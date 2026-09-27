@@ -122,8 +122,8 @@ def apply_medium(
         MediumResult: Radiance seen through the medium, alongside its transmittance, optical depth and in-scattering.
     """
     kwargs: dict[str, Any] = {"dtype": dtype, "device": device}
-    radiance = torch.as_tensor(np.asarray(radiance) if not torch.is_tensor(radiance) else radiance, **kwargs)
-    depth = torch.as_tensor(np.asarray(depth) if not torch.is_tensor(depth) else depth, **kwargs)
+    radiance = radiance.to(**kwargs) if torch.is_tensor(radiance) else torch.tensor(np.asarray(radiance), **kwargs)
+    depth = depth.to(**kwargs) if torch.is_tensor(depth) else torch.tensor(np.asarray(depth), **kwargs)
     radiance = radiance[..., None] if radiance.ndim == 2 else radiance
     depth = depth[..., 0] if depth.ndim == 3 else depth
 
