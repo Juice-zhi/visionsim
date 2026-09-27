@@ -103,8 +103,13 @@ def apply(
             if i == 0 and path.suffix.lower() not in LINEAR_EXTENSIONS:
                 _log.warning("Frames are tonemapped and have clipped highlights, prefer linear EXR frames.")
 
+            radiance = to_linearrgb(frame, path)
+            if radiance.shape[-1] == 1 and (c := transform.get("c") or 1) > 1:
+                # EXRs whose channels are all identical, as in gray scenes, are collapsed when loaded
+                radiance = np.repeat(radiance, c, axis=-1)
+
             result = apply_medium(
-                to_linearrgb(frame, path),
+                radiance,
                 depth,
                 transform,
                 transform["transform_matrix"],

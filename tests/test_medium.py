@@ -236,7 +236,7 @@ def test_apply_medium_background_and_extra_channels():
         apply_medium(radiance, depth, camera, pose, medium, Lighting(ambient=(1.0, 1.0)))
 
 
-def make_render(root, n=3):
+def make_render(root, n=3, gray=False):
     """Synthetic render, with linear EXR frames, depth maps (including background pixels) and lighting."""
     camera, pose = small_camera()
     rng = np.random.default_rng(2)
@@ -246,7 +246,8 @@ def make_render(root, n=3):
         path = Path("0000") / f"{i:03}.exr"
         depth = rng.uniform(1, 20, size=(5, 7, 1))
         depth[0, :2] = 1e10
-        _write_exr(root / "frames" / path, rng.uniform(0, 2, size=(5, 7, 3)))
+        radiance = rng.uniform(0, 2, size=(5, 7, 1 if gray else 3))
+        _write_exr(root / "frames" / path, np.repeat(radiance, 3, axis=-1) if gray else radiance)
         _write_exr(root / "depths" / path, depth)
         transform = camera | {"file_path": path, "transform_matrix": pose.tolist(), "fps": 24.0}
         frames.append(transform | {"c": 3})
@@ -300,3 +301,14 @@ def test_cli_apply_requires_lighting(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="--include-lighting"):
         apply(tmp_path / "render", tmp_path / "fog", tmp_path / "medium.json", device="cpu")
+
+
+def test_cli_apply_gray_frames(tmp_path):
+    # RGB frames of a gray scene are loaded as a single channel, but should still be lit in color
+    make_render(tmp_path / "render", n=1, gray=True)
+    (tmp_path / "medium.json").write_text(Medium(extinction=0.1, angstrom=1.3).model_dump_json())
+    apply(tmp_path / "render", tmp_path / "fog", tmp_path / "medium.json", device="cpu")
+
+    frame, transform = Dataset.from_path(tmp_path / "fog" / "frames")[0]
+    assert frame.shape == (5, 7, 3) and transform["c"] == 3
+    assert not np.allclose(frame[..., 0], frame[..., 2])  # extinction depends on wavelength
