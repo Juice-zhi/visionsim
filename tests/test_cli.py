@@ -1,4 +1,5 @@
 import inspect
+import shutil
 import sys
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import numpy as np
 import pytest
 from docstring_parser import parse_from_object
 
-from visionsim.cli import _cli_modules, _run, dataset, transforms
+from visionsim.cli import _cli_modules, _run, dataset, ffmpeg, transforms
 from visionsim.cli.medium import _write_exr
 from visionsim.dataset.models import Metadata
 
@@ -37,6 +38,17 @@ def test_tonemap_single_channel_frames(tmp_path):
     _write_exr(tmp_path / "frames" / "0000" / "000.exr", np.full((4, 6, 3), 0.5))
     transforms.tonemap_frames(tmp_path / "frames", tmp_path / "tonemapped")
     assert iio.imread(tmp_path / "tonemapped" / "000.png").shape == (4, 6)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
+def test_combine_overwrites_with_force(tmp_path):
+    for name in ("a", "b"):
+        _run(f"ffmpeg -f lavfi -i testsrc=size=64x48:rate=5 -t 1 {tmp_path / name}.mp4", hide=True, check=True)
+
+    # Each video is scaled to QVGA before being stacked, so the output's width tells how many were combined
+    for row in (["a", "b"], ["a", "b", "a"]):
+        ffmpeg.combine(str([[str(tmp_path / f"{name}.mp4") for name in row]]), tmp_path / "combined.mp4", force=True)
+        assert ffmpeg.dimensions(tmp_path / "combined.mp4") == (320 * len(row), 240)
 
 
 @pytest.mark.parametrize("module", _cli_modules)

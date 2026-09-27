@@ -209,7 +209,7 @@ def combine(
                 "".join(f"[a{i}]" for i, _ in enumerate(in_paths))
                 + f"xstack=inputs={len(in_paths)}:layout={layout_spec}[out]"
             )
-            cmd = f'ffmpeg {in_paths_str} -filter_complex "{filter_inputs_str} {placement}" -map "[out]" -c:v libx264 {outfile}'
+            cmd = f'ffmpeg {in_paths_str} -filter_complex "{filter_inputs_str} {placement}" -map "[out]" -c:v libx264 {outfile} -y'
             _run(cmd)
             return
 
