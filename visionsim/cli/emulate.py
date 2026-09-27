@@ -114,6 +114,7 @@ def events(
     cs_lambda_pixels: float | None = None,
     cs_tau_p_ms: float | None = None,
     scidvs: bool = False,
+    srgb_log: bool = False,
     blur_sigma: float = 0.0,
     preview_step: int | None = None,
     only_preview: bool = False,
@@ -140,6 +141,8 @@ def events(
         cs_lambda_pixels: space constant of the centre-surround surround in pixels
         cs_tau_p_ms: time constant of the surround low-pass filter in ms
         scidvs: simulate the high-gain adaptive photoreceptor of the SCIDVS pixel
+        srgb_log: if true, apply the log response to sRGB (gamma-encoded) values instead of linear intensities.
+            This reproduces v2e and earlier versions of this emulator, but makes thresholds depend on the tonemapping
         blur_sigma: standard deviation of the Gaussian blur applied to input frames in pixels, 0 disables blurring
         preview_step: accumulate events over this many frames before saving a visualization preview. If the
             number of input frames is not a multiple of the preview step, the last few frames will be dropped.
@@ -155,6 +158,7 @@ def events(
     from visionsim.dataset import Dataset
     from visionsim.emulate.dvs import EventEmulator
     from visionsim.simulate.blender import INDEX_PADDING, ITEMS_PER_SUBFOLDER
+    from visionsim.utils.color import linearrgb_to_srgb, to_linearrgb
     from visionsim.utils.progress import ElapsedProgress
 
     if input_dir.resolve() == output_dir.resolve():
@@ -202,16 +206,20 @@ def events(
     emulator = EventEmulator(**emulator_kwargs)  # type: ignore
 
     with open(output_dir / "params.json", "w") as f:
-        json.dump(emulator_kwargs | {"fps": fps, "blur_sigma": blur_sigma}, f, indent=2)
+        json.dump(emulator_kwargs | {"fps": fps, "blur_sigma": blur_sigma, "srgb_log": srgb_log}, f, indent=2)
 
     with open(events_path, "a+") as out, ElapsedProgress() as progress:
         task = progress.add_task("Writing DVS data...", total=len(dataset))
         viz = None
 
-        for idx, (frame, _) in enumerate(dataset):  # type: ignore
+        for idx, (frame, transform) in enumerate(dataset):  # type: ignore
+            # The emulator expects intensities where 255 corresponds to a display-referred white
+            linear = to_linearrgb(frame, transform["file_path"])
+            intensity = (linearrgb_to_srgb(linear) if srgb_log else linear) * 255.0
+
             # Manually grayscale as we've already converted to floating point pixel values
             # Values from http://en.wikipedia.org/wiki/Grayscale
-            r, g, b, *_ = np.transpose(frame, (2, 0, 1))
+            r, g, b, *_ = np.transpose(intensity, (2, 0, 1))
             luma = 0.0722 * b + 0.7152 * g + 0.2126 * r
             if blur_sigma > 0:
                 luma = gaussian_filter(luma, sigma=blur_sigma)
@@ -226,12 +234,12 @@ def events(
 
                 if preview_step is not None and preview_step > 0:
                     if viz is None:
-                        viz = np.ones_like(frame) * 255
+                        viz = np.full((*frame.shape[:2], 3), 255, dtype=np.uint8)
 
                     _, px, py, _ = events[events[:, -1] == 1].T.astype(int)
                     _, nx, ny, _ = events[events[:, -1] == -1].T.astype(int)
-                    viz[ny, nx, :3] = [255, 0, 0]
-                    viz[py, px, :3] = [0, 0, 255]
+                    viz[ny, nx] = [255, 0, 0]
+                    viz[py, px] = [0, 0, 255]
 
                     if (idx + 1) % preview_step == 0:
                         folder_index = f"{idx // ITEMS_PER_SUBFOLDER:04}"

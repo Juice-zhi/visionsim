@@ -55,6 +55,8 @@ Parameters such as thresholds and noise rates can be adjusted:
         --pos-thres=0.2 --neg-thres=0.2 --sigma-thres=0.03 \
         --cutoff-hz=200 --leak-rate-hz=1.0 --shot-noise-rate-hz=10.0
 
+Input frames are first converted to linear intensities using :func:`to_linearrgb <visionsim.utils.color.to_linearrgb>`, so that the log response above is applied to the scene's intensity :math:`I`, regardless of whether frames were saved as tonemapped PNGs or as linear EXRs. Earlier versions of this emulator, like v2e, instead took the log of tonemapped (sRGB) values, which makes the effective contrast thresholds roughly 2.2 times larger and dependent on the tonemapping. This behavior can be recovered with ``--srgb-log``.
+
 The output directory will contain:
 
 * ``events.txt``: A text file where each line is an event in the format ``t x y p`` (time in microseconds, x-coordinate, y-coordinate, polarity).
