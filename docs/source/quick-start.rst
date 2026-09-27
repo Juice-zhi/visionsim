@@ -25,7 +25,7 @@ Generating a dataset
 To give you a taste of how visionsim works, we will create a small scale dataset of a toy lego truck as if it was captured by a realistic 25fps conventional RGB camera and a 4kHz single photon camera for 4 seconds. To achieve this, we will:  
 
 - Render a small dataset of 500 ground truth frames using the ``blender.render-animation`` CLI,
-- Interpolate this dataset 32-fold using the ``interpolate.frames`` CLI,
+- Interpolate this dataset 32-fold using the ``interpolate.dataset`` CLI,
 - And emulate different cameras using the ``emulate.rgb/spad/event`` CLIs. 
 
 |
@@ -47,13 +47,13 @@ To create the lego dataset, we'll slow down the camera movement by a factor of 5
 
         $ visionsim blender.render-animation --help
 
-    If the above command does not work, you might have to change some settings, notably the ``device-type``. For instance on older GPUs that do not support Optix you can do ``--render-config.device-type=cuda`` to use CUDA.
+    If the above command does not work, you might have to change some settings, notably the ``device-type``. For instance on older GPUs that do not support Optix you can do ``--config.device-type=cuda`` to use CUDA.
     
     Finer grain control can be had using the :class:`BlenderClient API <visionsim.simulate.blender.BlenderClient>`.
 
 .. warning:: This might take a while, with blender 4.2 on a RTX 3080 it takes about 18 minutes. 
 
-All the rendered frames will be in ``quickstart/lego-gt/frames``, and alongside this directory you should see a ``transforms.json`` file which contains metadata and information about the camera trajectory used for rendering. 
+All the rendered frames will be in ``quickstart/lego-gt/frames``, alongside a ``transforms.db`` file which contains metadata and information about the camera trajectory used for rendering. 
 
 Let's create a quick preview of this dataset by animating every 5th frame into a video, this allows for realtime play back without creating a video with a very fast framerate:
 
