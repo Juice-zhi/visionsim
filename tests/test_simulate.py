@@ -1,5 +1,7 @@
 import itertools
 import os
+import shlex
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -154,3 +156,14 @@ def test_metadata_roundtrip_from_db(cube_dataset):
         meta.save(path.parent / "transforms.json")
 
         assert Metadata.load(path.parent / "transforms.json").model_dump() == meta.model_dump()
+
+
+def test_camera_intrinsics(executable):
+    # Checks intrinsics against Blender's own projection, this needs to run from within Blender itself
+    script = Path(__file__).parent / "blender_scripts" / "camera_intrinsics.py"
+    scene = Path(__file__).parent / "test_files" / "scenes" / "cube.blend"
+    cmd = shlex.split(f"{executable or 'blender'} -b --factory-startup --python-exit-code 1")
+    result = subprocess.run(
+        [*cmd, "--python", str(script), "--", str(scene)], capture_output=True, encoding="utf-8", errors="replace"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

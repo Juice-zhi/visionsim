@@ -1712,17 +1712,27 @@ class BlenderService(rpyc.Service):
             ]
         }
 
-        # Note: This might be a blender bug, but when height==width,
-        #   angle_x != angle_y, so here we just use angle.
-        scale = self.scene.render.resolution_percentage / 100.0
-        info["w"] = int(self.scene.render.resolution_x * scale)
-        info["h"] = int(self.scene.render.resolution_y * scale)
-        info["fl_x"] = float(1 / 2 * self.scene.render.resolution_x / np.tan(1 / 2 * self.camera.data.angle))
-        info["fl_y"] = float(1 / 2 * self.scene.render.resolution_y / np.tan(1 / 2 * self.camera.data.angle))
-        info["shift_x"] *= self.scene.render.resolution_x * scale
-        info["shift_y"] *= self.scene.render.resolution_y * scale
-        info["cx"] = 1 / 2 * self.scene.render.resolution_x * scale + info["shift_x"]
-        info["cy"] = 1 / 2 * self.scene.render.resolution_y * scale + info["shift_y"]
+        # Mirror Blender's camera model (see `BKE_camera_params_compute_viewplane`): the sensor spans the
+        #   image along the fit axis (its longest side when fit is AUTO), lens shifts are expressed in units
+        #   of that same side, and non-square pixels are accounted for by rescaling the vertical axis.
+        render = self.scene.render
+        scale = render.resolution_percentage / 100.0
+        w, h = int(render.resolution_x * scale), int(render.resolution_y * scale)
+        ycor = render.pixel_aspect_y / render.pixel_aspect_x
+        sensor_fit = self.camera.data.sensor_fit
+        sensor_size = self.camera.data.sensor_height if sensor_fit == "VERTICAL" else self.camera.data.sensor_width
+
+        if sensor_fit == "AUTO":
+            sensor_fit = "HORIZONTAL" if render.pixel_aspect_x * w >= render.pixel_aspect_y * h else "VERTICAL"
+        viewfac = w if sensor_fit == "HORIZONTAL" else ycor * h
+
+        info["w"], info["h"] = w, h
+        info["fl_x"] = float(self.camera.data.lens * viewfac / sensor_size)
+        info["fl_y"] = info["fl_x"] / ycor
+        info["shift_x"] *= viewfac
+        info["shift_y"] *= viewfac / ycor
+        info["cx"] = w / 2 - info["shift_x"]
+        info["cy"] = h / 2 + info["shift_y"]
         info["fps"] = self.exposed_get_original_fps()
         info["keyframe_scale"] = self._keyframe_scale
         return info
