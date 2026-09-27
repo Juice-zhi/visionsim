@@ -258,6 +258,7 @@ def rgb(
     fwc: int | None = None,
     duplicate: float = 1.0,
     pattern: str | None = None,
+    seed: int = 2147483647,
     force: bool = False,
 ) -> None:
     """Simulate real camera, adding read/poisson noise and tonemapping
@@ -273,6 +274,7 @@ def rgb(
             This parameter artificially increases the chunk size by using each input image ``duplicate`` number of times
         pattern: used to find source image files to convert to rgb frames,
             not needed when ``input_dir`` points to a valid dataset.
+        seed: random seed to use while sampling, ensures reproducibility
         force: if true, overwrite output file(s) if present
     """
     import imageio.v3 as iio
@@ -299,6 +301,7 @@ def rgb(
 
         if dataset.cameras is None or len(dataset.cameras) != 1:
             raise NotImplementedError("Cannot emulate an RGB camera from multiple cameras.")
+    rng = np.random.default_rng(int(seed))
     transforms = []
 
     with ElapsedProgress() as progress:
@@ -317,6 +320,7 @@ def rgb(
                 readout_std=readout_std,
                 fwc=fwc or (chunk_size * duplicate),
                 factor=factor,
+                rng=rng,
             )
 
             if not pattern:
