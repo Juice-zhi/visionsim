@@ -92,8 +92,9 @@ def _run(
     """Execute a command and return an object with the result and failure status."""
     _log.debug(f"Running command: {command}")
 
-    # shlex the command if we don't want to run in shell
-    if not shell and isinstance(command, str):
+    # shlex the command if we don't want to run in shell. On Windows, command lines are parsed by the
+    # program itself and shlex would strip the backslashes of paths, so they are passed as is instead.
+    if not shell and isinstance(command, str) and os.name != "nt":
         command = shlex.split(command)
 
     # Either Pipe output or save to a file

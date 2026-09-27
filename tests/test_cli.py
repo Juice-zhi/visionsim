@@ -21,6 +21,14 @@ def test_completions(tmpdir):
     _run(rf"visionsim --tyro-write-completion {shell_name} {tmpdir}/visionsim", check=True, shell=True, log_path=tmpdir)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows paths only")
+def test_run_keeps_windows_paths(tmp_path):
+    # Commands such as ffmpeg's are built as strings containing Windows paths, which must survive being run
+    path = tmp_path / "frames" / "%09d.png"
+    result = _run(f'"{sys.executable}" -c "import sys; print(sys.argv[1])" {path}', hide=True, check=True)
+    assert result.stdout.strip() == str(path)
+
+
 @pytest.mark.parametrize("module", _cli_modules)
 def test_help_is_full(module):
     for func_name, func in inspect.getmembers(module, inspect.isfunction):
