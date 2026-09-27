@@ -287,6 +287,10 @@ def tonemap_frames(
         img = (np.clip(img, 0, 1) * 255).astype(np.uint8)
         hdrs.append(high / low)
 
+        # EXRs with identical channels are loaded as a single channel, which is saved as grayscale
+        if img.ndim == 3 and img.shape[-1] == 1:
+            img = img[..., 0]
+
         path = output_dir / Path(in_file).stem
         iio.imwrite(str(path.with_suffix(ext)), img)
 

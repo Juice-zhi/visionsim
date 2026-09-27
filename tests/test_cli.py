@@ -2,10 +2,13 @@ import inspect
 import sys
 from pathlib import Path
 
+import imageio.v3 as iio
+import numpy as np
 import pytest
 from docstring_parser import parse_from_object
 
-from visionsim.cli import _cli_modules, _run, dataset
+from visionsim.cli import _cli_modules, _run, dataset, transforms
+from visionsim.cli.medium import _write_exr
 from visionsim.dataset.models import Metadata
 
 
@@ -27,6 +30,13 @@ def test_run_keeps_windows_paths(tmp_path):
     path = tmp_path / "frames" / "%09d.png"
     result = _run(f'"{sys.executable}" -c "import sys; print(sys.argv[1])" {path}', hide=True, check=True)
     assert result.stdout.strip() == str(path)
+
+
+def test_tonemap_single_channel_frames(tmp_path):
+    # Gray EXRs are loaded with a single channel, and should be saved as grayscale images
+    _write_exr(tmp_path / "frames" / "0000" / "000.exr", np.full((4, 6, 3), 0.5))
+    transforms.tonemap_frames(tmp_path / "frames", tmp_path / "tonemapped")
+    assert iio.imread(tmp_path / "tonemapped" / "000.png").shape == (4, 6)
 
 
 @pytest.mark.parametrize("module", _cli_modules)
