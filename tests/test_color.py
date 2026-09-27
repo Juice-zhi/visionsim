@@ -35,3 +35,10 @@ def test_to_linearrgb_format_agnostic():
     linear = np.random.random((32, 32, 3))
     png = np.round(linearrgb_to_srgb(linear) * 255).astype(np.uint8)
     assert np.allclose(to_linearrgb(png, "frame.png"), to_linearrgb(linear, "frame.exr"), atol=5e-3)
+
+
+def test_to_linearrgb_clips_negative_intensities():
+    # Denoisers can leave small negative values in linear renders, which cannot be sampled as photon counts
+    img = np.array([[[-1e-5, 0.5, np.nan]]], dtype=np.float32)
+    linear = to_linearrgb(img, "frame.exr")
+    assert linear[0, 0, 0] == 0 and linear[0, 0, 1] == 0.5 and np.isnan(linear[0, 0, 2])

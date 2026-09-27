@@ -51,8 +51,9 @@ def linearrgb_to_srgb(img: torch.Tensor | npt.NDArray) -> torch.Tensor | npt.NDA
 def to_linearrgb(img: npt.ArrayLike, path: str | os.PathLike) -> npt.NDArray[np.floating]:
     """Convert image data, as loaded from ``path``, to linear intensities.
 
-    Scene-referred formats (EXR/HDR) already store linear intensities and are returned as-is,
-    including values above one. Display-referred images (PNG, JPEG, etc.) are first normalized
+    Scene-referred formats (EXR/HDR) already store linear intensities and are returned as-is, including
+    values above one, except for negative values (such as those left by denoisers) which are clipped to zero
+    as they would break photon sampling. Display-referred images (PNG, JPEG, etc.) are first normalized
     by the range of their integer datatype (e.g. 255 for 8-bit or 65535 for 16-bit images) and
     then un-tonemapped using the sRGB transfer function. This ensures that the same scene saved
     in either kind of format results in the same linear intensities, up to quantization.
@@ -67,7 +68,7 @@ def to_linearrgb(img: npt.ArrayLike, path: str | os.PathLike) -> npt.NDArray[np.
     img = np.asarray(img)
 
     if Path(path).suffix.lower() in LINEAR_EXTENSIONS:
-        return img.astype(float)
+        return np.maximum(img.astype(float), 0)
     if np.issubdtype(img.dtype, np.integer):
         img = img / np.iinfo(img.dtype).max
     return cast(npt.NDArray[np.floating], srgb_to_linearrgb(img.astype(float)))
