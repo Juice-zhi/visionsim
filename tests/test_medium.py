@@ -1,11 +1,25 @@
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 from scipy.integrate import cumulative_trapezoid, quad, trapezoid
 
-from visionsim.medium import Blob, HeightFog, Homogeneous, Lighting, Medium, Sun, apply_medium, camera_rays, kim_exponent
+from visionsim.cli.emulate import spad
+from visionsim.cli.medium import _write_exr, apply
+from visionsim.dataset import Dataset, Metadata
+from visionsim.medium import (
+    Blob,
+    HeightFog,
+    Homogeneous,
+    Lighting,
+    Medium,
+    Sun,
+    apply_medium,
+    camera_rays,
+    kim_exponent,
+)
 from visionsim.medium.optics import component_optical_depth, height_fog_sun_inscatter, henyey_greenstein
 
 T = torch.tensor
@@ -220,3 +234,69 @@ def test_apply_medium_background_and_extra_channels():
 
     with pytest.raises(ValueError, match="1 or 3 values"):
         apply_medium(radiance, depth, camera, pose, medium, Lighting(ambient=(1.0, 1.0)))
+
+
+def make_render(root, n=3):
+    """Synthetic render, with linear EXR frames, depth maps (including background pixels) and lighting."""
+    camera, pose = small_camera()
+    rng = np.random.default_rng(2)
+    frames, depths = [], []
+
+    for i in range(n):
+        path = Path("0000") / f"{i:03}.exr"
+        depth = rng.uniform(1, 20, size=(5, 7, 1))
+        depth[0, :2] = 1e10
+        _write_exr(root / "frames" / path, rng.uniform(0, 2, size=(5, 7, 3)))
+        _write_exr(root / "depths" / path, depth)
+        transform = camera | {"file_path": path, "transform_matrix": pose.tolist(), "fps": 24.0}
+        frames.append(transform | {"c": 3})
+        depths.append(transform | {"c": 1})
+
+    Metadata.from_dense_transforms(frames).save(root / "frames" / "transforms.json")
+    Metadata.from_dense_transforms(depths).save(root / "depths" / "transforms.json")
+    lighting = Lighting(ambient=(0.3, 0.4, 0.5), suns=[Sun(direction=(0, 1, 1), irradiance=(2.0,))])
+    (root / "lighting.json").write_text(lighting.model_dump_json())
+    return lighting
+
+
+def test_cli_apply(tmp_path):
+    lighting = make_render(tmp_path / "render")
+    medium = Medium(
+        extinction=0.1,
+        components=[Homogeneous(density=0.5), Blob(center=(0, 5, 1.5), radius=2, velocity=(4, 0, 0))],
+    )
+    (tmp_path / "medium.json").write_text(medium.model_dump_json())
+    apply(tmp_path / "render", tmp_path / "fog", tmp_path / "medium.json", device="cpu")
+
+    frames = Dataset.from_path(tmp_path / "render" / "frames")
+    depths = Dataset.from_path(tmp_path / "render" / "depths")
+    # Output directories, in the same order as the fields of `MediumResult`
+    names = ("frames", "transmittance", "optical-depth", "inscatter")
+    outputs = {name: Dataset.from_path(tmp_path / "fog" / name) for name in names}
+    assert Medium.model_validate_json((tmp_path / "fog" / "medium.json").read_text()) == medium
+
+    for i, ((radiance, transform), (depth, _)) in enumerate(zip(frames, depths)):
+        pose = transform["transform_matrix"]
+        expected = apply_medium(radiance, depth, transform, pose, medium, lighting, time=i / 24)
+
+        for name, value in zip(names, expected):
+            data, saved = outputs[name][i]
+            assert np.allclose(data, value.numpy(), rtol=1e-6, atol=1e-7)
+            assert np.allclose(saved["transform_matrix"], pose) and saved["fl_x"] == transform["fl_x"]
+
+    # The blob moves, so frames differ even though the scene doesn't
+    assert not np.allclose(outputs["frames"][0][0], outputs["frames"][-1][0])
+
+    # Frames with the medium can be used as is by emulators
+    spad(tmp_path / "fog" / "frames", tmp_path / "spad", seed=1)
+    binary, _ = Dataset.from_path(tmp_path / "spad")[0]
+    assert binary.shape == (5, 7, 3) and set(np.unique(binary)) <= {0, 1}
+
+
+def test_cli_apply_requires_lighting(tmp_path):
+    make_render(tmp_path / "render")
+    (tmp_path / "render" / "lighting.json").unlink()
+    (tmp_path / "medium.json").write_text(Medium(extinction=0.1).model_dump_json())
+
+    with pytest.raises(FileNotFoundError, match="--include-lighting"):
+        apply(tmp_path / "render", tmp_path / "fog", tmp_path / "medium.json", device="cpu")
