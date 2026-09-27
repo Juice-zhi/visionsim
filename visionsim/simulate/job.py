@@ -77,6 +77,9 @@ def render_job(
         client.include_specular_pass(**asdict(config.specular_pass))
     if config.include_points:
         client.include_points(**asdict(config.points))
+    if config.include_lighting:
+        # All clients load the same scene, so a single one saves its lighting
+        (client[0] if isinstance(client, BlenderClients) else client).save_lighting()
 
     if config.unbind_camera:
         client.unbind_camera()

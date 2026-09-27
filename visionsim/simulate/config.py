@@ -203,6 +203,8 @@ class RenderConfig:
     """If true, enable world-space point map outputs"""
     points: PointsConfig = field(default_factory=PointsConfig)
     """Point maps configuration options"""
+    include_lighting: bool = False
+    """If true, save the scene's lighting to ``lighting.json``, as needed to add participating media with ``medium.apply``"""
     include_all: bool = False
     """If true, enable all ground truth outputs"""
     previews: bool = True
@@ -259,6 +261,7 @@ class RenderConfig:
             self.include_diffuse_pass = True
             self.include_specular_pass = True
             self.include_points = True
+            self.include_lighting = True
 
         self.depths.preview &= self.previews
         self.normals.preview &= self.previews

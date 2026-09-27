@@ -10,6 +10,7 @@ import pytest
 from peewee import SqliteDatabase
 
 from visionsim.dataset import Dataset, Metadata
+from visionsim.medium import Lighting
 from visionsim.simulate.blender import INDEX_PADDING, ITEMS_PER_SUBFOLDER, BlenderClients
 from visionsim.simulate.schema import _MODELS, _Data
 
@@ -158,12 +159,27 @@ def test_metadata_roundtrip_from_db(cube_dataset):
         assert Metadata.load(path.parent / "transforms.json").model_dump() == meta.model_dump()
 
 
-def test_camera_intrinsics(executable):
-    # Checks intrinsics against Blender's own projection, this needs to run from within Blender itself
-    script = Path(__file__).parent / "blender_scripts" / "camera_intrinsics.py"
+def _run_blender_script(executable, name, *args):
+    # Some checks need to access Blender's API directly, so they run from within Blender itself
+    script = Path(__file__).parent / "blender_scripts" / name
     scene = Path(__file__).parent / "test_files" / "scenes" / "cube.blend"
     cmd = shlex.split(f"{executable or 'blender'} -b --factory-startup --python-exit-code 1")
     result = subprocess.run(
-        [*cmd, "--python", str(script), "--", str(scene)], capture_output=True, encoding="utf-8", errors="replace"
+        [*cmd, "--python", str(script), "--", str(scene), *map(str, args)],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_camera_intrinsics(executable):
+    # Checks intrinsics against Blender's own projection
+    _run_blender_script(executable, "camera_intrinsics.py")
+
+
+def test_lighting_info(executable, tmp_path):
+    # Lights are added and checked from within Blender, the saved lighting is then validated here
+    _run_blender_script(executable, "lighting.py", tmp_path / "lighting.json")
+    lighting = Lighting.model_validate_json((tmp_path / "lighting.json").read_text())
+    assert len(lighting.suns) == 1 and len(lighting.points) == 1 and lighting.ambient == pytest.approx((1, 0.5, 0.25))

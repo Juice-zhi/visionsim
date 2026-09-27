@@ -5,6 +5,7 @@ import collections
 import functools
 import inspect
 import itertools
+import json
 import logging
 import os
 import platform
@@ -1747,6 +1748,111 @@ class BlenderService(rpyc.Service):
         pose = np.array(self.camera.matrix_world)
         pose[:3, :3] /= np.linalg.norm(pose[:3, :3], axis=0)
         return pose
+
+    @staticmethod
+    def _mean_equirectangular(image: bpy.types.Image) -> list[float]:
+        """Average linear radiance over the sphere of an equirectangular environment map.
+
+        Args:
+            image (bpy.types.Image): Environment map, in equirectangular projection.
+
+        Returns:
+            list[float]: Mean RGB radiance, weighted by solid angle.
+        """
+        w, h = image.size
+        pixels = np.empty(w * h * image.channels, dtype=np.float32)
+        image.pixels.foreach_get(pixels)
+        rgb = pixels.reshape(h, w, image.channels)[..., :3].astype(float)
+
+        if not image.is_float and image.colorspace_settings.name.lower().startswith("srgb"):
+            rgb = np.where(rgb < 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+
+        # Rows go from the bottom to the top of the image, each row spans a band of latitude
+        weights = np.cos((np.arange(h) + 0.5) / h * np.pi - np.pi / 2)
+        return ((rgb * weights[:, None, None]).sum(axis=(0, 1)) / (weights.sum() * w)).tolist()
+
+    @require_initialized_service
+    def _world_radiance(self) -> list[float]:
+        """Average radiance of the world background, over the whole sphere."""
+        world = self.scene.world
+        if world is None:
+            return [0.0, 0.0, 0.0]
+
+        nodes = world.node_tree.nodes if world.node_tree else []
+        output = next((n for n in nodes if n.bl_idname == "ShaderNodeOutputWorld" and n.is_active_output), None)
+        if output is None or not output.inputs["Surface"].is_linked:
+            return list(world.color)
+
+        background = output.inputs["Surface"].links[0].from_node
+        if background.bl_idname != "ShaderNodeBackground":
+            self.log.warning(f"Unsupported world shader {background.bl_idname}, falling back to the world's color.")
+            return list(world.color)
+
+        color, strength = background.inputs["Color"], background.inputs["Strength"]
+        if strength.is_linked:
+            self.log.warning("World strength is driven by a node, falling back to its default value.")
+
+        if color.is_linked:
+            source = color.links[0].from_node
+            if source.bl_idname == "ShaderNodeTexEnvironment" and source.image is not None and all(source.image.size):
+                return [c * strength.default_value for c in self._mean_equirectangular(source.image)]
+            self.log.warning(f"Unsupported world color node {source.bl_idname}, falling back to its default value.")
+        return [c * strength.default_value for c in color.default_value[:3]]
+
+    @require_initialized_service
+    def exposed_lighting_info(self) -> dict[str, Any]:
+        """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
+
+        This includes sun and point lights, whose intensities account for their exposure and volume factor, as well
+        as the average radiance of the world background (either a constant color or an environment texture).
+        Light temperatures, spot and area lights, and other world shaders are not supported and are ignored,
+        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
+
+        Returns:
+            dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
+        """
+        suns: list[dict[str, Any]] = []
+        points: list[dict[str, Any]] = []
+
+        for obj in self.scene.objects:
+            if obj.type != "LIGHT" or obj.hide_render:
+                continue
+            light = obj.data
+
+            if getattr(light, "use_temperature", False):
+                self.log.warning(f"Temperature of light '{obj.name}' is not supported and will be ignored.")
+            if obj.animation_data or light.animation_data:
+                self.log.warning(f"Light '{obj.name}' is animated, only its state at the current frame is saved.")
+
+            scale = light.energy * 2 ** getattr(light, "exposure", 0.0) * getattr(light, "volume_factor", 1.0)
+            color = [c * scale for c in light.color]
+
+            if light.type == "SUN":
+                # Sun lamps shine along their local -Z axis
+                direction = (obj.matrix_world.to_3x3() @ mathutils.Vector((0.0, 0.0, 1.0))).normalized()
+                suns.append({"direction": list(direction), "irradiance": color})
+            elif light.type == "POINT":
+                points.append(
+                    {"position": list(obj.matrix_world.translation), "power": color, "radius": light.shadow_soft_size}
+                )
+            else:
+                self.log.warning(f"{light.type.title()} light '{obj.name}' is not supported and will be ignored.")
+
+        return {"ambient": self._world_radiance(), "suns": suns, "points": points}
+
+    @require_initialized_service
+    def exposed_save_lighting(self, path: str | os.PathLike | None = None) -> None:
+        """Save the lighting of the scene, as returned by :meth:`lighting_info <exposed_lighting_info>`, to a JSON file.
+
+        Args:
+            path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
+                root directory of the renders.
+        """
+        path = Path(str(path)) if path else self.root_path / "lighting.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(path, "w") as f:
+            json.dump(self.exposed_lighting_info(), f, indent=2)
 
     @require_initialized_service
     @validate_camera_moved

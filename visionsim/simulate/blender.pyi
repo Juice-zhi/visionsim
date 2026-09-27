@@ -813,6 +813,43 @@ class BlenderService(rpyc.Service):
             npt.NDArray[np.floating]: Current camera pose in matrix form.
         """
 
+    @staticmethod
+    def _mean_equirectangular(image: bpy.types.Image) -> list[float]:
+        """Average linear radiance over the sphere of an equirectangular environment map.
+
+        Args:
+            image (bpy.types.Image): Environment map, in equirectangular projection.
+
+        Returns:
+            list[float]: Mean RGB radiance, weighted by solid angle.
+        """
+
+    @require_initialized_service
+    def _world_radiance(self) -> list[float]:
+        """Average radiance of the world background, over the whole sphere."""
+
+    @require_initialized_service
+    def exposed_lighting_info(self) -> dict[str, Any]:
+        """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
+
+        This includes sun and point lights, whose intensities account for their exposure and volume factor, as well
+        as the average radiance of the world background (either a constant color or an environment texture).
+        Light temperatures, spot and area lights, and other world shaders are not supported and are ignored,
+        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
+
+        Returns:
+            dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
+        """
+
+    @require_initialized_service
+    def exposed_save_lighting(self, path: str | os.PathLike | None = None) -> None:
+        """Save the lighting of the scene, as returned by :meth:`lighting_info <exposed_lighting_info>`, to a JSON file.
+
+        Args:
+            path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
+                root directory of the renders.
+        """
+
     @require_initialized_service
     @validate_camera_moved
     def exposed_position_camera(
@@ -1572,6 +1609,28 @@ class BlenderClient:
 
         Returns:
             npt.NDArray[np.floating]: Current camera pose in matrix form.
+        """
+
+    @type_check_only
+    def lighting_info(self) -> dict[str, Any]:
+        """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
+
+        This includes sun and point lights, whose intensities account for their exposure and volume factor, as well
+        as the average radiance of the world background (either a constant color or an environment texture).
+        Light temperatures, spot and area lights, and other world shaders are not supported and are ignored,
+        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
+
+        Returns:
+            dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
+        """
+
+    @type_check_only
+    def save_lighting(self, path: str | os.PathLike | None = None) -> None:
+        """Save the lighting of the scene, as returned by :meth:`lighting_info <exposed_lighting_info>`, to a JSON file.
+
+        Args:
+            path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
+                root directory of the renders.
         """
 
     @type_check_only
@@ -2406,6 +2465,28 @@ class BlenderClients(tuple):
 
         Returns:
             npt.NDArray[np.floating]: Current camera pose in matrix form.
+        """
+
+    @type_check_only
+    def lighting_info(self) -> tuple[dict[str, Any],]:
+        """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
+
+        This includes sun and point lights, whose intensities account for their exposure and volume factor, as well
+        as the average radiance of the world background (either a constant color or an environment texture).
+        Light temperatures, spot and area lights, and other world shaders are not supported and are ignored,
+        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
+
+        Returns:
+            dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
+        """
+
+    @type_check_only
+    def save_lighting(self, path: str | os.PathLike | None = None) -> None:
+        """Save the lighting of the scene, as returned by :meth:`lighting_info <exposed_lighting_info>`, to a JSON file.
+
+        Args:
+            path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
+                root directory of the renders.
         """
 
     @type_check_only
