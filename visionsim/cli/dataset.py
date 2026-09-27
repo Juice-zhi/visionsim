@@ -272,9 +272,10 @@ def to_pointcloud(
 
                 # Camera space points (Blender/OpenGL: +X right, +Y up, -Z forward)
                 # So depth is -Z. Y is inverted between image and camera space (up is positive)
+                # The principal point is expressed relative to the image corner, so pixel centers are offset by 0.5
                 z = -depth
-                x = -(xx - cx) * z / fl_x
-                y = (yy - cy) * z / fl_y
+                x = -(xx + 0.5 - cx) * z / fl_x
+                y = (yy + 0.5 - cy) * z / fl_y
 
                 # World space
                 c2w = np.array(points_meta["transform_matrix"])
