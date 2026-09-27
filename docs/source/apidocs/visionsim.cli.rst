@@ -44,6 +44,14 @@ visionsim.cli.interpolate module
    :show-inheritance:
    :undoc-members:
 
+visionsim.cli.medium module
+---------------------------
+
+.. automodule:: visionsim.cli.medium
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 visionsim.cli.transforms module
 -------------------------------
 

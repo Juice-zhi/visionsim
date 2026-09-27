@@ -24,6 +24,7 @@ VisionSIM is a modular and extensible framework for distributed simulations with
 
    sections/simulation
    sections/interpolation
+   sections/medium
    sections/emulation 
    sections/datasets
 

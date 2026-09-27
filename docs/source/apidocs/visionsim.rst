@@ -11,6 +11,7 @@ Subpackages
    visionsim.dataset
    visionsim.emulate
    visionsim.interpolate
+   visionsim.medium
    visionsim.simulate
    visionsim.utils
 
