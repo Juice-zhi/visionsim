@@ -33,7 +33,7 @@ def spad(
 
     from visionsim.dataset import Dataset, Metadata
     from visionsim.emulate.spc import emulate_spc
-    from visionsim.utils.color import srgb_to_linearrgb
+    from visionsim.utils.color import to_linearrgb
     from visionsim.utils.progress import ElapsedProgress
 
     if input_dir.resolve() == output_dir.resolve():
@@ -58,11 +58,7 @@ def spad(
         for i, (data, transform) in enumerate(dataset):
             remainder = len(dataset) - (i // max_size) * max_size
 
-            if transform["file_path"].suffix.lower() not in (".exr", ".hdr"):
-                # Image has been tonemapped so undo mapping
-                data = srgb_to_linearrgb((data / 255.0).astype(float))
-            else:
-                data = data.astype(float) / 255.0
+            data = to_linearrgb(data, transform["file_path"])
 
             # Default to bitpacking width
             binary_img = emulate_spc(data, factor=factor, rng=rng) * 255
