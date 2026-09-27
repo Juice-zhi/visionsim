@@ -54,7 +54,11 @@ def test_optical_depth_matches_quadrature(component):
 
     closed = component_optical_depth(component, T(origin), T(directions), T(distance), time=0.7).numpy()
     for o, v, d, tau in zip([origin] * 64, directions, distance, closed):
-        ref, _ = quad(lambda s: density(component, o + s * v, time=0.7), 0, d, epsabs=0, epsrel=1e-12, limit=200)
+
+        def integrand(s, o=o, v=v):
+            return density(component, o + s * v, time=0.7)
+
+        ref, _ = quad(integrand, 0, d, epsabs=0, epsrel=1e-12, limit=200)
         assert tau == pytest.approx(ref, rel=1e-9, abs=1e-12)
 
 

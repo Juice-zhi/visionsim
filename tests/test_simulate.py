@@ -169,6 +169,7 @@ def _run_blender_script(executable, name, *args):
         capture_output=True,
         encoding="utf-8",
         errors="replace",
+        check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
