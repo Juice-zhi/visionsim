@@ -122,3 +122,6 @@ examples/quickstart/
 docs/source/_build/
 examples/assets/
 uv.lock
+
+# Local experiment outputs
+runs/

@@ -1,0 +1,59 @@
+{
+  "extinction": 0.15,
+  "reference_wavelength": 550.0,
+  "angstrom": 0.0,
+  "albedo": 1.0,
+  "anisotropy": 0.8,
+  "components": [
+    {
+      "type": "homogeneous",
+      "density": 0.03
+    },
+    {
+      "type": "blob",
+      "density": 1.0,
+      "center": [
+        -4.0,
+        14.0,
+        1.5
+      ],
+      "radius": 4.0,
+      "velocity": [
+        1.5,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "type": "blob",
+      "density": 0.8,
+      "center": [
+        5.0,
+        26.0,
+        2.5
+      ],
+      "radius": 6.0,
+      "velocity": [
+        1.5,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "type": "blob",
+      "density": 1.2,
+      "center": [
+        -2.0,
+        40.0,
+        2.0
+      ],
+      "radius": 5.0,
+      "velocity": [
+        1.5,
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "sun_attenuation": false
+}

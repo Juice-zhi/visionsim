@@ -1,0 +1,14 @@
+{
+  "extinction": 0.03912023005428146,
+  "reference_wavelength": 550.0,
+  "angstrom": 0.0,
+  "albedo": 1.0,
+  "anisotropy": 0.85,
+  "components": [
+    {
+      "type": "homogeneous",
+      "density": 1.0
+    }
+  ],
+  "sun_attenuation": false
+}

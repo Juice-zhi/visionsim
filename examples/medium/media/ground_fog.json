@@ -1,0 +1,16 @@
+{
+  "extinction": 0.08,
+  "reference_wavelength": 550.0,
+  "angstrom": 0.0,
+  "albedo": 1.0,
+  "anisotropy": 0.8,
+  "components": [
+    {
+      "type": "height",
+      "density": 1.0,
+      "base_height": 0.0,
+      "falloff": 2.5
+    }
+  ],
+  "sun_attenuation": true
+}
