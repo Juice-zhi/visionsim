@@ -282,7 +282,7 @@ def rgb(
     from visionsim.emulate.rgb import emulate_rgb_from_sequence
     from visionsim.interpolate.pose import pose_interp
     from visionsim.simulate.blender import INDEX_PADDING, ITEMS_PER_SUBFOLDER
-    from visionsim.utils.color import srgb_to_linearrgb
+    from visionsim.utils.color import to_linearrgb
     from visionsim.utils.progress import ElapsedProgress
 
     if input_dir.resolve() == output_dir.resolve():
@@ -309,11 +309,8 @@ def rgb(
             outpath = output_dir / folder_index / frame_index
 
             # Batch is an iterable of (data, transforms) that we need to reduce
-            imgs_iter, transforms_iter = mitertools.unzip(batch)
-            imgs = np.array([(i.astype(float) / 255.0).astype(float) for i in imgs_iter])
-
-            # Assume images have been tonemapped and undo mapping
-            imgs = srgb_to_linearrgb(imgs)
+            items = list(batch)
+            imgs = np.array([to_linearrgb(img, transform["file_path"]) for img, transform in items])
 
             rgb_img = emulate_rgb_from_sequence(
                 imgs * duplicate,
@@ -324,8 +321,8 @@ def rgb(
 
             if not pattern:
                 # We checked that there's only a single camera, just re-use any transforms dict
-                (transform, *_), transforms_iter = mitertools.spy(transforms_iter)
-                poses = np.array([t["transform_matrix"] for t in transforms_iter])
+                transform = items[0][1]
+                poses = np.array([t["transform_matrix"] for _, t in items])
                 transform["transform_matrix"] = pose_interp(poses, k=np.clip(len(poses) - 1, 2, 3))(0.5)
                 transform["file_path"] = outpath.relative_to(output_dir)
                 transforms.append(transform)
