@@ -236,7 +236,7 @@ def test_apply_medium_background_and_extra_channels():
         apply_medium(radiance, depth, camera, pose, medium, Lighting(ambient=(1.0, 1.0)))
 
 
-def make_render(root, n=3, gray=False):
+def make_render(root, n=3, gray=False, keyframe_scale=1.0):
     """Synthetic render, with linear EXR frames, depth maps (including background pixels) and lighting."""
     camera, pose = small_camera()
     rng = np.random.default_rng(2)
@@ -250,6 +250,7 @@ def make_render(root, n=3, gray=False):
         _write_exr(root / "frames" / path, np.repeat(radiance, 3, axis=-1) if gray else radiance)
         _write_exr(root / "depths" / path, depth)
         transform = camera | {"file_path": path, "transform_matrix": pose.tolist(), "fps": 24.0}
+        transform["keyframe_scale"] = keyframe_scale
         frames.append(transform | {"c": 3})
         depths.append(transform | {"c": 1})
 
@@ -260,8 +261,9 @@ def make_render(root, n=3, gray=False):
     return lighting
 
 
-def test_cli_apply(tmp_path):
-    lighting = make_render(tmp_path / "render")
+@pytest.mark.parametrize("keyframe_scale", [1.0, 5.0])
+def test_cli_apply(tmp_path, keyframe_scale):
+    lighting = make_render(tmp_path / "render", keyframe_scale=keyframe_scale)
     medium = Medium(
         extinction=0.1,
         components=[Homogeneous(density=0.5), Blob(center=(0, 5, 1.5), radius=2, velocity=(4, 0, 0))],
@@ -278,7 +280,8 @@ def test_cli_apply(tmp_path):
 
     for i, ((radiance, transform), (depth, _)) in enumerate(zip(frames, depths)):
         pose = transform["transform_matrix"]
-        expected = apply_medium(radiance, depth, transform, pose, medium, lighting, time=i / 24)
+        # Frames rendered with a keyframe multiplier are closer in time
+        expected = apply_medium(radiance, depth, transform, pose, medium, lighting, time=i / (24 * keyframe_scale))
 
         for name, value in zip(names, expected):
             data, saved = outputs[name][i]

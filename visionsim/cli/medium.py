@@ -49,7 +49,8 @@ def apply(
         depths: name of the directory containing depth maps within ``input_dir``
         wavelengths: effective wavelength, in nm, of each color channel. Defaults to 550 for grayscale frames,
             and to (610, 550, 465) otherwise
-        fps: frame rate of the sequence, only needed for moving media, inferred from the dataset if possible
+        fps: frame rate of the sequence, only needed for moving media. Inferred from the dataset if possible,
+            accounting for the keyframe multiplier used when rendering
         device: torch device to run on, defaults to "cuda" if available
         force: if true, overwrite output directory if present
     """
@@ -84,8 +85,10 @@ def apply(
 
     if len(ds_frames) != len(ds_depths):
         raise ValueError(f"Found {len(ds_frames)} frames but {len(ds_depths)} depth maps.")
-    if fps is None and ds_frames.cameras and len(framerates := {cam.fps for cam in ds_frames.cameras}) == 1:
-        fps = framerates.pop()
+    if fps is None and ds_frames.cameras:
+        # A keyframe multiplier slows the animation down, so consecutive frames are closer in time
+        framerates = {cam.fps * (getattr(cam, "keyframe_scale", None) or 1) for cam in ds_frames.cameras if cam.fps}
+        fps = framerates.pop() if len(framerates) == 1 else None
     if not fps and any(isinstance(c, Blob) and any(c.velocity) for c in medium_spec.components):
         raise ValueError("The medium moves but the frame rate is unknown, please specify it with `--fps`.")
 
