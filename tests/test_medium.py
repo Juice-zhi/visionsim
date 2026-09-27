@@ -1,0 +1,222 @@
+import math
+
+import numpy as np
+import pytest
+import torch
+from scipy.integrate import cumulative_trapezoid, quad, trapezoid
+
+from visionsim.medium import Blob, HeightFog, Homogeneous, Lighting, Medium, Sun, apply_medium, camera_rays, kim_exponent
+from visionsim.medium.optics import component_optical_depth, height_fog_sun_inscatter, henyey_greenstein
+
+T = torch.tensor
+COMPONENTS = [
+    Homogeneous(density=0.7),
+    HeightFog(density=1.3, base_height=1.0, falloff=4.0),
+    Blob(density=2.0, center=(1.0, 6.0, 1.5), radius=1.5, velocity=(0.5, -0.2, 0.1)),
+]
+
+
+def density(component, points, time=0.0):
+    """Reference density of a component, evaluated at points of shape (..., 3)."""
+    if isinstance(component, Homogeneous):
+        return np.full(points.shape[:-1], component.density)
+    if isinstance(component, HeightFog):
+        return component.density * np.exp(-(points[..., 2] - component.base_height) / component.falloff)
+    center = np.array(component.center) + time * np.array(component.velocity)
+    return component.density * np.exp(-((points - center) ** 2).sum(-1) / (2 * component.radius**2))
+
+
+def random_rays(rng, n):
+    directions = rng.normal(size=(n, 3))
+    return rng.uniform(-3, 3, size=3), directions / np.linalg.norm(directions, axis=-1, keepdims=True)
+
+
+@pytest.mark.parametrize("component", COMPONENTS, ids=lambda c: c.type)
+def test_optical_depth_matches_quadrature(component):
+    rng = np.random.default_rng(0)
+    origin, directions = random_rays(rng, 64)
+    distance = rng.uniform(0.1, 30, size=64)
+    directions[0] = [1.0, 0.0, 0.0]  # horizontal ray
+
+    closed = component_optical_depth(component, T(origin), T(directions), T(distance), time=0.7).numpy()
+    for o, v, d, tau in zip([origin] * 64, directions, distance, closed):
+        ref, _ = quad(lambda s: density(component, o + s * v, time=0.7), 0, d, epsabs=0, epsrel=1e-12, limit=200)
+        assert tau == pytest.approx(ref, rel=1e-9, abs=1e-12)
+
+
+def test_optical_depth_to_infinity():
+    origin = T([0.0, 0.0, 2.0], dtype=torch.float64)
+    directions = T([[0.0, 0.6, 0.8], [0.0, 0.6, -0.8], [1.0, 0.0, 0.0]], dtype=torch.float64)
+    inf = torch.full((3,), torch.inf, dtype=torch.float64)
+
+    fog, blob = COMPONENTS[1], COMPONENTS[2]
+    k = fog.density * math.exp(-(2.0 - fog.base_height) / fog.falloff)
+    up, down, horizontal = component_optical_depth(fog, origin, directions, inf).tolist()
+    assert up == pytest.approx(k * fog.falloff / 0.8)
+    assert down == math.inf and horizontal == math.inf
+
+    # Towards its center, a blob integrates to sqrt(2*pi) * radius * density, minus the part behind the camera
+    offset = T(blob.center, dtype=torch.float64) - origin
+    total = component_optical_depth(blob, origin, (offset / offset.norm())[None], inf[:1]).item()
+    behind = math.erfc(offset.norm().item() / (blob.radius * math.sqrt(2))) / 2
+    assert total == pytest.approx(math.sqrt(2 * math.pi) * blob.radius * blob.density * (1 - behind), rel=1e-12)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_height_fog_sun_inscatter_matches_quadrature(seed):
+    rng = np.random.default_rng(seed)
+    fog = HeightFog(density=rng.uniform(0.2, 2), base_height=rng.uniform(-2, 2), falloff=rng.uniform(1, 20))
+    extinction, sun_z = rng.uniform(0.01, 0.3), rng.uniform(0.05, 1)
+    origin, directions = random_rays(rng, 32)
+    directions[0] = [np.sqrt(1 - sun_z**2), 0, sun_z]  # removable singularity, rays parallel to the sun's elevation
+    directions[1] = [1.0, 0.0, 0.0]  # horizontal ray
+    distance = rng.uniform(0.1, 60, size=32)
+
+    def sigma(o, v, s):
+        return extinction * density(fog, o + s[:, None] * v)
+
+    tau = extinction * component_optical_depth(fog, T(origin), T(directions), T(distance)).numpy()
+    k_ext = extinction * density(fog, origin)
+    closed = height_fog_sun_inscatter(
+        T(tau)[:, None], T([k_ext]), fog.falloff, T(directions[:, 2:3]), T(distance)[:, None], sun_z
+    ).numpy()[:, 0]
+
+    for v, d, value in zip(directions, distance, closed):
+        s = np.linspace(0, d, 200_001)
+        sig = sigma(origin, v, s)
+        tau_s = cumulative_trapezoid(sig, s, initial=0)
+        tau_sun = sig * fog.falloff / sun_z  # exponential fog above each point
+        ref = trapezoid(sig * np.exp(-tau_s - tau_sun), s)
+        assert value == pytest.approx(ref, rel=1e-6, abs=1e-12)
+
+
+def test_height_fog_sun_inscatter_edge_cases():
+    fog = HeightFog(density=1.0, falloff=5.0)
+    k_ext, sun_z = T([0.2], dtype=torch.float64), 0.5
+    dirs_z = T([[0.5], [0.3], [0.0], [-0.5], [0.3], [0.0], [-0.5]], dtype=torch.float64)
+    dist = T([[10.0], [10.0], [10.0], [10.0], [torch.inf], [torch.inf], [torch.inf]], dtype=torch.float64)
+    directions = torch.cat([torch.sqrt(1 - dirs_z**2), torch.zeros_like(dirs_z), dirs_z], dim=-1)
+    tau = 0.2 * component_optical_depth(fog, T([0.0, 0.0, 0.0], dtype=torch.float64), directions, dist[:, 0])
+
+    values = height_fog_sun_inscatter(tau[:, None], k_ext, fog.falloff, dirs_z, dist, sun_z)
+    assert torch.isfinite(values).all() and (values >= 0).all()
+
+    # Looking down into infinitely dense fog, all sunlight entering the fog along the ray gets scattered
+    c0 = 0.2 * fog.falloff / sun_z
+    assert values[-1].item() == pytest.approx(sun_z / (sun_z + 0.5) * math.exp(-c0))
+    # No sunlight reaches the fog when the sun is below the horizon, and no fog means no scattering
+    assert (height_fog_sun_inscatter(tau[:, None], k_ext, fog.falloff, dirs_z, dist, -0.1) == 0).all()
+    assert (height_fog_sun_inscatter(tau[:, None] * 0, k_ext * 0, fog.falloff, dirs_z, dist, sun_z) == 0).all()
+
+
+def test_henyey_greenstein_is_normalized():
+    theta = np.linspace(0, np.pi, 200_001)
+    for g in (-0.5, 0.0, 0.85):
+        phase = henyey_greenstein(T(np.cos(theta)), g).numpy()
+        assert trapezoid(2 * np.pi * phase * np.sin(theta), theta) == pytest.approx(1.0, rel=1e-8)
+
+
+def test_visibility():
+    medium = Medium.from_visibility(100.0, components=[Homogeneous()])
+    # The contrast of a black object at the visibility distance is the threshold
+    assert math.exp(-medium.extinction * 100.0) == pytest.approx(0.02)
+    assert Medium.from_visibility(100.0, contrast_threshold=0.05).extinction == pytest.approx(math.log(20) / 100)
+    assert [kim_exponent(v) for v in (100, 800, 3000, 10_000, 60_000)] == pytest.approx([0, 0.3, 0.82, 1.3, 1.6])
+
+
+def test_medium_validation():
+    with pytest.raises(ValueError, match="single `HeightFog`"):
+        Medium(extinction=0.1, components=[Homogeneous()], sun_attenuation=True)
+    assert Medium.model_validate_json(Medium(extinction=0.1, components=COMPONENTS).model_dump_json()).components == (
+        COMPONENTS
+    )
+
+
+def small_camera(w=7, h=5):
+    angle = 0.3
+    pose = np.eye(4)
+    # Look along +Y, slightly upwards, from 1.5m above the ground
+    pose[:3, :3] = [[1, 0, 0], [0, -np.sin(angle), np.cos(angle)], [0, np.cos(angle), np.sin(angle)]]
+    pose[:3, 3] = [0.3, -4.0, 1.5]
+    return {"w": w, "h": h, "fl_x": 6.0, "fl_y": 6.0, "cx": 3.2, "cy": 2.6}, pose
+
+
+def reference_render(medium, lighting, camera, pose, radiance, depth, wavelengths, time=0.0):
+    """Brute-force single scattering along each pixel's ray, independently of the closed forms."""
+    origin, directions, scale = (x.numpy() for x in camera_rays(camera, pose))
+    beta = np.array(medium.extinction_at(wavelengths))
+    result = np.zeros_like(radiance)
+
+    for i, j in np.ndindex(depth.shape):
+        v, d = directions[i, j], depth[i, j] * scale[i, j]
+        s = np.linspace(0, d, 100_001)
+        points = origin + s[:, None] * v
+        rho = sum(density(c, points, time) for c in medium.components)
+        tau = cumulative_trapezoid(rho, s, initial=0)[:, None] * beta
+        source = medium.albedo * np.broadcast_to(lighting.ambient, (len(s), len(beta)))
+
+        for sun in lighting.suns:
+            towards = np.array(sun.direction) / np.linalg.norm(sun.direction)
+            phase = henyey_greenstein(T(v @ towards), medium.anisotropy).item()
+            sun_tau = 0.0
+            if medium.sun_attenuation:
+                fog = medium.components[0]
+                sun_tau = density(fog, points)[:, None] * beta * fog.falloff / towards[2]
+            source = source + medium.albedo * phase * np.array(sun.irradiance) * np.exp(-sun_tau)
+
+        inscatter = trapezoid(rho[:, None] * beta * np.exp(-tau) * source, s, axis=0)
+        result[i, j] = np.exp(-tau[-1]) * radiance[i, j] + inscatter
+    return result
+
+
+@pytest.mark.parametrize(
+    "medium",
+    [
+        Medium(extinction=0.08, angstrom=1.3, albedo=0.9, anisotropy=0.6, components=COMPONENTS),
+        Medium(extinction=0.1, components=[HeightFog(density=2.0, falloff=3.0)], sun_attenuation=True),
+    ],
+    ids=["mixture", "attenuated-sun"],
+)
+def test_apply_medium_matches_brute_force(medium):
+    rng = np.random.default_rng(1)
+    camera, pose = small_camera()
+    radiance = rng.uniform(0, 2, size=(5, 7, 3))
+    depth = rng.uniform(1, 25, size=(5, 7))
+    lighting = Lighting(
+        ambient=(0.3, 0.4, 0.6),
+        suns=[
+            Sun(direction=(0.2, 1.0, 0.6), irradiance=(3.0, 2.8, 2.5)),
+            Sun(direction=(-1, 0, 0.3), irradiance=(1.0,)),
+        ],
+    )
+
+    result = apply_medium(radiance, depth, camera, pose, medium, lighting, time=0.4)
+    reference = reference_render(medium, lighting, camera, pose, radiance, depth, (610.0, 550.0, 465.0), time=0.4)
+    assert np.allclose(result.radiance.numpy(), reference, rtol=1e-6, atol=1e-9)
+
+    # Ground truth is consistent with the composited radiance
+    assert torch.allclose(result.transmittance, torch.exp(-result.optical_depth))
+    assert torch.allclose(result.radiance, result.transmittance * T(radiance) + result.inscatter)
+
+
+def test_apply_medium_background_and_extra_channels():
+    camera, pose = small_camera()
+    radiance = np.ones((5, 7, 4))
+    depth = np.full((5, 7), 1e10)  # Blender's depth for the background
+    lighting = Lighting(ambient=(0.5,))
+
+    # In a homogeneous medium the background is hidden behind the airlight, as in Koschmieder's model
+    fog = apply_medium(radiance, depth, camera, pose, Medium(extinction=0.05, albedo=0.8), lighting)
+    assert torch.allclose(fog.radiance[..., :3], T(0.8 * 0.5, dtype=torch.float64))
+    assert (fog.radiance[..., 3] == 1).all() and fog.transmittance.shape == (5, 7, 3)
+
+    # Whereas with a height fog, the sky is seen through a finite amount of fog, but not the ground
+    medium = Medium(extinction=0.05, components=[HeightFog(density=1.0, falloff=10.0)])
+    fog = apply_medium(radiance, depth, camera, pose, medium, lighting)
+    upwards = camera_rays(camera, pose)[1][..., 2] > 0
+    assert upwards.any() and (~upwards).any() and torch.isfinite(fog.radiance).all()
+    assert ((fog.transmittance[upwards] > 0) & (fog.transmittance[upwards] < 1)).all()
+    assert (fog.transmittance[~upwards] == 0).all()
+
+    with pytest.raises(ValueError, match="1 or 3 values"):
+        apply_medium(radiance, depth, camera, pose, medium, Lighting(ambient=(1.0, 1.0)))
