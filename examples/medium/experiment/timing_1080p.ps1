@@ -14,4 +14,7 @@ $t = Measure-Command { visionsim blender.render-animation "$R/demo.blend" "$R/hd
 "clear_1080p exit={0} {1:n1}s for 10 frames" -f $LASTEXITCODE, $t.TotalSeconds | Out-File $log -Append -Encoding utf8
 $t = Measure-Command { visionsim blender.render-animation "$R/fog_default.blend" "$R/hd/cycles_default" @common *> "$R/hd_cycles_default.log" }
 "cycles_default_1080p exit={0} {1:n1}s for 10 frames" -f $LASTEXITCODE, $t.TotalSeconds | Out-File $log -Append -Encoding utf8
+# With multiple scattering, see render_ms.ps1
+$t = Measure-Command { visionsim blender.render-animation "$R/fog_default_ms.blend" "$R/hd/cycles_default_ms" @common *> "$R/hd_cycles_default_ms.log" }
+"cycles_default_ms_1080p exit={0} {1:n1}s for 10 frames" -f $LASTEXITCODE, $t.TotalSeconds | Out-File $log -Append -Encoding utf8
 "finished $(Get-Date -Format s)" | Out-File $log -Append -Encoding utf8

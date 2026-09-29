@@ -21,8 +21,5 @@ Timed "clear" { visionsim blender.render-animation "$R/demo.blend" "$R/clear" @c
 
 # Same scene with a fog volume, rendered by Cycles with visionsim's default settings (256 spp, adaptive, denoised)
 Timed "cycles_default" { visionsim blender.render-animation "$R/fog_default.blend" "$R/cycles_default" @common *> "$R/cycles_default.log" }
-
-# Reference: 4096 spp without adaptive sampling nor denoising, with volume passes, and a second seed for its noise floor
-Timed "cycles_ref" { blender -b "$R/fog_ref.blend" --python-exit-code 1 --python examples/medium/experiment/render_passes.py -- "$R/cycles_ref" --samples 4096 *> "$R/cycles_ref.log" }
-Timed "cycles_ref_seed1" { blender -b "$R/fog_ref.blend" --python-exit-code 1 --python examples/medium/experiment/render_passes.py -- "$R/cycles_ref_seed1" --samples 4096 --seed 1 --no-volume-passes *> "$R/cycles_ref_seed1.log" }
 "finished $(Get-Date -Format s)" | Out-File $log -Append -Encoding utf8
+# The references are rendered by render_refs.ps1, which should run once these renders are done

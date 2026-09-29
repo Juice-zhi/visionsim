@@ -22,6 +22,10 @@ def main(args):
     service.exposed_cycles_settings(device_type="optix", use_cpu=False, max_samples=args.samples, use_denoising=False)
     service.scene.cycles.use_adaptive_sampling = False
     service.scene.cycles.seed = args.seed
+    if args.volume_bounces is not None:
+        # The total number of bounces also limits volume bounces, so leave room for surface bounces too
+        service.scene.cycles.volume_bounces = args.volume_bounces
+        service.scene.cycles.max_bounces = max(service.scene.cycles.max_bounces, args.volume_bounces + 12)
 
     service.exposed_include_frames(file_format="OPEN_EXR", bit_depth=32, exr_codec="ZIP")
     if args.volume_passes:
@@ -37,8 +41,9 @@ def main(args):
         service.exposed_render_animation()
         count = len(service.exposed_animation_range())
     else:
-        service.exposed_render_frame(args.frame)
-        count = 1
+        for frame in args.frame:
+            service.exposed_render_frame(frame)
+        count = len(args.frame)
     elapsed = time.perf_counter() - start
     print(f"RENDER_TIME frames={count} total={elapsed:.2f}s per_frame={elapsed / count:.3f}s", flush=True)
 
@@ -46,9 +51,14 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("output", help="directory in which to save the passes")
-    parser.add_argument("--frame", type=int, help="frame to render, after rescaling keyframes, defaults to all")
+    parser.add_argument("--frame", type=int, nargs="+", help="frames to render, after rescaling keyframes, or all")
     parser.add_argument("--keyframe-multiplier", type=float, default=5.0, help="same as the render CLI's option")
     parser.add_argument("--samples", type=int, default=4096, help="samples per pixel")
     parser.add_argument("--seed", type=int, default=0, help="Cycles sampling seed")
+    parser.add_argument(
+        "--volume-bounces",
+        type=int,
+        help="maximum number of volume scattering events, i.e. 0 for single scattering, defaults to the scene's",
+    )
     parser.add_argument("--no-volume-passes", dest="volume_passes", action="store_false", help="only save frames")
     main(parser.parse_args(sys.argv[sys.argv.index("--") + 1 :]))

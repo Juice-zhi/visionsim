@@ -99,6 +99,8 @@ def main(args):
     box.data.materials.append(fog_material(medium))
 
     scene.cycles.volume_bounces = args.volume_bounces
+    # The total number of bounces also limits volume bounces, so leave room for surface bounces too
+    scene.cycles.max_bounces = max(scene.cycles.max_bounces, args.volume_bounces + 12)
     scene.cycles.volume_biased = False
     scene.cycles.volume_max_steps = 100_000
     if args.no_adaptive:
@@ -114,7 +116,12 @@ if __name__ == "__main__":
     parser.add_argument("--half-width", type=float, default=200.0, help="half extent of the fog box in x and y (m)")
     parser.add_argument("--bottom", type=float, default=-1.0, help="height of the bottom of the fog box (m)")
     parser.add_argument("--top", type=float, default=25.0, help="height of the top of the fog box (m)")
-    parser.add_argument("--volume-bounces", type=int, default=0, help="maximum number of volume scattering events")
+    parser.add_argument(
+        "--volume-bounces",
+        type=int,
+        default=0,
+        help="maximum number of volume scattering events, i.e. 0 (Blender's default) for single scattering",
+    )
     parser.add_argument("--no-adaptive", action="store_true", help="disable adaptive sampling, e.g. for references")
     parser.add_argument("--seed", type=int, default=0, help="Cycles sampling seed")
     main(parser.parse_args(sys.argv[sys.argv.index("--") + 1 :]))

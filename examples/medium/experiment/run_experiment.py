@@ -65,6 +65,13 @@ LABELS = {
     "closed_form": "闭式解",
     "reference": "参考 Cycles 4096spp",
     "reference_seed1": "参考（另一种子）",
+    "cycles_default_ss": "Cycles 默认（单次散射）",
+}
+FOLDERS = {  # rendered method -> folder of its render in ROOT
+    "cycles_default": "cycles_default",
+    "cycles_nodenoise": "cycles_nodenoise",
+    "reference": "cycles_ref",
+    "reference_seed1": "cycles_ref_seed1",
 }
 PASSIVE = [
     "clear",
@@ -86,6 +93,26 @@ TOF = {  # ToF method -> (passive method providing the ambient background, ray m
 TOF_LABELS = LABELS | {"raymarch_16": "Ray marching 128 步", "raymarch_64s16": "Ray marching 1024 步"}
 COLORS = {name: f"C{i}" for i, name in enumerate(LABELS)}  # the same color for a method in every plot
 FONT = ImageFont.truetype("C:/Windows/Fonts/msyh.ttc", 13)
+STILLS = ("clear", "cycles_default", "cycles_nodenoise", "raymarch_16", "closed_form_m1", "closed_form")
+VIDEO = ("clear", "cycles_default", "cycles_nodenoise", "raymarch_16", "closed_form")
+
+
+def use_multiple_scattering() -> None:
+    """Compare against Cycles renders in which light may scatter many times in the fog (``render_ms.ps1``), instead
+    of Blender's default single scattering, alongside Cycles' single scattering render with default settings."""
+    global STILLS, VIDEO
+    FOLDERS.update({name: f"ms/{folder}" for name, folder in FOLDERS.items()} | {"cycles_default_ss": "cycles_default"})
+    PASSIVE.insert(PASSIVE.index("cycles_nodenoise") + 1, "cycles_default_ss")
+    names = {
+        "cycles_default": "Cycles 默认（多次散射）",
+        "cycles_nodenoise": "Cycles 不降噪（多次散射）",
+        "reference": "参考（多次散射）",
+        "reference_seed1": "参考（多次散射，另一种子）",
+    }
+    LABELS.update(names)
+    TOF_LABELS.update(names)
+    STILLS = ("clear", "cycles_default_ss", "cycles_default", "cycles_nodenoise", "raymarch_16", "closed_form")
+    VIDEO = ("clear", "cycles_default_ss", "cycles_default", "raymarch_16", "closed_form")
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -172,13 +199,7 @@ def passive_sequences(cache: Path, limit: int | None) -> tuple[dict[str, np.ndar
         ),
     }
     sequences, seconds = {"clear": clear}, {}
-    folders = {
-        "cycles_default": "cycles_default",
-        "cycles_nodenoise": "cycles_nodenoise",
-        "reference": "cycles_ref",
-        "reference_seed1": "cycles_ref_seed1",
-    }
-    for name, folder in folders.items():
+    for name, folder in FOLDERS.items():
         if (ROOT / folder / "frames").exists():
             sequences[name] = load_sequence(ROOT / folder / "frames", limit=limit)[0]
     if len(sequences.get("cycles_nodenoise", [])) < len(clear):
@@ -448,12 +469,15 @@ def write_video(frames: list[np.ndarray], path: Path, fps: int = 25) -> None:
 
 
 def main(args):
-    out = ROOT / "results"
+    if args.truth == "multiple":
+        use_multiple_scattering()
+    out = ROOT / ("results" if args.truth == "single" else "results_ms")
+    cache = ROOT / "results" / "cache"  # the closed form and ray marching don't depend on the reference
     (out / "images").mkdir(parents=True, exist_ok=True)
     (out / "videos").mkdir(parents=True, exist_ok=True)
-    (out / "cache").mkdir(parents=True, exist_ok=True)
+    cache.mkdir(parents=True, exist_ok=True)
 
-    seqs, transforms, medium_seconds = passive_sequences(out / "cache", args.frames)
+    seqs, transforms, medium_seconds = passive_sequences(cache, args.frames)
     print("passive sequences ready", {k: v.shape for k, v in seqs.items()}, medium_seconds, flush=True)
     global FRAME
     FRAME = min(FRAME, 5 * (len(transforms) // 10))
@@ -512,8 +536,7 @@ def main(args):
     print(json.dumps(summary, indent=1, ensure_ascii=False), flush=True)
 
     # Still images of the chosen frame
-    candidates = ("clear", "cycles_default", "cycles_nodenoise", "raymarch_16", "closed_form_m1", "closed_form")
-    columns = [n for n in candidates if n in PASSIVE] + ["reference"]
+    columns = [n for n in STILLS if n in PASSIVE] + ["reference"]
     k = FRAME // 5
     reference = seqs["reference"][FRAME]
     rows = [
@@ -607,8 +630,7 @@ def main(args):
     plt.close(fig)
 
     # Videos
-    candidates = ("clear", "cycles_default", "cycles_nodenoise", "raymarch_16", "closed_form")
-    video_columns = [n for n in candidates if n in PASSIVE] + ["reference"]
+    video_columns = [n for n in VIDEO if n in PASSIVE] + ["reference"]
     frames = []
     for k in range(len(rgb["reference"]["noisy"])):
         i = 5 * k + 2
@@ -638,4 +660,11 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--frames", type=int, help="only use the first frames, for quick tests")
+    parser.add_argument(
+        "--truth",
+        choices=("single", "multiple"),
+        default="single",
+        help="compare against Cycles with single scattering (Blender's default) or multiple scattering, whose "
+        "results are saved to results_ms",
+    )
     main(parser.parse_args())

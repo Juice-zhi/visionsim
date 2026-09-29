@@ -7,8 +7,8 @@
 <header style="display:flex;flex-direction:column;gap:14px">
   <div class="eyebrow">VisionSIM · feat/volumetric-media · 地面雾 · 4 种仿真传感器</div>
   <h1>雾化方法对照实验</h1>
-  <p class="lede">同一个动画场景、同一团地面雾，分别用<strong>无雾 baseline</strong>、<strong>Cycles 体积路径追踪</strong>、<strong>ray marching</strong> 和<strong>闭式解</strong>生成带雾画面，再喂给 RGB、被动 SPAD、DVS 和 ToF 四种仿真传感器，逐一对比它们和参考真值之间的 loss 以及耗时。</p>
-  <div class="meta"><span>场景 320×180，125 fps × 500 帧（4 s）</span><span>参考：Cycles 4096 spp，每帧 {r[cycles_ref]:.2f} s</span><span>GPU：RTX 5080</span></div>
+  <p class="lede">同一个动画场景、同一团地面雾，分别用<strong>无雾 baseline</strong>、<strong>Cycles 体积路径追踪</strong>、<strong>ray marching</strong> 和<strong>闭式解</strong>生成带雾画面，再喂给 RGB、被动 SPAD、DVS 和 ToF 四种仿真传感器，对比闭式解省下的时间和损失的精度。真值有两个：物理上完整的<strong>多次散射</strong>，以及 Blender 默认、和闭式解模型一致的<strong>单次散射</strong>。</p>
+  <div class="meta"><span>场景 320×180，125 fps × 500 帧（4 s）</span><span>参考：Cycles 4096 spp，多次散射每帧 {r[ms_cycles_ref]:.2f} s，单次散射每帧 {r[cycles_ref]:.2f} s</span><span>GPU：RTX 5080</span></div>
 </header>
 
 <section>
@@ -17,8 +17,26 @@
 </section>
 
 <section>
-  <h2>汇总</h2>
-  <p>每种传感器取一个主要 loss；各传感器的完整指标见后文。"生成一帧"指从 Blender 场景到得到带雾画面的总耗时。"只改雾参数时"指场景不变、只改雾的参数（比如能见度）时，重新生成一帧所需的时间。</p>
+  <h2>闭式解省下多少时间、损失多少精度</h2>
+  <p>{ms_intro}</p>
+  {ms_summary_table}
+  <figure><a href="images/tradeoff.png" target="_blank" rel="noopener"><img src="images/tradeoff.png" alt="各方法的误差与耗时，分别以单次散射和多次散射为真值" loading="lazy"></a>
+  <figcaption>{tradeoff_caption}</figcaption></figure>
+  <p>{ms_text}</p>
+  <h3>多次散射有多重要</h3>
+  <p>{bounces_intro}</p>
+  {bounces_table}
+  <p>{bounces_text}</p>
+  <h3>画面与传感器输出（以多次散射为真值）</h3>
+  <figure><a href="images/overview_ms.png" target="_blank" rel="noopener"><img src="images/overview_ms.png" alt="以多次散射为真值时，各方法在第 250 帧的渲染帧、误差图和传感器输出" loading="lazy"></a>
+  <figcaption>{overview_ms_caption}</figcaption></figure>
+  <p>整段动画，列同上图，以 12 fps 播放（约 2 倍慢放）。从上到下依次是：渲染帧、RGB、SPAD（32 帧平均）、DVS（40 ms）、ToF 测距。</p>
+  <video src="videos/sensors_ms.mp4" controls muted loop playsinline preload="metadata"></video>
+</section>
+
+<section>
+  <h2>以单次散射为真值：模型本身的误差</h2>
+  <p>这一部分的参考和闭式解一样只算单次散射（Blender 默认的 0 次体积弹射），所以衡量的是闭式解对它自己的物理模型实现得怎么样，以及模型里还缺哪些几何效应。以下各节都以单次散射为真值。每种传感器取一个主要 loss；各传感器的完整指标见后文。“生成一帧”指从 Blender 场景到得到带雾画面的总耗时，“只改雾参数时”指场景不变、只改雾的参数（比如能见度）时重新生成一帧所需的时间。</p>
   {summary_table}
 </section>
 
@@ -26,19 +44,19 @@
   <h2>实验设置</h2>
   <dl class="setup">
     <dt>场景</dt><dd>演示场景（<code>examples/medium/demo_scene.py</code>）：棋盘格地面、4 个方块、7 根柱子。太阳高度角 30°、辐照度 4 W/m²，天空辐射度 (0.25, 0.35, 0.55)。相机离地 1.6 m，前进 24 m 并同时转动，关键帧拉伸 5 倍，得到 125 fps × 500 帧。</dd>
-    <dt>雾</dt><dd>地面雾 <code>media/ground_fog.json</code>：σ(z) = 0.08·e<sup>−z/2.5</sup> m⁻¹，反照率 1，HG 相函数 g = 0.8，阳光和天光在雾中都会衰减。Cycles 里是一个 400×400×26 m 的体积盒，密度函数完全相同，体积弹射次数为 0（Blender 默认，即单次散射）。</dd>
-    <dt>参考真值</dt><dd>Cycles 体积路径追踪，4096 spp，关闭自适应采样和降噪。另外换一个随机种子重新渲染一遍，两者之差就是参考自身的噪声底。</dd>
+    <dt>雾</dt><dd>地面雾 <code>media/ground_fog.json</code>：σ(z) = 0.08·e<sup>−z/2.5</sup> m⁻¹，反照率 1，HG 相函数 g = 0.8，阳光和天光在雾中都会衰减。Cycles 里是一个 400×400×26 m 的体积盒，密度函数完全相同。</dd>
+    <dt>参考真值</dt><dd>两套参考，都是 Cycles 体积路径追踪，4096 spp，关闭自适应采样和降噪：多次散射（最多 16 次体积弹射，8 次时已收敛）和单次散射（Blender 默认的 0 次体积弹射）。每套都换一个随机种子再渲染一遍，两者之差就是参考自身的噪声底。</dd>
     <dt>闭式解与 ray marching 的输入</dt><dd>无雾场景用 visionsim 默认设置渲染（256 spp，自适应采样，降噪），输出线性 EXR、深度和 <code>lighting.json</code>。雾是事后加上去的，渲染帧只算一次。</dd>
   </dl>
   <div class="table-wrap"><table>
     <thead><tr><th scope="col">方法</th><th scope="col" style="text-align:left">雾怎么来</th></tr></thead>
     <tbody>
       <tr><th scope="row">无雾 baseline</th><td style="text-align:left;font-family:var(--sans);white-space:normal">原始 visionsim 流程，不加雾。它的 loss 就是"完全忽略雾"会造成的误差。</td></tr>
-      <tr><th scope="row">Cycles 默认设置</th><td style="text-align:left;font-family:var(--sans);white-space:normal">把雾的体积放进场景，用 visionsim 默认的渲染设置（256 spp，自适应采样，OIDN 降噪）直接渲染，也就是"真实体积渲染"的常规做法。</td></tr>
-      <tr><th scope="row">Cycles 默认（不降噪）</th><td style="text-align:left;font-family:var(--sans);white-space:normal">同上，但关闭降噪，画面保留蒙特卡洛噪声，用来检验渲染噪声对光子级传感器的影响。</td></tr>
-      <tr><th scope="row">Ray marching</th><td style="text-align:left;font-family:var(--sans);white-space:normal">新增的 <code>visionsim.medium.ray_march_medium</code>：沿每条视线均匀分步做数值积分，每步内按能量守恒的方式积分。<em>16 步</em>版本中，光照衰减用解析式；<em>64+16 步</em>版本中，每个采样点再朝太阳方向走 16 步，这是通用体积渲染器的做法。它和闭式解积分的是同一个物理模型。</td></tr>
+      <tr><th scope="row">Cycles 默认设置</th><td style="text-align:left;font-family:var(--sans);white-space:normal">把雾的体积放进场景，用 visionsim 默认的渲染设置（256 spp，自适应采样，OIDN 降噪）直接渲染，也就是"真实体积渲染"的常规做法。分别渲染了多次散射（最多 16 次体积弹射）和单次散射（Blender 默认的 0 次）两个版本。</td></tr>
+      <tr><th scope="row">Cycles 不降噪</th><td style="text-align:left;font-family:var(--sans);white-space:normal">同上，但关闭降噪，画面保留蒙特卡洛噪声，用来检验渲染噪声对光子级传感器的影响。</td></tr>
+      <tr><th scope="row">Ray marching</th><td style="text-align:left;font-family:var(--sans);white-space:normal">新增的 <code>visionsim.medium.ray_march_medium</code>：沿每条视线均匀分步做数值积分，每步内按能量守恒的方式积分。<em>16 步</em>版本中，光照衰减用解析式；<em>64+16 步</em>版本中，每个采样点再朝太阳方向走 16 步，这是通用体积渲染器的做法。它和闭式解积分的是同一个单次散射模型，只是换成了数值积分。</td></tr>
       <tr><th scope="row">闭式解（修正天光前）</th><td style="text-align:left;font-family:var(--sans);white-space:normal">上一版 M1 的光照模型：天空被当作来自整个球面的均匀光，并且不被雾衰减。</td></tr>
-      <tr><th scope="row">闭式解</th><td style="text-align:left;font-family:var(--sans);white-space:normal">当前模型：天光只来自上半球（下半球被地面遮挡），按相函数加权，并且被雾衰减。每个方向的衰减都有闭式解，方向积分用固定求积，结果确定、没有噪声。</td></tr>
+      <tr><th scope="row">闭式解</th><td style="text-align:left;font-family:var(--sans);white-space:normal">当前模型（单次散射）：天光只来自上半球（下半球被地面遮挡），按相函数加权，并且被雾衰减。每个方向的衰减都有闭式解，方向积分用固定求积，结果确定、没有噪声。</td></tr>
     </tbody>
   </table></div>
   <div class="table-wrap"><table>
@@ -53,8 +71,8 @@
 </section>
 
 <section>
-  <h2>画面与传感器输出</h2>
-  <p>第 250 帧（相机正从红色方块旁边经过）。第二行是相对参考的误差（0–50%）。点击图片可以看原图。</p>
+  <h2>画面与传感器输出（以单次散射为真值）</h2>
+  <p>第 250 帧（相机正从红色方块旁边经过）。第二行是相对单次散射参考的误差（0–50%）。点击图片可以看原图。</p>
   <figure><a href="images/overview.png" target="_blank" rel="noopener"><img src="images/overview.png" alt="各方法在第 250 帧的渲染帧、误差图和四种传感器输出" loading="lazy"></a>
   <figcaption>{overview_caption}</figcaption></figure>
   <h3>视频</h3>
@@ -63,7 +81,7 @@
 </section>
 
 <section>
-  <h2>各传感器细节</h2>
+  <h2>各传感器细节（以单次散射为真值）</h2>
   <figure><a href="images/loss_curves.png" target="_blank" rel="noopener"><img src="images/loss_curves.png" alt="四种传感器的逐帧 loss 曲线" loading="lazy"></a>
   <figcaption>{curves_caption}</figcaption></figure>
   <h3>RGB</h3>
@@ -100,7 +118,7 @@
 </section>
 
 <section>
-  <h2>闭式解和真值的差距从哪来</h2>
+  <h2>闭式解和单次散射真值的差距从哪来</h2>
   <p>{breakdown_intro}</p>
   <div class="table-wrap"><table>
     <thead><tr><th scope="col">第 255 帧，雾的散射光：闭式解 / Cycles</th><th scope="col">天空像素</th><th scope="col">表面像素</th></tr></thead>
@@ -127,15 +145,17 @@
 <pre><code>blender -b --factory-startup --python examples/medium/demo_scene.py -- runs/fog-comparison/demo.blend
 blender -b runs/fog-comparison/demo.blend --python examples/medium/experiment/add_fog.py -- examples/medium/media/ground_fog.json runs/fog-comparison/fog_default.blend
 blender -b runs/fog-comparison/demo.blend --python examples/medium/experiment/add_fog.py -- examples/medium/media/ground_fog.json runs/fog-comparison/fog_ref.blend --no-adaptive
-pwsh examples/medium/experiment/render_all.ps1        # 无雾 + Cycles 默认设置
-pwsh examples/medium/experiment/render_refs.ps1       # 参考（两个种子）
-pwsh examples/medium/experiment/render_nodenoise.ps1  # Cycles 不降噪
+pwsh examples/medium/experiment/render_all.ps1        # 无雾 + Cycles 默认设置（单次散射）
+pwsh examples/medium/experiment/render_refs.ps1       # 单次散射参考（两个种子）
+pwsh examples/medium/experiment/render_nodenoise.ps1  # Cycles 不降噪（单次散射）
+pwsh examples/medium/experiment/render_ms.ps1         # 多次散射：Cycles 默认、不降噪、参考（两个种子）
 blender -b runs/fog-comparison/demo.blend --python examples/medium/experiment/export_lighting.py -- runs/fog-comparison/clear/lighting.json
 $env:PYTHONPATH = "examples/medium/experiment"; python examples/medium/experiment/run_experiment.py
+python examples/medium/experiment/run_experiment.py --truth multiple   # 结果在 results_ms
 python examples/medium/experiment/temporal.py         # DVS 一节的对数亮度误差
 pwsh examples/medium/experiment/timing_1080p.ps1      # 1080p 计时：渲染 10 帧
 python examples/medium/experiment/timing_1080p.py
 python examples/medium/experiment/make_report.py</code></pre>
-  <p>误差拆解用 <code>breakdown_scenes.py</code> 生成几种光源变体场景，再用 <code>render_passes.py --frame 255</code> 渲染，最后由 <code>breakdown.py</code> 汇总。</p>
+  <p>误差拆解用 <code>breakdown_scenes.py</code> 生成几种光源变体场景，再用 <code>render_passes.py --frame 255</code> 渲染，最后由 <code>breakdown.py</code> 汇总。多次散射的影响：用 <code>render_passes.py --samples 1024 --frame 255 345 --volume-bounces N</code> 把两帧以 N = 0、1、2、4、8、16、32 次体积弹射各渲染一遍（输出到 <code>runs/fog-comparison/bounces/N</code>），再由 <code>bounces.py</code> 汇总。</p>
 </section>
 </main>
