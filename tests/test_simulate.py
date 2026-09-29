@@ -183,4 +183,6 @@ def test_lighting_info(executable, tmp_path):
     # Lights are added and checked from within Blender, the saved lighting is then validated here
     _run_blender_script(executable, "lighting.py", tmp_path / "lighting.json")
     lighting = Lighting.model_validate_json((tmp_path / "lighting.json").read_text())
-    assert len(lighting.suns) == 1 and len(lighting.points) == 1 and lighting.ambient == pytest.approx((1, 0.5, 0.25))
+    latitudes = (np.arange(16) + 0.5) / 32 * np.pi
+    expected_sky = (np.array((1.0, 0.5, 0.25)) + 100 * np.cos(latitudes[-1]) / np.cos(latitudes).sum()) * 2.0
+    assert len(lighting.suns) == 1 and len(lighting.points) == 1 and lighting.sky == pytest.approx(expected_sky)

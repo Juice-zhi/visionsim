@@ -815,27 +815,28 @@ class BlenderService(rpyc.Service):
 
     @staticmethod
     def _mean_equirectangular(image: bpy.types.Image) -> list[float]:
-        """Average linear radiance over the sphere of an equirectangular environment map.
+        """Average linear radiance over the upper hemisphere of an equirectangular environment map.
 
         Args:
             image (bpy.types.Image): Environment map, in equirectangular projection.
 
         Returns:
-            list[float]: Mean RGB radiance, weighted by solid angle.
+            list[float]: Mean RGB radiance above the horizon, weighted by solid angle.
         """
 
     @require_initialized_service
     def _world_radiance(self) -> list[float]:
-        """Average radiance of the world background, over the whole sphere."""
+        """Average radiance of the world background above the horizon."""
 
     @require_initialized_service
     def exposed_lighting_info(self) -> dict[str, Any]:
         """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
 
         This includes sun and point lights, whose intensities account for their exposure and volume factor, as well
-        as the average radiance of the world background (either a constant color or an environment texture).
-        Light temperatures, spot and area lights, and other world shaders are not supported and are ignored,
-        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
+        as the average radiance of the world background above the horizon, i.e. the sky (either a constant color or
+        an environment texture). Light temperatures, spot and area lights, and other world shaders are not supported
+        and are ignored, with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for
+        its usage.
 
         Returns:
             dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
@@ -1616,9 +1617,10 @@ class BlenderClient:
         """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
 
         This includes sun and point lights, whose intensities account for their exposure and volume factor, as well
-        as the average radiance of the world background (either a constant color or an environment texture).
-        Light temperatures, spot and area lights, and other world shaders are not supported and are ignored,
-        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
+        as the average radiance of the world background above the horizon, i.e. the sky (either a constant color or
+        an environment texture). Light temperatures, spot and area lights, and other world shaders are not supported
+        and are ignored, with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for
+        its usage.
 
         Returns:
             dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
@@ -2472,9 +2474,10 @@ class BlenderClients(tuple):
         """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
 
         This includes sun and point lights, whose intensities account for their exposure and volume factor, as well
-        as the average radiance of the world background (either a constant color or an environment texture).
-        Light temperatures, spot and area lights, and other world shaders are not supported and are ignored,
-        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
+        as the average radiance of the world background above the horizon, i.e. the sky (either a constant color or
+        an environment texture). Light temperatures, spot and area lights, and other world shaders are not supported
+        and are ignored, with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for
+        its usage.
 
         Returns:
             dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.

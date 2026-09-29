@@ -49,17 +49,22 @@ def main(blend_file: str, output: str) -> None:
         background = next(n for n in scene.world.node_tree.nodes if n.bl_idname == "ShaderNodeBackground")
         background.inputs["Color"].default_value = (0.2, 0.3, 0.4, 1.0)
         background.inputs["Strength"].default_value = 2.0
-        assert np.allclose(service.exposed_lighting_info()["ambient"], (0.4, 0.6, 0.8))
+        assert np.allclose(service.exposed_lighting_info()["sky"], (0.4, 0.6, 0.8))
 
-        # Environment map, bright in the upper hemisphere only, whose solid angle is half of the sphere
+        # Environment map, whose upper hemisphere is bright and lower one is dark. Only the sky above the horizon is
+        # exported, and its brightest band, near the zenith, covers a small solid angle so it weighs less
         image = bpy.data.images.new("Sky", width=64, height=32, float_buffer=True)
         pixels = np.zeros((32, 64, 4), dtype=np.float32)
         pixels[16:] = (1.0, 0.5, 0.25, 1.0)
+        pixels[-1] = (101.0, 100.5, 100.25, 1.0)
         image.pixels.foreach_set(pixels.ravel())
         environment = scene.world.node_tree.nodes.new("ShaderNodeTexEnvironment")
         environment.image = image
         scene.world.node_tree.links.new(environment.outputs["Color"], background.inputs["Color"])
-        assert np.allclose(service.exposed_lighting_info()["ambient"], np.array((1.0, 0.5, 0.25)) * 2.0 / 2)
+        latitudes = (np.arange(16) + 0.5) / 32 * np.pi
+        zenith_weight = np.cos(latitudes[-1]) / np.cos(latitudes).sum()
+        expected = (np.array((1.0, 0.5, 0.25)) + 100 * zenith_weight) * 2.0
+        assert np.allclose(service.exposed_lighting_info()["sky"], expected)
 
         service.exposed_save_lighting(output)
 

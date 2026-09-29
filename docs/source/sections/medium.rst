@@ -62,7 +62,9 @@ properties:
 
 The medium is lit by the same lights as the scene, which are exported from Blender to ``lighting.json`` (see
 :meth:`lighting_info <visionsim.simulate.blender.BlenderService.exposed_lighting_info>`): sun lights, and the average
-radiance of the world background.
+radiance of the world background above the horizon, i.e. the sky. Light from below the horizon is assumed to be blocked
+by the ground, and, with ``sun_attenuation``, both sunlight and skylight are attenuated by the fog they travel through
+before being scattered.
 
 |
 
@@ -77,7 +79,8 @@ Along the ray of each pixel, which travels a distance :math:`d` before hitting a
     \tau(s) = \int_0^s \sigma(r) \, dr
 
 where :math:`\sigma` is the extinction coefficient and :math:`J` the light scattered towards the camera, which is
-the albedo times the ambient radiance, plus the phase function times the irradiance of each sun. Every component
+the albedo times the skylight weighted by the phase function over the sky, plus the phase function times the irradiance
+of each sun. Every component
 has a closed-form optical depth :math:`\tau`, which relies on error functions for blobs. Moreover, when :math:`J` is
 constant along the ray, the integral is exactly :math:`J \, (1 - T(d))` regardless of the density, which is a
 generalization of Koschmieder's model. When sunlight is attenuated by an exponential height fog before being
@@ -87,8 +90,9 @@ scattered, this integral also has a closed form:
     \int_0^d \sigma(s) \, T(s) \, T_{sun}(s) \, ds = \frac{\ell_z}{\ell_z - v_z} \left( T_{sun}(0) - T(d) \, T_{sun}(d) \right)
 
 where :math:`v_z` and :math:`\ell_z` are the vertical components of the ray direction and of the direction towards
-the sun, and :math:`T_{sun}` the transmittance between a point and the sun. See :mod:`visionsim.medium.optics`
-for details.
+the sun, and :math:`T_{sun}` the transmittance between a point and the sun. Skylight is integrated over the sky with
+a fixed quadrature (:func:`sky_quadrature <visionsim.medium.optics.sky_quadrature>`), where each direction is attenuated
+like a sun would be, so the result stays deterministic and noise-free. See :mod:`visionsim.medium.optics` for details.
 
 |
 
@@ -108,9 +112,9 @@ Limitations
 
 The following are not yet modeled:
 
-- Shadows cast onto the medium, i.e. light shafts.
+- Shadows cast onto the medium, i.e. light shafts, and the occlusion of the sky by nearby objects.
 - Point, spot and area lights, as well as emissive surfaces, lighting the medium.
-- Multiple scattering, which becomes significant in dense media, and anisotropic environment lighting.
+- Multiple scattering, which becomes significant in dense media, and skies whose radiance varies with direction.
 - The dimming of surfaces lit through the medium.
 - Anti-aliasing: depth maps are not anti-aliased, so edges between near and far objects can show halos in dense
   media. Rendering at a higher resolution and downsampling the results reduces these.

@@ -1751,13 +1751,13 @@ class BlenderService(rpyc.Service):
 
     @staticmethod
     def _mean_equirectangular(image: bpy.types.Image) -> list[float]:
-        """Average linear radiance over the sphere of an equirectangular environment map.
+        """Average linear radiance over the upper hemisphere of an equirectangular environment map.
 
         Args:
             image (bpy.types.Image): Environment map, in equirectangular projection.
 
         Returns:
-            list[float]: Mean RGB radiance, weighted by solid angle.
+            list[float]: Mean RGB radiance above the horizon, weighted by solid angle.
         """
         w, h = image.size
         pixels = np.empty(w * h * image.channels, dtype=np.float32)
@@ -1768,12 +1768,13 @@ class BlenderService(rpyc.Service):
             rgb = np.where(rgb < 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
 
         # Rows go from the bottom to the top of the image, each row spans a band of latitude
-        weights = np.cos((np.arange(h) + 0.5) / h * np.pi - np.pi / 2)
+        latitudes = (np.arange(h) + 0.5) / h * np.pi - np.pi / 2
+        weights = np.cos(latitudes) * (latitudes > 0)
         return ((rgb * weights[:, None, None]).sum(axis=(0, 1)) / (weights.sum() * w)).tolist()
 
     @require_initialized_service
     def _world_radiance(self) -> list[float]:
-        """Average radiance of the world background, over the whole sphere."""
+        """Average radiance of the world background above the horizon."""
         world = self.scene.world
         if world is None:
             return [0.0, 0.0, 0.0]
@@ -1804,9 +1805,10 @@ class BlenderService(rpyc.Service):
         """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
 
         This includes sun and point lights, whose intensities account for their exposure and volume factor, as well
-        as the average radiance of the world background (either a constant color or an environment texture).
-        Light temperatures, spot and area lights, and other world shaders are not supported and are ignored,
-        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
+        as the average radiance of the world background above the horizon, i.e. the sky (either a constant color or
+        an environment texture). Light temperatures, spot and area lights, and other world shaders are not supported
+        and are ignored, with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for
+        its usage.
 
         Returns:
             dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
@@ -1838,7 +1840,7 @@ class BlenderService(rpyc.Service):
             else:
                 self.log.warning(f"{light.type.title()} light '{obj.name}' is not supported and will be ignored.")
 
-        return {"ambient": self._world_radiance(), "suns": suns, "points": points}
+        return {"sky": self._world_radiance(), "suns": suns, "points": points}
 
     @require_initialized_service
     def exposed_save_lighting(self, path: str | os.PathLike | None = None) -> None:

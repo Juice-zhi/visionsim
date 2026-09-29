@@ -20,7 +20,12 @@ from visionsim.medium import (
     camera_rays,
     kim_exponent,
 )
-from visionsim.medium.optics import component_optical_depth, height_fog_sun_inscatter, henyey_greenstein
+from visionsim.medium.optics import (
+    component_optical_depth,
+    height_fog_sun_inscatter,
+    henyey_greenstein,
+    sky_quadrature,
+)
 
 T = torch.tensor
 COMPONENTS = [
@@ -217,6 +222,70 @@ def test_apply_medium_matches_brute_force(medium):
     assert torch.allclose(result.radiance, result.transmittance * T(radiance) + result.inscatter)
 
 
+def sky_source(v, g, c_values, n_theta=300, n_phi=600):
+    """Brute-force skylight scattered along direction v, for a unit sky above the horizon, after it was attenuated
+    by an optical depth of ``c / ω_z`` along each direction ω, for each value of c."""
+    theta = (np.arange(n_theta) + 0.5) / n_theta * np.pi / 2
+    phi = (np.arange(n_phi) + 0.5) / n_phi * 2 * np.pi
+    th, ph = np.meshgrid(theta, phi, indexing="ij")
+    omega = np.stack([np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)], -1).reshape(-1, 3)
+    weights = (np.sin(th) * (np.pi / 2 / n_theta) * (2 * np.pi / n_phi)).reshape(-1)
+    weights = weights * henyey_greenstein(T(omega @ v), g).numpy()
+    return np.exp(-np.outer(np.atleast_1d(c_values), 1 / omega[:, 2])) @ weights
+
+
+@pytest.mark.parametrize("g", [0.0, 0.6, 0.85, -0.3])
+def test_sky_quadrature_matches_brute_force(g):
+    for v_z in (-0.9, -0.3, -0.05, 0.0, 0.1, 0.5, 1.0):
+        v = np.array([math.sqrt(1 - v_z * v_z), 0.0, v_z])
+        elevations, weights = sky_quadrature(T(v)[None], g)
+        for c, expected in zip((0.0, 0.05, 0.5, 5.0), sky_source(v, g, (0.0, 0.05, 0.5, 5.0))):
+            value = (weights * torch.exp(-c / elevations.clamp_min(1e-300)) * (elevations > 0)).sum().item()
+            assert value == pytest.approx(expected, rel=2e-3, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    "medium",
+    [
+        Medium(extinction=0.1, anisotropy=0.8, components=[HeightFog(density=1.0, falloff=2.5)], sun_attenuation=True),
+        Medium(extinction=0.08, angstrom=1.3, albedo=0.9, anisotropy=0.6, components=COMPONENTS),
+    ],
+    ids=["attenuated", "unattenuated"],
+)
+def test_apply_medium_sky_matches_brute_force(medium):
+    rng = np.random.default_rng(3)
+    camera, pose = small_camera(w=3, h=2)
+    camera = camera | {"fl_x": 1.5, "fl_y": 1.5, "cx": 1.5, "cy": 1.0}
+    origin, directions, scale = (x.numpy() for x in camera_rays(camera, pose))
+
+    # Rays going down stop on the ground, which is what blocks light from below the horizon
+    with np.errstate(divide="ignore"):
+        to_ground = np.where(directions[..., 2] < 0, -origin[2] / directions[..., 2], np.inf)
+    depth = np.minimum(rng.uniform(2, 40, size=(2, 3)), to_ground / scale)
+    sky = np.array([0.2, 0.3, 0.5])
+    result = apply_medium(np.zeros((2, 3, 3)), depth, camera, pose, medium, Lighting(sky=tuple(sky)))
+
+    beta = np.array(medium.extinction_at((610.0, 550.0, 465.0)))
+    for i, j in np.ndindex(depth.shape):
+        v = directions[i, j]
+        s = np.linspace(0, depth[i, j] * scale[i, j], 4001)
+        points = origin + s[:, None] * v
+        rho = sum(density(c, points) for c in medium.components)
+        tau = cumulative_trapezoid(rho, s, initial=0)[:, None] * beta
+
+        if medium.sun_attenuation:
+            # Skylight is attenuated by the fog above each point, i.e. an optical depth of density * falloff / ω_z
+            fog = medium.components[0]
+            c_grid = np.linspace(0, rho.max() * beta.max() * fog.falloff, 400)
+            table = sky_source(v, medium.anisotropy, c_grid)
+            source = np.stack([np.interp(rho * b * fog.falloff, c_grid, table) for b in beta], -1)
+        else:
+            source = np.broadcast_to(sky_source(v, medium.anisotropy, 0.0), (len(s), len(beta)))
+
+        inscatter = trapezoid(rho[:, None] * beta * np.exp(-tau) * medium.albedo * sky * source, s, axis=0)
+        assert result.inscatter[i, j].numpy() == pytest.approx(inscatter, rel=3e-3)
+
+
 def test_apply_medium_background_and_extra_channels():
     camera, pose = small_camera()
     radiance = np.ones((5, 7, 4))
@@ -237,7 +306,7 @@ def test_apply_medium_background_and_extra_channels():
     assert (fog.transmittance[~upwards] == 0).all()
 
     with pytest.raises(ValueError, match="1 or 3 values"):
-        apply_medium(radiance, depth, camera, pose, medium, Lighting(ambient=(1.0, 1.0)))
+        apply_medium(radiance, depth, camera, pose, medium, Lighting(ambient=(1.0, 2.0)))
 
 
 def make_render(root, n=3, gray=False, keyframe_scale=1.0):

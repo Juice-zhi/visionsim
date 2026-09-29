@@ -8,7 +8,7 @@ import numpy.typing as npt
 import torch
 
 from visionsim.medium.model import HeightFog, Lighting, Medium
-from visionsim.medium.optics import height_fog_sun_inscatter, henyey_greenstein, optical_depth
+from visionsim.medium.optics import height_fog_sun_inscatter, henyey_greenstein, optical_depth, sky_quadrature
 
 RGB_WAVELENGTHS: tuple[float, float, float] = (610.0, 550.0, 465.0)
 """Approximate effective wavelengths, in nm, of the red, green and blue channels of linear sRGB images"""
@@ -68,9 +68,10 @@ def camera_rays(
 
 
 def _per_channel(values: Sequence[float], n: int, name: str, **kwargs) -> torch.Tensor:
-    if len(values) not in (1, n):
+    # Values that are the same for every channel, such as the default black sky, work with any number of channels
+    if len(values) != n and len(set(values)) > 1:
         raise ValueError(f"Expected {name} to have 1 or {n} values (one per wavelength), got {len(values)}.")
-    return torch.as_tensor([values[0]] * n if len(values) == 1 else list(values), **kwargs)
+    return torch.as_tensor([values[0]] * n if len(values) != n else list(values), **kwargs)
 
 
 def apply_medium(
@@ -95,8 +96,8 @@ def apply_medium(
 
     Note:
         Shadows cast onto the medium (light shafts), point lights, multiple scattering, and the dimming of
-        surfaces lit through the medium are not yet modeled. The environment is assumed to light the
-        medium uniformly from all directions.
+        surfaces lit through the medium are not yet modeled. The sky is assumed to have a uniform radiance
+        above the horizon, and to be occluded by the ground below it.
 
     Args:
         radiance (npt.ArrayLike | torch.Tensor): Linear radiance of the scene without the medium, of shape (h, w, c).
@@ -150,6 +151,7 @@ def apply_medium(
     # Sources which are constant along rays result in exactly `J * (1 - T)`, whatever the density
     source = medium.albedo * _per_channel(lighting.ambient, n, "ambient", **kwargs)
     source = source.expand(*tau.shape).clone()
+    sky = medium.albedo * _per_channel(lighting.sky, n, "sky", **kwargs)
     attenuated_suns = []
 
     for sun in lighting.suns:
@@ -162,17 +164,35 @@ def apply_medium(
             attenuated_suns.append((float(towards_sun[2]), medium.albedo * phase * irradiance))
         else:
             source = source + medium.albedo * phase * irradiance
+
+    # Skylight comes from the upper hemisphere only, weighted by how much the phase function sends it to the camera
+    if lit_by_sky := bool((sky != 0).any()):
+        sky_elevations, sky_weights = sky_quadrature(directions, medium.anisotropy)
+        if not medium.sun_attenuation:
+            source = source + sky * sky_weights.sum(dim=-1, keepdim=True)
     inscatter = source * -torch.expm1(-tau)
 
-    if attenuated_suns:
+    if medium.sun_attenuation:
         fog = medium.components[0]
         assert isinstance(fog, HeightFog)
         origin_extinction = beta * fog.density * torch.exp(-(origin[2] - fog.base_height) / fog.falloff)
+        args = (origin_extinction, fog.falloff, directions[..., 2:3], distance[..., None])
 
         for sun_z, weight in attenuated_suns:
-            inscatter = inscatter + weight * height_fog_sun_inscatter(
-                tau, origin_extinction, fog.falloff, directions[..., 2:3], distance[..., None], sun_z
-            )
+            inscatter = inscatter + weight * height_fog_sun_inscatter(tau, *args, sun_z)
+
+        # Each direction of the sky is attenuated like a sun would be, so integrate them in chunks to bound memory
+        if lit_by_sky:
+            for elevations, weights in zip(sky_elevations.split(32, dim=-1), sky_weights.split(32, dim=-1)):
+                integral = height_fog_sun_inscatter(
+                    optical_depth=tau[..., None, :],
+                    origin_extinction=origin_extinction,
+                    falloff=fog.falloff,
+                    directions_z=directions[..., None, 2:3],
+                    distance=distance[..., None, None],
+                    sun_z=elevations[..., None],
+                )
+                inscatter = inscatter + sky * (weights[..., None] * integral).sum(dim=-2)
 
     return MediumResult(
         radiance=torch.cat([transmittance * radiance[..., :n] + inscatter, radiance[..., n:]], dim=-1),

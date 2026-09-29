@@ -86,9 +86,9 @@ class Medium(BaseModel):
     components: list[Component] = Field(default_factory=lambda: [Homogeneous()])
     """density components, whose relative densities add up"""
     sun_attenuation: bool = False
-    """if true, sunlight is attenuated as it travels through the medium before being scattered. This is only
-    supported, in closed form, for media made of a single :class:`HeightFog` component. Otherwise, sunlight is
-    assumed to reach every point of the medium unattenuated"""
+    """if true, light from suns and from the sky is attenuated as it travels through the medium before being
+    scattered. This is only supported, in closed form, for media made of a single :class:`HeightFog` component.
+    Otherwise, light is assumed to reach every point of the medium unattenuated"""
 
     @model_validator(mode="after")
     def _validate_sun_attenuation(self) -> Self:
@@ -185,8 +185,12 @@ class Lighting(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    sky: tuple[float, ...] = (0.0, 0.0, 0.0)
+    """average radiance per color channel of the environment above the horizon, e.g. the sky. Light from below the
+    horizon is assumed to be blocked by the ground, as is the case for scenes captured from near the ground"""
     ambient: tuple[float, ...] = (0.0, 0.0, 0.0)
-    """average radiance of the environment per color channel, which lights the medium uniformly from all directions"""
+    """radiance per color channel of an environment which lights the medium uniformly from all directions, including
+    from below the horizon, and which is never attenuated. This is useful for scenes without a ground"""
     suns: list[Sun] = Field(default_factory=list)
     """distant light sources"""
     points: list[PointLight] = Field(default_factory=list)
