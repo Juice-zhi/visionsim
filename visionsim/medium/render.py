@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -12,6 +12,12 @@ from visionsim.medium.optics import height_fog_sun_inscatter, henyey_greenstein,
 
 RGB_WAVELENGTHS: tuple[float, float, float] = (610.0, 550.0, 465.0)
 """Approximate effective wavelengths, in nm, of the red, green and blue channels of linear sRGB images"""
+
+_SKY_NODES = 3 * 16 * 24
+"""Number of directions over which skylight is integrated for each pixel, at the default resolution of
+:func:`sky_quadrature <visionsim.medium.optics.sky_quadrature>`"""
+_CHUNK_ELEMENTS = 4e7
+"""Rough bound on the number of elements of intermediate tensors when processing pixels in chunks"""
 
 
 class MediumResult(NamedTuple):
@@ -72,6 +78,21 @@ def _per_channel(values: Sequence[float], n: int, name: str, **kwargs) -> torch.
     if len(values) != n and len(set(values)) > 1:
         raise ValueError(f"Expected {name} to have 1 or {n} values (one per wavelength), got {len(values)}.")
     return torch.as_tensor([values[0]] * n if len(values) != n else list(values), **kwargs)
+
+
+def _by_pixels(fn: Callable[..., Any], *images: torch.Tensor, elements_per_pixel: int) -> Any:
+    # Integrating skylight needs hundreds of values per pixel, which exhausts GPU memory at high resolutions unless
+    # pixels are processed in chunks. Images are of shape (h, w, ...), and `fn` returns tensors, or tuples of tensors,
+    # with one row per pixel of the chunk, which are stitched back into images
+    h, w = images[0].shape[:2]
+    flat = [image.reshape(h * w, *image.shape[2:]) for image in images]
+    size = max(1, int(_CHUNK_ELEMENTS // elements_per_pixel))
+    chunks = [fn(*(image[i : i + size] for image in flat)) for i in range(0, h * w, size)]
+
+    def stitch(parts: Sequence[torch.Tensor]) -> torch.Tensor:
+        return torch.cat(list(parts)).reshape(h, w, *parts[0].shape[1:])
+
+    return tuple(map(stitch, zip(*chunks))) if isinstance(chunks[0], tuple) else stitch(chunks)
 
 
 def apply_medium(
@@ -166,10 +187,13 @@ def apply_medium(
             source = source + medium.albedo * phase * irradiance
 
     # Skylight comes from the upper hemisphere only, weighted by how much the phase function sends it to the camera
-    if lit_by_sky := bool((sky != 0).any()):
-        sky_elevations, sky_weights = sky_quadrature(directions, medium.anisotropy)
-        if not medium.sun_attenuation:
-            source = source + sky * sky_weights.sum(dim=-1, keepdim=True)
+    lit_by_sky = bool((sky != 0).any())
+    if lit_by_sky and not medium.sun_attenuation:
+
+        def sky_phase(directions: torch.Tensor) -> torch.Tensor:
+            return sky_quadrature(directions, medium.anisotropy)[1].sum(dim=-1, keepdim=True)
+
+        source = source + sky * _by_pixels(sky_phase, directions, elements_per_pixel=_SKY_NODES)
     inscatter = source * -torch.expm1(-tau)
 
     if medium.sun_attenuation:
@@ -181,22 +205,29 @@ def apply_medium(
         for sun_z, weight in attenuated_suns:
             inscatter = inscatter + weight * height_fog_sun_inscatter(tau, *args, sun_z)
 
-        # Each direction of the sky is attenuated like a sun would be, so integrate them in chunks to bound memory.
-        # When extinction doesn't depend on wavelength, as for fog, the integral is the same for every channel.
+        # Each direction of the sky is attenuated like a sun would be. When extinction doesn't depend on wavelength,
+        # as for fog, the integral is the same for every channel
         if lit_by_sky:
             gray = bool((beta == beta[0]).all())
             tau_sky, extinction_sky = (tau[..., :1], origin_extinction[:1]) if gray else (tau, origin_extinction)
-            chunk = max(8, int(4e7 // tau_sky.numel()))
-            for elevations, weights in zip(sky_elevations.split(chunk, dim=-1), sky_weights.split(chunk, dim=-1)):
+            falloff = fog.falloff
+
+            def sky_inscatter(directions: torch.Tensor, distance: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+                elevations, weights = sky_quadrature(directions, medium.anisotropy)
                 integral = height_fog_sun_inscatter(
-                    optical_depth=tau_sky[..., None, :],
+                    optical_depth=tau[..., None, :],
                     origin_extinction=extinction_sky,
-                    falloff=fog.falloff,
+                    falloff=falloff,
                     directions_z=directions[..., None, 2:3],
                     distance=distance[..., None, None],
                     sun_z=elevations[..., None],
                 )
-                inscatter = inscatter + sky * (weights[..., None] * integral).sum(dim=-2)
+                return (weights[..., None] * integral).sum(dim=-2)
+
+            nodes = _SKY_NODES * tau_sky.shape[-1]
+            inscatter = inscatter + sky * _by_pixels(
+                sky_inscatter, directions, distance, tau_sky, elements_per_pixel=nodes
+            )
 
     return MediumResult(
         radiance=torch.cat([transmittance * radiance[..., :n] + inscatter, radiance[..., n:]], dim=-1),

@@ -313,6 +313,29 @@ def test_ray_marching_converges_to_closed_form(medium):
         assert errors[-1] < error(steps=256, shadow_steps=64) < 1e-3
 
 
+@pytest.mark.parametrize(
+    "medium",
+    [
+        Medium(extinction=0.1, anisotropy=0.8, components=[HeightFog(density=1.0, falloff=2.5)], sun_attenuation=True),
+        Medium(extinction=0.08, angstrom=1.3, albedo=0.9, anisotropy=0.6, components=COMPONENTS),
+    ],
+    ids=["attenuated", "unattenuated"],
+)
+def test_chunks_of_pixels_give_the_same_result(medium, monkeypatch):
+    rng = np.random.default_rng(5)
+    camera, pose = small_camera()
+    args = (rng.uniform(0, 2, size=(5, 7, 3)), rng.uniform(1, 25, size=(5, 7)), camera, pose, medium)
+    lighting = Lighting(sky=(0.2, 0.3, 0.5), ambient=(0.05,), suns=[Sun(direction=(0.2, 1.0, 0.6), irradiance=(3.0,))])
+    whole = [apply_medium(*args, lighting), ray_march_medium(*args, lighting, steps=8)]
+
+    # Skylight is otherwise integrated in chunks of pixels at high resolutions only
+    monkeypatch.setattr("visionsim.medium.render._CHUNK_ELEMENTS", 4000)
+    chunked = [apply_medium(*args, lighting), ray_march_medium(*args, lighting, steps=8)]
+    for expected, result in zip(whole, chunked):
+        for a, b in zip(expected, result):
+            assert torch.allclose(a, b, rtol=1e-12, atol=0)
+
+
 def test_apply_medium_background_and_extra_channels():
     camera, pose = small_camera()
     radiance = np.ones((5, 7, 4))

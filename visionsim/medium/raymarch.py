@@ -17,7 +17,7 @@ import torch
 
 from visionsim.medium.model import HeightFog, Lighting, Medium
 from visionsim.medium.optics import density, henyey_greenstein, sky_quadrature
-from visionsim.medium.render import RGB_WAVELENGTHS, MediumResult, _per_channel, camera_rays
+from visionsim.medium.render import _SKY_NODES, RGB_WAVELENGTHS, MediumResult, _by_pixels, _per_channel, camera_rays
 
 
 def _sun_transmittance(
@@ -118,55 +118,63 @@ def ray_march_medium(
 
     background = ~torch.isfinite(depth) | (depth >= background_depth)
     distance = torch.where(background, torch.full_like(depth, max_distance), depth * scale)
-    step = (distance / steps)[..., None]
     beta = torch.as_tensor(medium.extinction_at(wavelengths), **kwargs)
-
-    # Light which is the same at every sample of a ray
-    constant = medium.albedo * _per_channel(lighting.ambient, n, "ambient", **kwargs)
-    constant = constant.expand(*directions.shape[:2], n).clone()
+    ambient = medium.albedo * _per_channel(lighting.ambient, n, "ambient", **kwargs)
     sky = medium.albedo * _per_channel(lighting.sky, n, "sky", **kwargs)
-    if lit_by_sky := bool((sky != 0).any()):
-        sky_elevations, sky_weights = sky_quadrature(directions, medium.anisotropy)
-        if not medium.sun_attenuation:
-            constant = constant + sky * sky_weights.sum(dim=-1, keepdim=True)
+    lit_by_sky = bool((sky != 0).any())
+    # When extinction doesn't depend on wavelength, as for fog, skylight is attenuated the same in every channel
+    gray = bool((beta == beta[0]).all())
 
     suns = []
     for sun in lighting.suns:
         towards_sun = torch.as_tensor(sun.direction, **kwargs)
-        towards_sun = towards_sun / towards_sun.norm()
-        phase = henyey_greenstein(directions @ towards_sun, medium.anisotropy)[..., None]
-        irradiance = _per_channel(sun.irradiance, n, "sun irradiance", **kwargs)
-        suns.append((towards_sun, medium.albedo * phase * irradiance))
+        suns.append((towards_sun / towards_sun.norm(), _per_channel(sun.irradiance, n, "sun irradiance", **kwargs)))
 
-    transmittance = torch.ones_like(constant)
-    optical_depth = torch.zeros_like(constant)
-    inscatter = torch.zeros_like(constant)
+    def march(directions: torch.Tensor, distance: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Light which is the same at every sample of a ray
+        constant = ambient.expand(*directions.shape[:-1], n).clone()
+        if lit_by_sky:
+            sky_elevations, sky_weights = sky_quadrature(directions, medium.anisotropy)
+            if not medium.sun_attenuation:
+                constant = constant + sky * sky_weights.sum(dim=-1, keepdim=True)
+        sunlight = []
+        for towards_sun, irradiance in suns:
+            phase = henyey_greenstein(directions @ towards_sun, medium.anisotropy)[..., None]
+            sunlight.append((towards_sun, medium.albedo * phase * irradiance))
 
-    for i in range(steps):
-        points = origin + (i + 0.5) * step * directions
-        sigma = density(medium, points, time)[..., None] * beta
-        source = constant.clone()
+        step = (distance / steps)[..., None]
+        transmittance = torch.ones_like(constant)
+        optical_depth = torch.zeros_like(constant)
+        inscatter = torch.zeros_like(constant)
 
-        for towards_sun, weight in suns:
-            if medium.sun_attenuation:
-                weight = weight * _sun_transmittance(points, towards_sun, medium, beta, shadow_steps, time)
-            source = source + weight
+        for i in range(steps):
+            points = origin + (i + 0.5) * step * directions
+            sigma = density(medium, points, time)[..., None] * beta
+            source = constant.clone()
 
-        if lit_by_sky and medium.sun_attenuation:
-            # Each direction of the sky is attenuated by the fog above the sample, i.e. by density * falloff / ω_z
-            fog = medium.components[0]
-            assert isinstance(fog, HeightFog)
-            # When extinction doesn't depend on wavelength, as for fog, the attenuation is the same for every channel
-            above = (sigma[..., :1] if bool((beta == beta[0]).all()) else sigma)[..., None, :] * fog.falloff
-            chunk = max(8, int(4e7 // above[..., 0, :].numel()))
-            for elevations, weights in zip(sky_elevations.split(chunk, dim=-1), sky_weights.split(chunk, dim=-1)):
-                attenuation = torch.exp(-above / elevations[..., None].clamp_min(1e-12)) * (elevations[..., None] > 0)
-                source = source + sky * (weights[..., None] * attenuation).sum(dim=-2)
+            for towards_sun, weight in sunlight:
+                if medium.sun_attenuation:
+                    weight = weight * _sun_transmittance(points, towards_sun, medium, beta, shadow_steps, time)
+                source = source + weight
 
-        step_transmittance = torch.exp(-sigma * step)
-        inscatter = inscatter + transmittance * source * (1 - step_transmittance)
-        optical_depth = optical_depth + sigma * step
-        transmittance = transmittance * step_transmittance
+            if lit_by_sky and medium.sun_attenuation:
+                # Each direction of the sky is attenuated by the fog above the sample, i.e. by density * falloff / ω_z
+                fog = medium.components[0]
+                assert isinstance(fog, HeightFog)
+                above = (sigma[..., :1] if gray else sigma)[..., None, :] * fog.falloff
+                elevations = sky_elevations[..., None]
+                attenuation = torch.exp(-above / elevations.clamp_min(1e-12)) * (elevations > 0)
+                source = source + sky * (sky_weights[..., None] * attenuation).sum(dim=-2)
+
+            step_transmittance = torch.exp(-sigma * step)
+            inscatter = inscatter + transmittance * source * (1 - step_transmittance)
+            optical_depth = optical_depth + sigma * step
+            transmittance = transmittance * step_transmittance
+        return transmittance, optical_depth, inscatter
+
+    # Integrating skylight needs hundreds of values per pixel, so rays are marched in chunks to bound memory
+    nodes = (_SKY_NODES if lit_by_sky else 1) * (1 if gray else n)
+    transmittance, optical_depth, inscatter = _by_pixels(march, directions, distance, elements_per_pixel=nodes)
 
     return MediumResult(
         radiance=torch.cat([transmittance * radiance[..., :n] + inscatter, radiance[..., n:]], dim=-1),
