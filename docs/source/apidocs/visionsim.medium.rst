@@ -20,10 +20,26 @@ visionsim.medium.optics module
    :show-inheritance:
    :undoc-members:
 
+visionsim.medium.raymarch module
+--------------------------------
+
+.. automodule:: visionsim.medium.raymarch
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 visionsim.medium.render module
 ------------------------------
 
 .. automodule:: visionsim.medium.render
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+visionsim.medium.transient module
+---------------------------------
+
+.. automodule:: visionsim.medium.transient
    :members:
    :show-inheritance:
    :undoc-members:

@@ -41,6 +41,35 @@ def henyey_greenstein(cos_theta: torch.Tensor, g: float) -> torch.Tensor:
     return (1 - g * g) / (4 * math.pi * (1 + g * g - 2 * g * cos_theta).clamp_min(1e-12) ** 1.5)
 
 
+def density(medium: Medium, points: torch.Tensor, time: float = 0.0) -> torch.Tensor:
+    """Relative density of a medium at given points, i.e. the sum of the densities of its components.
+
+    Args:
+        medium (Medium): Participating medium.
+        points (torch.Tensor): World-space points, of shape (..., 3).
+        time (float, optional): Time in seconds, used by moving components. Defaults to 0.0.
+
+    Raises:
+        TypeError: raised if a component type is not supported.
+
+    Returns:
+        torch.Tensor: Relative density at each point, of shape (...).
+    """
+    total = torch.zeros_like(points[..., 0])
+    for component in medium.components:
+        if isinstance(component, Homogeneous):
+            total = total + component.density
+        elif isinstance(component, HeightFog):
+            total = total + component.density * torch.exp(-(points[..., 2] - component.base_height) / component.falloff)
+        elif isinstance(component, Blob):
+            center = points.new_tensor(component.center) + time * points.new_tensor(component.velocity)
+            squared = ((points - center) ** 2).sum(dim=-1)
+            total = total + component.density * torch.exp(-squared / (2 * component.radius**2))
+        else:
+            raise TypeError(f"Unsupported medium component {type(component).__name__}.")
+    return total
+
+
 def homogeneous_optical_depth(component: Homogeneous, distance: torch.Tensor) -> torch.Tensor:
     """Relative optical depth of a homogeneous component, along rays of a given length.
 

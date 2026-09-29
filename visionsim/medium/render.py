@@ -181,12 +181,16 @@ def apply_medium(
         for sun_z, weight in attenuated_suns:
             inscatter = inscatter + weight * height_fog_sun_inscatter(tau, *args, sun_z)
 
-        # Each direction of the sky is attenuated like a sun would be, so integrate them in chunks to bound memory
+        # Each direction of the sky is attenuated like a sun would be, so integrate them in chunks to bound memory.
+        # When extinction doesn't depend on wavelength, as for fog, the integral is the same for every channel.
         if lit_by_sky:
-            for elevations, weights in zip(sky_elevations.split(32, dim=-1), sky_weights.split(32, dim=-1)):
+            gray = bool((beta == beta[0]).all())
+            tau_sky, extinction_sky = (tau[..., :1], origin_extinction[:1]) if gray else (tau, origin_extinction)
+            chunk = max(8, int(4e7 // tau_sky.numel()))
+            for elevations, weights in zip(sky_elevations.split(chunk, dim=-1), sky_weights.split(chunk, dim=-1)):
                 integral = height_fog_sun_inscatter(
-                    optical_depth=tau[..., None, :],
-                    origin_extinction=origin_extinction,
+                    optical_depth=tau_sky[..., None, :],
+                    origin_extinction=extinction_sky,
                     falloff=fog.falloff,
                     directions_z=directions[..., None, 2:3],
                     distance=distance[..., None, None],

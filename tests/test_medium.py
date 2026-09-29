@@ -26,6 +26,7 @@ from visionsim.medium.optics import (
     henyey_greenstein,
     sky_quadrature,
 )
+from visionsim.medium.raymarch import ray_march_medium
 
 T = torch.tensor
 COMPONENTS = [
@@ -284,6 +285,32 @@ def test_apply_medium_sky_matches_brute_force(medium):
 
         inscatter = trapezoid(rho[:, None] * beta * np.exp(-tau) * medium.albedo * sky * source, s, axis=0)
         assert result.inscatter[i, j].numpy() == pytest.approx(inscatter, rel=3e-3)
+
+
+@pytest.mark.parametrize(
+    "medium",
+    [
+        Medium(extinction=0.1, anisotropy=0.8, components=[HeightFog(density=1.0, falloff=2.5)], sun_attenuation=True),
+        Medium(extinction=0.08, angstrom=1.3, albedo=0.9, anisotropy=0.6, components=COMPONENTS),
+    ],
+    ids=["attenuated", "unattenuated"],
+)
+def test_ray_marching_converges_to_closed_form(medium):
+    rng = np.random.default_rng(4)
+    camera, pose = small_camera()
+    args = (rng.uniform(0, 2, size=(5, 7, 3)), rng.uniform(1, 25, size=(5, 7)), camera, pose, medium)
+    lighting = Lighting(sky=(0.2, 0.3, 0.5), ambient=(0.05,), suns=[Sun(direction=(0.2, 1.0, 0.6), irradiance=(3.0,))])
+    exact = apply_medium(*args, lighting, time=0.4).radiance
+
+    def error(**kwargs):
+        marched = ray_march_medium(*args, lighting, time=0.4, **kwargs).radiance
+        return ((marched - exact).abs().sum() / exact.abs().sum()).item()
+
+    errors = [error(steps=steps) for steps in (4, 16, 64, 256)]
+    assert errors == sorted(errors, reverse=True) and errors[-1] < 1e-4
+    if medium.sun_attenuation:
+        # Marching towards the sun converges too, but adds its own error
+        assert errors[-1] < error(steps=256, shadow_steps=64) < 1e-3
 
 
 def test_apply_medium_background_and_extra_channels():
