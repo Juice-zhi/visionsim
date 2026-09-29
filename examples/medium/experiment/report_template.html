@@ -1,0 +1,141 @@
+<title>雾化方法对照实验</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600;700&display=swap">
+<style>{style}</style>
+<main>
+<header style="display:flex;flex-direction:column;gap:14px">
+  <div class="eyebrow">VisionSIM · feat/volumetric-media · 地面雾 · 4 种仿真传感器</div>
+  <h1>雾化方法对照实验</h1>
+  <p class="lede">同一个动画场景、同一团地面雾，分别用<strong>无雾 baseline</strong>、<strong>Cycles 体积路径追踪</strong>、<strong>ray marching</strong> 和<strong>闭式解</strong>生成带雾画面，再喂给 RGB、被动 SPAD、DVS 和 ToF 四种仿真传感器，逐一对比它们和参考真值之间的 loss 以及耗时。</p>
+  <div class="meta"><span>场景 320×180，125 fps × 500 帧（4 s）</span><span>参考：Cycles 4096 spp，每帧 {r[cycles_ref]:.2f} s</span><span>GPU：RTX 5080</span></div>
+</header>
+
+<section>
+  <h2>结论</h2>
+  <div class="findings">{findings}</div>
+</section>
+
+<section>
+  <h2>汇总</h2>
+  <p>每种传感器取一个主要 loss；各传感器的完整指标见后文。"生成一帧"指从 Blender 场景到得到带雾画面的总耗时。"只改雾参数时"指场景不变、只改雾的参数（比如能见度）时，重新生成一帧所需的时间。</p>
+  {summary_table}
+</section>
+
+<section>
+  <h2>实验设置</h2>
+  <dl class="setup">
+    <dt>场景</dt><dd>演示场景（<code>examples/medium/demo_scene.py</code>）：棋盘格地面、4 个方块、7 根柱子。太阳高度角 30°、辐照度 4 W/m²，天空辐射度 (0.25, 0.35, 0.55)。相机离地 1.6 m，前进 24 m 并同时转动，关键帧拉伸 5 倍，得到 125 fps × 500 帧。</dd>
+    <dt>雾</dt><dd>地面雾 <code>media/ground_fog.json</code>：σ(z) = 0.08·e<sup>−z/2.5</sup> m⁻¹，反照率 1，HG 相函数 g = 0.8，阳光和天光在雾中都会衰减。Cycles 里是一个 400×400×26 m 的体积盒，密度函数完全相同，体积弹射次数为 0（Blender 默认，即单次散射）。</dd>
+    <dt>参考真值</dt><dd>Cycles 体积路径追踪，4096 spp，关闭自适应采样和降噪。另外换一个随机种子重新渲染一遍，两者之差就是参考自身的噪声底。</dd>
+    <dt>闭式解与 ray marching 的输入</dt><dd>无雾场景用 visionsim 默认设置渲染（256 spp，自适应采样，降噪），输出线性 EXR、深度和 <code>lighting.json</code>。雾是事后加上去的，渲染帧只算一次。</dd>
+  </dl>
+  <div class="table-wrap"><table>
+    <thead><tr><th scope="col">方法</th><th scope="col" style="text-align:left">雾怎么来</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">无雾 baseline</th><td style="text-align:left;font-family:var(--sans);white-space:normal">原始 visionsim 流程，不加雾。它的 loss 就是"完全忽略雾"会造成的误差。</td></tr>
+      <tr><th scope="row">Cycles 默认设置</th><td style="text-align:left;font-family:var(--sans);white-space:normal">把雾的体积放进场景，用 visionsim 默认的渲染设置（256 spp，自适应采样，OIDN 降噪）直接渲染，也就是"真实体积渲染"的常规做法。</td></tr>
+      <tr><th scope="row">Cycles 默认（不降噪）</th><td style="text-align:left;font-family:var(--sans);white-space:normal">同上，但关闭降噪，画面保留蒙特卡洛噪声，用来检验渲染噪声对光子级传感器的影响。</td></tr>
+      <tr><th scope="row">Ray marching</th><td style="text-align:left;font-family:var(--sans);white-space:normal">新增的 <code>visionsim.medium.ray_march_medium</code>：沿每条视线均匀分步做数值积分，每步内按能量守恒的方式积分。<em>16 步</em>版本中，光照衰减用解析式；<em>64+16 步</em>版本中，每个采样点再朝太阳方向走 16 步，这是通用体积渲染器的做法。它和闭式解积分的是同一个物理模型。</td></tr>
+      <tr><th scope="row">闭式解（修正天光前）</th><td style="text-align:left;font-family:var(--sans);white-space:normal">上一版 M1 的光照模型：天空被当作来自整个球面的均匀光，并且不被雾衰减。</td></tr>
+      <tr><th scope="row">闭式解</th><td style="text-align:left;font-family:var(--sans);white-space:normal">当前模型：天光只来自上半球（下半球被地面遮挡），按相函数加权，并且被雾衰减。每个方向的衰减都有闭式解，方向积分用固定求积，结果确定、没有噪声。</td></tr>
+    </tbody>
+  </table></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th scope="col">传感器</th><th scope="col" style="text-align:left">设置</th><th scope="col" style="text-align:left">loss（都在期望测量值上计算，排除传感器自身噪声）</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">RGB</th><td style="text-align:left;font-family:var(--sans);white-space:normal">25 fps，每次曝光合并 5 帧（40 ms），每帧每单位辐射度 100 个光子，满阱 500，读出噪声 5，12 bit</td><td style="text-align:left;font-family:var(--sans);white-space:normal">无噪声 8 位输出的 PSNR、SSIM；线性曝光图的相对 L1</td></tr>
+      <tr><th scope="row">被动 SPAD</th><td style="text-align:left;font-family:var(--sans);white-space:normal">125 Hz 二值帧，检测概率 p = 1 − e<sup>−λ</sup></td><td style="text-align:left;font-family:var(--sans);white-space:normal">检测概率的 MAE、相对 L1，以及伯努利分布之间的 KL 散度（每像素每帧损失多少比特信息）</td></tr>
+      <tr><th scope="row">DVS</th><td style="text-align:left;font-family:var(--sans);white-space:normal">v2e，正负阈值 0.2，关闭阈值抖动、散粒噪声和漏电事件（输出只取决于输入画面）</td><td style="text-align:left;font-family:var(--sans);white-space:normal">按 40 ms 窗口、像素和极性统计事件数，与参考的 F1（1 表示完全一致）</td></tr>
+      <tr><th scope="row">ToF / 主动 SPC</th><td style="text-align:left;font-family:var(--sans);white-space:normal">905 nm 闪光，1000 个 0.4 ns 的 bin（量程 60 m），脉宽 1 ns，每帧 500 个激光周期，首光子 SPAD 加 Coates 校正；背景光取自各方法自己算出的被动辐射度</td><td style="text-align:left;font-family:var(--sans);white-space:normal">期望直方图的相对 L1（包括只算激光回波和含背景光两种）；测距与参考不一致的像素比例（差 &gt; 15 cm）</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>画面与传感器输出</h2>
+  <p>第 250 帧（相机正从红色方块旁边经过）。第二行是相对参考的误差（0–50%）。点击图片可以看原图。</p>
+  <figure><a href="images/overview.png" target="_blank" rel="noopener"><img src="images/overview.png" alt="各方法在第 250 帧的渲染帧、误差图和四种传感器输出" loading="lazy"></a>
+  <figcaption>{overview_caption}</figcaption></figure>
+  <h3>视频</h3>
+  <p>整段 4 秒动画，以 12 fps 播放（约 2 倍慢放）。从上到下依次是：渲染帧、RGB、SPAD（32 帧平均）、DVS（40 ms）、ToF 测距。ToF 一行里，ray marching 的瞬态用了 128 步。</p>
+  <video src="videos/sensors.mp4" controls muted loop playsinline preload="metadata"></video>
+</section>
+
+<section>
+  <h2>各传感器细节</h2>
+  <figure><a href="images/loss_curves.png" target="_blank" rel="noopener"><img src="images/loss_curves.png" alt="四种传感器的逐帧 loss 曲线" loading="lazy"></a>
+  <figcaption>{curves_caption}</figcaption></figure>
+  <h3>RGB</h3>
+  {rgb_table}
+  <p>{rgb_text}</p>
+  <h3>被动 SPAD</h3>
+  {spad_table}
+  <p>{spad_text}</p>
+  <h3>DVS</h3>
+  {dvs_table}
+  <p>{dvs_text}</p>
+  <h3>ToF / 主动 SPC</h3>
+  {tof_table}
+  <p>{tof_text}</p>
+  <div class="grid-2">
+    <figure><a href="images/tof_depth.png" target="_blank" rel="noopener"><img src="images/tof_depth.png" alt="第 250 帧各方法的 ToF 测距图" loading="lazy"></a>
+    <figcaption>第 250 帧，含光子噪声时 ToF 测得的距离（0–60 m，颜色越暖越远）。无雾时天空没有回波，测到的是随机的背景光子；加雾后，雾的后向散射在近处形成峰，盖住了远处方块和地面的回波，它们都被测成很近。</figcaption></figure>
+    <figure><a href="images/tof_transients.png" target="_blank" rel="noopener"><img src="images/tof_transients.png" alt="三个像素的期望瞬态直方图" loading="lazy"></a>
+    <figcaption>三个像素的期望直方图（对数坐标）。0.5 m 之后缓慢衰减的部分是雾的后向散射，尖峰是表面回波，底部的平台是背景光。ray marching 的步长比 bin 大时，后向散射会变成锯齿状。</figcaption></figure>
+  </div>
+</section>
+
+<section>
+  <h2>Ray marching 与闭式解</h2>
+  <p>{convergence_text}</p>
+  <div class="grid-2">
+    <figure><a href="images/convergence.png" target="_blank" rel="noopener"><img src="images/convergence.png" alt="ray marching 的误差与耗时随步数的变化" loading="lazy"></a>
+    <figcaption>第 250 帧，横轴是每帧耗时，纵轴是和闭式解的相对 L1 误差，点旁的数字是步数。竖虚线是闭式解的耗时（{closed_form_seconds}）。</figcaption></figure>
+    <div class="table-wrap"><table>
+      <thead><tr><th scope="col">Ray marching</th><th scope="col">每帧耗时</th><th scope="col">与闭式解之差</th><th scope="col">与参考之差</th></tr></thead>
+      <tbody>{convergence_rows}<tr class="floor"><th scope="row">闭式解</th><td>{closed_form_seconds}</td><td>0</td><td>{closed_form_error}</td></tr></tbody>
+    </table></div>
+  </div>
+</section>
+
+<section>
+  <h2>闭式解和真值的差距从哪来</h2>
+  <p>{breakdown_intro}</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th scope="col">第 255 帧，雾的散射光：闭式解 / Cycles</th><th scope="col">天空像素</th><th scope="col">表面像素</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">修正天光前（M1）</th><td>{bd[full_before_fix][sky]:.3f}</td><td>{bd[full_before_fix][surfaces]:.3f}</td></tr>
+      <tr><th scope="row">当前模型，完整场景</th><td>{bd[full][sky]:.3f}</td><td>{bd[full][surfaces]:.3f}</td></tr>
+      <tr><th scope="row">只有太阳，物体有投影（光柱）</th><td>{bd[sun][sky]:.3f}</td><td>{bd[sun][surfaces]:.3f}</td></tr>
+      <tr><th scope="row">只有太阳，物体不投影</th><td>{bd[sun_noshadow][sky]:.3f}</td><td>{bd[sun_noshadow][surfaces]:.3f}</td></tr>
+      <tr><th scope="row">只有天光，有物体</th><td>{bd[sky][sky]:.3f}</td><td>{bd[sky][surfaces]:.3f}</td></tr>
+      <tr><th scope="row">只有天光，去掉方块和柱子</th><td>{bd[sky_noobjects][sky]:.3f}</td><td>{bd[sky_noobjects][surfaces]:.3f}</td></tr>
+    </tbody>
+  </table></div>
+  <p>{breakdown_text}</p>
+</section>
+
+<section>
+  <h2>局限与下一步</h2>
+  {next_steps}
+</section>
+
+<section>
+  <h2>复现</h2>
+  <p>代码都在 <code>examples/medium/experiment/</code> 下，渲染输出在 <code>runs/fog-comparison/</code>（已被 git 忽略）。在仓库根目录的 PowerShell 里先激活 visionsim 的环境（例如 <code>conda activate .\.conda</code>），并确保 <code>blender</code> 在 PATH 里，然后依次运行：</p>
+<pre><code>blender -b --factory-startup --python examples/medium/demo_scene.py -- runs/fog-comparison/demo.blend
+blender -b runs/fog-comparison/demo.blend --python examples/medium/experiment/add_fog.py -- examples/medium/media/ground_fog.json runs/fog-comparison/fog_default.blend
+blender -b runs/fog-comparison/demo.blend --python examples/medium/experiment/add_fog.py -- examples/medium/media/ground_fog.json runs/fog-comparison/fog_ref.blend --no-adaptive
+pwsh examples/medium/experiment/render_all.ps1        # 无雾 + Cycles 默认设置
+pwsh examples/medium/experiment/render_refs.ps1       # 参考（两个种子）
+pwsh examples/medium/experiment/render_nodenoise.ps1  # Cycles 不降噪
+blender -b runs/fog-comparison/demo.blend --python examples/medium/experiment/export_lighting.py -- runs/fog-comparison/clear/lighting.json
+$env:PYTHONPATH = "examples/medium/experiment"; python examples/medium/experiment/run_experiment.py
+python examples/medium/experiment/temporal.py         # DVS 一节的对数亮度误差
+pwsh examples/medium/experiment/timing_1080p.ps1      # 1080p 计时：渲染 10 帧
+python examples/medium/experiment/timing_1080p.py
+python examples/medium/experiment/make_report.py</code></pre>
+  <p>误差拆解用 <code>breakdown_scenes.py</code> 生成几种光源变体场景，再用 <code>render_passes.py --frame 255</code> 渲染，最后由 <code>breakdown.py</code> 汇总。</p>
+</section>
+</main>
