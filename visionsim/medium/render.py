@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -8,7 +10,15 @@ import numpy.typing as npt
 import torch
 
 from visionsim.medium.model import HeightFog, Lighting, Medium
-from visionsim.medium.optics import height_fog_sun_inscatter, henyey_greenstein, optical_depth, sky_quadrature
+from visionsim.medium.optics import (
+    _per_channel,
+    height_fog_sun_inscatter,
+    henyey_greenstein,
+    optical_depth,
+    point_light_inscatter,
+    sky_quadrature,
+)
+from visionsim.medium.scattering import TABLE_SIZE, elevation_source, lookup, tabulate_along_rays
 
 RGB_WAVELENGTHS: tuple[float, float, float] = (610.0, 550.0, 465.0)
 """Approximate effective wavelengths, in nm, of the red, green and blue channels of linear sRGB images"""
@@ -18,6 +28,8 @@ _SKY_NODES = 3 * 16 * 24
 :func:`sky_quadrature <visionsim.medium.optics.sky_quadrature>`"""
 _CHUNK_ELEMENTS = 4e7
 """Rough bound on the number of elements of intermediate tensors when processing pixels in chunks"""
+_POINT_LIGHT_NODES = 32
+"""Number of quadrature nodes along each ray used to integrate light from point lights"""
 
 
 class MediumResult(NamedTuple):
@@ -73,13 +85,6 @@ def camera_rays(
     return pose[:3, 3], directions / directions.norm(dim=-1, keepdim=True), scale
 
 
-def _per_channel(values: Sequence[float], n: int, name: str, **kwargs) -> torch.Tensor:
-    # Values that are the same for every channel, such as the default black sky, work with any number of channels
-    if len(values) != n and len(set(values)) > 1:
-        raise ValueError(f"Expected {name} to have 1 or {n} values (one per wavelength), got {len(values)}.")
-    return torch.as_tensor([values[0]] * n if len(values) != n else list(values), **kwargs)
-
-
 def _by_pixels(fn: Callable[..., Any], *images: torch.Tensor, elements_per_pixel: int) -> Any:
     # Integrating skylight needs hundreds of values per pixel, which exhausts GPU memory at high resolutions unless
     # pixels are processed in chunks. Images are of shape (h, w, ...), and `fn` returns tensors, or tuples of tensors,
@@ -105,19 +110,24 @@ def apply_medium(
     wavelengths: Sequence[float] | None = None,
     time: float = 0.0,
     background_depth: float = 1e9,
+    table_size: tuple[int, int] = TABLE_SIZE,
     device: torch.device | str | None = None,
     dtype: torch.dtype = torch.float64,
 ) -> MediumResult:
     """Add a participating medium to a rendered frame, in closed form.
 
-    The radiance of each surface is attenuated by the medium's transmittance, and light from the environment
-    and from suns is scattered towards the camera (single scattering). Every quantity is computed in closed form,
-    without any ray marching, so the result is exact and noise-free for the given model. This makes it suitable
-    as the common input of all sensor emulators, which then only add their own noise.
+    The radiance of each surface is attenuated by the medium's transmittance, and light from the environment,
+    suns and point lights is scattered towards the camera. Sunlight is integrated in closed form, without any ray
+    marching, light that reaches the medium from many directions (from the sky, from the ground, and light scattered
+    more than once) is integrated once per frame along rays of every elevation and interpolated, see
+    :mod:`visionsim.medium.scattering`, and light from point lights is integrated with a quadrature that removes its
+    singularity, see :func:`point_light_inscatter <visionsim.medium.optics.point_light_inscatter>`. The result is
+    deterministic and noise-free for the given model, which makes it suitable as the common input of all sensor
+    emulators, which then only add their own noise.
 
     Note:
-        Shadows cast onto the medium (light shafts), point lights, multiple scattering, and the dimming of
-        surfaces lit through the medium are not yet modeled. The sky is assumed to have a uniform radiance
+        Shadows cast onto the medium (light shafts) and the dimming of surfaces lit through the medium are not yet
+        modeled, and light from point lights is only scattered once. The sky is assumed to have a uniform radiance
         above the horizon, and to be occluded by the ground below it.
 
     Args:
@@ -134,6 +144,9 @@ def apply_medium(
         time (float, optional): Time in seconds, used by moving media. Defaults to 0.0.
         background_depth (float, optional): Depth from which pixels are considered to see the background,
             in which case they are integrated to infinity. Defaults to 1e9.
+        table_size (tuple[int, int], optional): Number of elevations and optical depths at which light from the sky,
+            the ground and multiple scattering is tabulated along rays. Defaults to :data:`TABLE_SIZE
+            <visionsim.medium.scattering.TABLE_SIZE>`.
         device (torch.device | str | None, optional): Device to run on. Defaults to None (CPU).
         dtype (torch.dtype, optional): Floating point precision. Defaults to torch.float64.
 
@@ -205,29 +218,30 @@ def apply_medium(
         for sun_z, weight in attenuated_suns:
             inscatter = inscatter + weight * height_fog_sun_inscatter(tau, *args, sun_z)
 
-        # Each direction of the sky is attenuated like a sun would be. When extinction doesn't depend on wavelength,
-        # as for fog, the integral is the same for every channel
-        if lit_by_sky:
-            gray = bool((beta == beta[0]).all())
-            tau_sky, extinction_sky = (tau[..., :1], origin_extinction[:1]) if gray else (tau, origin_extinction)
-            falloff = fog.falloff
+        # Light from the sky, the ground and the fog itself reaches the fog from many directions, so that the light
+        # scattered towards a ray only depends on its elevation: it is integrated along rays of every elevation once,
+        # and interpolated for each pixel. When extinction doesn't depend on wavelength, as for fog, the integral is
+        # the same for every channel, up to the color of the light
+        channels = slice(0, 1) if bool((beta == beta[0]).all()) else slice(None)
+        if source := elevation_source(medium, lighting, beta[channels], n):
+            table = tabulate_along_rays(source, origin_extinction[channels] * fog.falloff, table_size)
+            inscatter = inscatter + lookup(table, directions[..., 2], tau[..., channels])
 
-            def sky_inscatter(directions: torch.Tensor, distance: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
-                elevations, weights = sky_quadrature(directions, medium.anisotropy)
-                integral = height_fog_sun_inscatter(
-                    optical_depth=tau[..., None, :],
-                    origin_extinction=extinction_sky,
-                    falloff=falloff,
-                    directions_z=directions[..., None, 2:3],
-                    distance=distance[..., None, None],
-                    sun_z=elevations[..., None],
-                )
-                return (weights[..., None] * integral).sum(dim=-2)
-
-            nodes = _SKY_NODES * tau_sky.shape[-1]
-            inscatter = inscatter + sky * _by_pixels(
-                sky_inscatter, directions, distance, tau_sky, elements_per_pixel=nodes
-            )
+    # Point lights shine with a radiant intensity of a quarter of their power per steradian, as in Cycles
+    for light in lighting.points:
+        intensity = _per_channel(light.power, n, "point light power", **kwargs) / (4 * math.pi)
+        scatter = partial(
+            point_light_inscatter,
+            medium,
+            origin,
+            position=torch.as_tensor(light.position, **kwargs),
+            beta=beta,
+            radius=light.radius,
+            time=time,
+            nodes=_POINT_LIGHT_NODES,
+        )
+        integral = _by_pixels(scatter, directions, distance, elements_per_pixel=_POINT_LIGHT_NODES * (8 + 2 * n))
+        inscatter = inscatter + medium.albedo * intensity * integral
 
     return MediumResult(
         radiance=torch.cat([transmittance * radiance[..., :n] + inscatter, radiance[..., n:]], dim=-1),

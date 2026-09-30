@@ -298,8 +298,12 @@ def test_apply_medium_sky_matches_brute_force(medium):
 def test_ray_marching_converges_to_closed_form(medium):
     rng = np.random.default_rng(4)
     camera, pose = small_camera()
-    args = (rng.uniform(0, 2, size=(5, 7, 3)), rng.uniform(1, 25, size=(5, 7)), camera, pose, medium)
     lighting = Lighting(sky=(0.2, 0.3, 0.5), ambient=(0.05,), suns=[Sun(direction=(0.2, 1.0, 0.6), irradiance=(3.0,))])
+    if medium.sun_attenuation:
+        # Light from the ground and multiple scattering are tabulated like skylight, and marched through alike
+        medium = medium.model_copy(update={"multiple_scattering": True})
+        lighting = lighting.model_copy(update={"ground_albedo": (0.4,), "ground_height": -0.5})
+    args = (rng.uniform(0, 2, size=(5, 7, 3)), rng.uniform(1, 25, size=(5, 7)), camera, pose, medium)
     exact = apply_medium(*args, lighting, time=0.4).radiance
 
     def error(**kwargs):

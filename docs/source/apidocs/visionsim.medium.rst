@@ -36,6 +36,14 @@ visionsim.medium.render module
    :show-inheritance:
    :undoc-members:
 
+visionsim.medium.scattering module
+----------------------------------
+
+.. automodule:: visionsim.medium.scattering
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 visionsim.medium.transient module
 ---------------------------------
 

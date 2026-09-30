@@ -8,6 +8,7 @@ which makes it a baseline against which to compare the closed form.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -17,7 +18,9 @@ import torch
 
 from visionsim.medium.model import HeightFog, Lighting, Medium
 from visionsim.medium.optics import density, henyey_greenstein, sky_quadrature
+from visionsim.medium.optics import optical_depth as segment_optical_depth
 from visionsim.medium.render import _SKY_NODES, RGB_WAVELENGTHS, MediumResult, _by_pixels, _per_channel, camera_rays
+from visionsim.medium.scattering import elevation_source
 
 
 def _sun_transmittance(
@@ -73,8 +76,9 @@ def ray_march_medium(
     (the energy conserving scheme of Hillaire, "Physically Based and Unified Volumetric Rendering in Frostbite",
     2015). Light reaching each sample is computed as in :func:`apply_medium <visionsim.medium.render.apply_medium>`,
     except that, when ``shadow_steps`` is positive, sunlight is attenuated by marching towards the sun instead of
-    in closed form, as generic volume renderers do. Skylight is always attenuated in closed form, since marching
-    towards every direction of the sky would be prohibitively expensive.
+    in closed form, as generic volume renderers do. Light from the sky and the ground is always attenuated in closed
+    form, since marching towards every direction would be prohibitively expensive, light scattered more than once
+    is interpolated from the same table, and light from point lights is attenuated in closed form towards them.
 
     Args:
         radiance (npt.ArrayLike | torch.Tensor): Linear radiance of the scene without the medium, of shape (h, w, c).
@@ -122,21 +126,26 @@ def ray_march_medium(
     ambient = medium.albedo * _per_channel(lighting.ambient, n, "ambient", **kwargs)
     sky = medium.albedo * _per_channel(lighting.sky, n, "sky", **kwargs)
     lit_by_sky = bool((sky != 0).any())
-    # When extinction doesn't depend on wavelength, as for fog, skylight is attenuated the same in every channel
-    gray = bool((beta == beta[0]).all())
+    # When extinction doesn't depend on wavelength, as for fog, light is attenuated the same in every channel
+    channels = slice(0, 1) if bool((beta == beta[0]).all()) else slice(None)
+    # Light from the sky, the ground and multiple scattering, which only depends on the rays' elevation
+    elevation_light = elevation_source(medium, lighting, beta[channels], n) if medium.sun_attenuation else None
 
     suns = []
     for sun in lighting.suns:
         towards_sun = torch.as_tensor(sun.direction, **kwargs)
         suns.append((towards_sun / towards_sun.norm(), _per_channel(sun.irradiance, n, "sun irradiance", **kwargs)))
+    points = []
+    for light in lighting.points:
+        intensity = _per_channel(light.power, n, "point light power", **kwargs) / (4 * math.pi)
+        points.append((torch.as_tensor(light.position, **kwargs), medium.albedo * intensity, max(light.radius, 1e-4)))
 
     def march(directions: torch.Tensor, distance: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Light which is the same at every sample of a ray
         constant = ambient.expand(*directions.shape[:-1], n).clone()
-        if lit_by_sky:
-            sky_elevations, sky_weights = sky_quadrature(directions, medium.anisotropy)
-            if not medium.sun_attenuation:
-                constant = constant + sky * sky_weights.sum(dim=-1, keepdim=True)
+        if lit_by_sky and not medium.sun_attenuation:
+            constant = constant + sky * sky_quadrature(directions, medium.anisotropy)[1].sum(dim=-1, keepdim=True)
+        elevations = directions[..., 2]
         sunlight = []
         for towards_sun, irradiance in suns:
             phase = henyey_greenstein(directions @ towards_sun, medium.anisotropy)[..., None]
@@ -148,23 +157,27 @@ def ray_march_medium(
         inscatter = torch.zeros_like(constant)
 
         for i in range(steps):
-            points = origin + (i + 0.5) * step * directions
-            sigma = density(medium, points, time)[..., None] * beta
+            samples = origin + (i + 0.5) * step * directions
+            sigma = density(medium, samples, time)[..., None] * beta
             source = constant.clone()
 
             for towards_sun, weight in sunlight:
                 if medium.sun_attenuation:
-                    weight = weight * _sun_transmittance(points, towards_sun, medium, beta, shadow_steps, time)
+                    weight = weight * _sun_transmittance(samples, towards_sun, medium, beta, shadow_steps, time)
                 source = source + weight
 
-            if lit_by_sky and medium.sun_attenuation:
-                # Each direction of the sky is attenuated by the fog above the sample, i.e. by density * falloff / ω_z
+            for position, weight, radius in points:
+                to_light = position - samples
+                r = to_light.norm(dim=-1).clamp_min(radius)
+                phase = henyey_greenstein((directions * to_light).sum(dim=-1) / r, medium.anisotropy)
+                depth = segment_optical_depth(medium, samples, to_light / r[..., None], r, time=time)
+                source = source + weight * (phase / (r * r))[..., None] * torch.exp(-depth[..., None] * beta)
+
+            if elevation_light is not None:
+                # Such light only depends on the optical depth of the fog above the sample, i.e. density * falloff
                 fog = medium.components[0]
                 assert isinstance(fog, HeightFog)
-                above = (sigma[..., :1] if gray else sigma)[..., None, :] * fog.falloff
-                elevations = sky_elevations[..., None]
-                attenuation = torch.exp(-above / elevations.clamp_min(1e-12)) * (elevations > 0)
-                source = source + sky * (sky_weights[..., None] * attenuation).sum(dim=-2)
+                source = source + elevation_light(elevations, (sigma[..., channels] * fog.falloff)[:, None])[:, 0]
 
             step_transmittance = torch.exp(-sigma * step)
             inscatter = inscatter + transmittance * source * (1 - step_transmittance)
@@ -173,7 +186,7 @@ def ray_march_medium(
         return transmittance, optical_depth, inscatter
 
     # Integrating skylight needs hundreds of values per pixel, so rays are marched in chunks to bound memory
-    nodes = (_SKY_NODES if lit_by_sky else 1) * (1 if gray else n)
+    nodes = (2 * _SKY_NODES if lit_by_sky or elevation_light else 1) * len(beta[channels])
     transmittance, optical_depth, inscatter = _by_pixels(march, directions, distance, elements_per_pixel=nodes)
 
     return MediumResult(

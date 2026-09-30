@@ -89,11 +89,16 @@ class Medium(BaseModel):
     """if true, light from suns and from the sky is attenuated as it travels through the medium before being
     scattered. This is only supported, in closed form, for media made of a single :class:`HeightFog` component.
     Otherwise, light is assumed to reach every point of the medium unattenuated"""
+    multiple_scattering: bool = False
+    """if true, also approximate light scattered more than once by the medium, which is significant in dense fog as
+    its droplets absorb little light, see :mod:`visionsim.medium.scattering`. This requires ``sun_attenuation``"""
 
     @model_validator(mode="after")
     def _validate_sun_attenuation(self) -> Self:
         if self.sun_attenuation and (len(self.components) != 1 or not isinstance(self.components[0], HeightFog)):
             raise ValueError("Sun attenuation is only supported for media made of a single `HeightFog` component.")
+        if self.multiple_scattering and not self.sun_attenuation:
+            raise ValueError("Multiple scattering is only supported along with sun attenuation.")
         return self
 
     @classmethod
@@ -163,7 +168,7 @@ class Sun(BaseModel):
 
 
 class PointLight(BaseModel):
-    """Point light source, such as a street lamp."""
+    """Point light source, such as a street lamp, whose radiant intensity is its power divided by 4π, as in Cycles."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -172,7 +177,7 @@ class PointLight(BaseModel):
     power: tuple[float, ...]
     """radiant power per color channel, in W"""
     radius: NonNegativeFloat = 0.0
-    """radius of the light, in meters"""
+    """radius of the light, in meters, below which distances to the light are clamped"""
 
 
 class Lighting(BaseModel):
@@ -194,4 +199,9 @@ class Lighting(BaseModel):
     suns: list[Sun] = Field(default_factory=list)
     """distant light sources"""
     points: list[PointLight] = Field(default_factory=list)
-    """point light sources, which are not yet supported by the medium and are ignored"""
+    """point light sources, whose light is attenuated by the medium on its way, and scattered once"""
+    ground_albedo: tuple[float, ...] = (0.0, 0.0, 0.0)
+    """albedo per color channel of the ground, modeled as a Lambertian plane at ``ground_height`` lit by suns and
+    the sky, which reflects light into the medium. This is only used when sunlight is attenuated by the medium"""
+    ground_height: float = 0.0
+    """height of the ground, in meters"""

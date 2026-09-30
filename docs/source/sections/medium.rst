@@ -61,10 +61,16 @@ properties:
   defined in world space, so it is consistent across frames and cameras.
 
 The medium is lit by the same lights as the scene, which are exported from Blender to ``lighting.json`` (see
-:meth:`lighting_info <visionsim.simulate.blender.BlenderService.exposed_lighting_info>`): sun lights, and the average
-radiance of the world background above the horizon, i.e. the sky. Light from below the horizon is assumed to be blocked
-by the ground, and, with ``sun_attenuation``, both sunlight and skylight are attenuated by the fog they travel through
-before being scattered.
+:meth:`lighting_info <visionsim.simulate.blender.BlenderService.exposed_lighting_info>`): sun and point lights, and the
+average radiance of the world background above the horizon, i.e. the sky. Light from below the horizon is assumed to
+be blocked by the ground, and, with ``sun_attenuation``, both sunlight and skylight are attenuated by the fog they travel
+through before being scattered. The ground can also reflect light into the fog, given its ``ground_albedo`` and
+``ground_height`` in the lighting, which are not exported from Blender.
+
+Dense fog absorbs little light, so a large share of the light it scatters towards the camera was already scattered
+before: in the ground fog of ``examples/medium``, whose albedo is one, light scattered more than once makes up 63% of
+the fog's light. Setting ``multiple_scattering`` on the medium approximates it, see below. Note that Blender's default
+maximum number of volume bounces, zero, also renders single scattering only.
 
 |
 
@@ -90,9 +96,23 @@ scattered, this integral also has a closed form:
     \int_0^d \sigma(s) \, T(s) \, T_{sun}(s) \, ds = \frac{\ell_z}{\ell_z - v_z} \left( T_{sun}(0) - T(d) \, T_{sun}(d) \right)
 
 where :math:`v_z` and :math:`\ell_z` are the vertical components of the ray direction and of the direction towards
-the sun, and :math:`T_{sun}` the transmittance between a point and the sun. Skylight is integrated over the sky with
-a fixed quadrature (:func:`sky_quadrature <visionsim.medium.optics.sky_quadrature>`), where each direction is attenuated
-like a sun would be, so the result stays deterministic and noise-free. See :mod:`visionsim.medium.optics` for details.
+the sun, and :math:`T_{sun}` the transmittance between a point and the sun. See :mod:`visionsim.medium.optics` for
+details.
+
+Skylight, light reflected by the ground and light scattered more than once reach the fog from many directions, so that
+the light they scatter towards a ray only depends on the ray's elevation and on the height of each point. Their
+integral along rays is tabulated once per frame against the rays' elevation and optical depth, as all camera rays start
+from the same point, and interpolated for every pixel, which is within 0.1% of integrating every direction of the sky
+for each pixel, while the cost of the table does not depend on the resolution. Directions of the sky and the ground are integrated with a fixed
+quadrature (:func:`sky_quadrature <visionsim.medium.optics.sky_quadrature>`), so the result stays deterministic and
+noise-free. Light scattered more than once is approximated following Hillaire (EGSR 2020): light scattered once, by the
+fog or the ground, is gathered at a set of heights and scattered again with the phase function, and higher orders are
+summed as a geometric series. See :mod:`visionsim.medium.scattering` for details.
+
+Point lights are integrated along each ray over the angle at which the light sees it (equi-angular sampling), with
+Gauss-Legendre quadrature, which cancels the singularity near the light, see :func:`point_light_inscatter
+<visionsim.medium.optics.point_light_inscatter>`. Their radiant intensity is their power divided by :math:`4\pi`, as in
+Cycles.
 
 |
 
@@ -105,6 +125,11 @@ volume using Cycles' volumetric path tracing, then compares them. When restricte
 pass with a median relative error of 0.26%, and the radiance of objects and of the sky seen through the fog is
 within 0.3%. The remaining differences are Monte Carlo noise, and object edges.
 
+In the same scene without objects, the light scattered by the fog towards the camera, including multiple scattering
+and light reflected by the ground, is within 2% of Cycles with 32 volume bounces overall, and within 8% at any
+elevation. Light scattered by a point light is within 1% of Cycles' single scattering.
+``examples/medium/experiment`` compares every method as seen by the sensor emulators.
+
 |
 
 Limitations
@@ -113,8 +138,9 @@ Limitations
 The following are not yet modeled:
 
 - Shadows cast onto the medium, i.e. light shafts, and the occlusion of the sky by nearby objects.
-- Point, spot and area lights, as well as emissive surfaces, lighting the medium.
-- Multiple scattering, which becomes significant in dense media, and skies whose radiance varies with direction.
-- The dimming of surfaces lit through the medium.
+- Spot and area lights, as well as emissive surfaces, lighting the medium. Light from point lights is only
+  scattered once, which misses about 30% of their glow in the dense fog of ``examples/medium``.
+- Multiple scattering in media other than a single height fog, and skies whose radiance varies with direction.
+- The dimming of surfaces lit through the medium, and their lighting by the fog's glow.
 - Anti-aliasing: depth maps are not anti-aliased, so edges between near and far objects can show halos in dense
   media. Rendering at a higher resolution and downsampling the results reduces these.

@@ -12,11 +12,19 @@ extinction coefficient at the wavelength of interest (see :meth:`Medium.extincti
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import numpy as np
 import torch
 
 from visionsim.medium.model import Blob, Component, HeightFog, Homogeneous, Medium
+
+
+def _per_channel(values: Sequence[float], n: int, name: str, **kwargs) -> torch.Tensor:
+    # Values that are the same for every channel, such as the default black sky, work with any number of channels
+    if len(values) != n and len(set(values)) > 1:
+        raise ValueError(f"Expected {name} to have 1 or {n} values (one per wavelength), got {len(values)}.")
+    return torch.as_tensor([values[0]] * n if len(values) != n else list(values), **kwargs)
 
 
 def _exprel(x: torch.Tensor) -> torch.Tensor:
@@ -94,14 +102,14 @@ def height_fog_optical_depth(
 
     Args:
         component (HeightFog): Height fog component.
-        origin (torch.Tensor): Ray origin, of shape (3,).
+        origin (torch.Tensor): Ray origin, of shape (3,), or one per ray, of shape (..., 3).
         directions (torch.Tensor): Unit ray directions, of shape (..., 3).
         distance (torch.Tensor): Ray lengths in meters, of shape (...), can be infinite.
 
     Returns:
         torch.Tensor: Relative optical depth of each ray.
     """
-    k = component.density * torch.exp(-(origin[2] - component.base_height) / component.falloff)
+    k = component.density * torch.exp(-(origin[..., 2] - component.base_height) / component.falloff)
     dir_z = directions[..., 2]
     x = torch.where(dir_z == 0, torch.zeros_like(distance), distance * dir_z / component.falloff)
     small = x.abs() < 1e-4
@@ -125,7 +133,7 @@ def blob_optical_depth(
 
     Args:
         component (Blob): Blob component.
-        origin (torch.Tensor): Ray origin, of shape (3,).
+        origin (torch.Tensor): Ray origin, of shape (3,), or one per ray, of shape (..., 3).
         directions (torch.Tensor): Unit ray directions, of shape (..., 3).
         distance (torch.Tensor): Ray lengths in meters, of shape (...), can be infinite.
         time (float, optional): Time in seconds, used to move the blob along its velocity. Defaults to 0.0.
@@ -136,7 +144,7 @@ def blob_optical_depth(
     center = origin.new_tensor(component.center) + time * origin.new_tensor(component.velocity)
     offset = center - origin
     t_star = (directions * offset).sum(dim=-1)
-    closest_sq = ((offset * offset).sum() - t_star * t_star).clamp_min(0)
+    closest_sq = ((offset * offset).sum(dim=-1) - t_star * t_star).clamp_min(0)
     s = component.radius
     k = component.density * torch.exp(-closest_sq / (2 * s * s))
     return (
@@ -158,7 +166,7 @@ def component_optical_depth(
 
     Args:
         component (Component): Density component.
-        origin (torch.Tensor): Ray origin, of shape (3,).
+        origin (torch.Tensor): Ray origin, of shape (3,), or one per ray, of shape (..., 3).
         directions (torch.Tensor): Unit ray directions, of shape (..., 3).
         distance (torch.Tensor): Ray lengths in meters, of shape (...), can be infinite.
         time (float, optional): Time in seconds, used by moving components. Defaults to 0.0.
@@ -189,7 +197,7 @@ def optical_depth(
 
     Args:
         medium (Medium): Participating medium.
-        origin (torch.Tensor): Ray origin, of shape (3,).
+        origin (torch.Tensor): Ray origin, of shape (3,), or one per ray, of shape (..., 3).
         directions (torch.Tensor): Unit ray directions, of shape (..., 3).
         distance (torch.Tensor): Ray lengths in meters, of shape (...), can be infinite.
         time (float, optional): Time in seconds, used by moving components. Defaults to 0.0.
@@ -323,3 +331,64 @@ def height_fog_sun_inscatter(
 
     # Sunlight from below the horizon would have to travel through an infinite amount of fog
     return torch.where((origin_extinction > 0) & above, result, torch.zeros_like(result))
+
+
+def point_light_inscatter(
+    medium: Medium,
+    origin: torch.Tensor,
+    directions: torch.Tensor,
+    distance: torch.Tensor,
+    position: torch.Tensor,
+    beta: torch.Tensor,
+    radius: float = 0.0,
+    time: float = 0.0,
+    nodes: int = 32,
+) -> torch.Tensor:
+    """Integral of ``σ(s) · T(s) · p(θ(s)) · T_light(s) / r(s)²`` along rays, for light from a point light.
+
+    This is the single scattering integral for a light of unit radiant intensity, where ``T(s)`` is the transmittance
+    between the ray origin and the point at distance ``s``, ``T_light(s)`` the one between that point and the light,
+    ``r(s)`` their distance and ``p`` the phase function. It is integrated over the angle ``θ`` at which the light sees
+    each point along the ray, measured from the ray's point of closest approach at a distance ``D`` from the light
+    (equi-angular sampling, Kulla and Fajardo, "Importance Sampling Techniques for Path Tracing in Participating
+    Media", EGSR 2012). As ``ds / r² = dθ / D``, the singularity near the light cancels out and the integrand is smooth,
+    such that Gauss-Legendre quadrature converges quickly. Light is attenuated towards the light in closed form, for
+    any medium.
+
+    Args:
+        medium (Medium): Participating medium.
+        origin (torch.Tensor): Ray origin, of shape (3,).
+        directions (torch.Tensor): Unit ray directions, of shape (..., 3).
+        distance (torch.Tensor): Ray lengths in meters, of shape (...), can be infinite.
+        position (torch.Tensor): Position of the light, of shape (3,).
+        beta (torch.Tensor): Extinction coefficient per channel, of shape (c,).
+        radius (float, optional): Radius of the light, below which distances to it are clamped. Defaults to 0.0.
+        time (float, optional): Time in seconds, used by moving media. Defaults to 0.0.
+        nodes (int, optional): Number of quadrature nodes along each ray. Defaults to 32.
+
+    Returns:
+        torch.Tensor: Single scattering integral, of shape (..., c), to be multiplied by the albedo and the light's
+        radiant intensity.
+    """
+    kwargs = {"dtype": directions.dtype, "device": directions.device}
+    offset = position - origin
+    along = directions @ offset
+    closest = ((offset * offset).sum() - along * along).clamp_min(0).sqrt().clamp_min(max(radius, 1e-4))
+    start, end = torch.atan2(-along, closest), torch.atan2(distance - along, closest)
+
+    t, w = (torch.as_tensor(a, **kwargs) for a in np.polynomial.legendre.leggauss(nodes))
+    theta = (start + end)[..., None] / 2 + (end - start)[..., None] / 2 * t
+    weights = (end - start)[..., None] / 2 * w
+    s = (along[..., None] + closest[..., None] * torch.tan(theta)).clamp_min(0)
+    points = origin + s[..., None] * directions[..., None, :]
+    to_light = position - points
+    r = to_light.norm(dim=-1).clamp_min(max(radius, 1e-4))
+
+    tau = optical_depth(medium, origin, directions[..., None, :], s, time=time)
+    tau = tau + optical_depth(medium, points, to_light / r[..., None], r, time=time)
+    # The light is seen at an angle θ past the point of closest approach, i.e. cos(ray, towards light) = -sin(θ)
+    phase = henyey_greenstein(-torch.sin(theta), medium.anisotropy)
+    integrand = density(medium, points, time)[..., None] * beta * torch.exp(-tau[..., None] * beta) * phase[..., None]
+    # Far along rays going down forever, the density overflows where no light is left anyway
+    integrand = torch.nan_to_num(integrand, nan=0.0, posinf=0.0)
+    return (integrand * weights[..., None]).sum(dim=-2) / closest[..., None]
