@@ -22,6 +22,8 @@ def main(args):
     service.exposed_cycles_settings(device_type="optix", use_cpu=False, max_samples=args.samples, use_denoising=False)
     service.scene.cycles.use_adaptive_sampling = False
     service.scene.cycles.seed = args.seed
+    if args.width or args.height:
+        service.exposed_set_resolution(height=args.height, width=args.width)
     if args.volume_bounces is not None:
         # The total number of bounces also limits volume bounces, so leave room for surface bounces too
         service.scene.cycles.volume_bounces = args.volume_bounces
@@ -54,6 +56,8 @@ if __name__ == "__main__":
     parser.add_argument("--frame", type=int, nargs="+", help="frames to render, after rescaling keyframes, or all")
     parser.add_argument("--keyframe-multiplier", type=float, default=5.0, help="same as the render CLI's option")
     parser.add_argument("--samples", type=int, default=4096, help="samples per pixel")
+    parser.add_argument("--width", type=int, help="frame width in pixels, defaults to the scene's")
+    parser.add_argument("--height", type=int, help="frame height in pixels, defaults to the scene's")
     parser.add_argument("--seed", type=int, default=0, help="Cycles sampling seed")
     parser.add_argument(
         "--volume-bounces",
