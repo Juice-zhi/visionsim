@@ -15,10 +15,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from run_experiment import GROUND_ALBEDO, ROOT, box_depth, psnr, relative_l1, tonemap
+from run_experiment import GROUND_ALBEDO, OCCLUSION, ROOT, box_depth, psnr, relative_l1, tonemap
 
 from visionsim.dataset import Dataset
 from visionsim.medium import Lighting, Medium, apply_medium
+from visionsim.medium.occlusion import load_occlusion
 from visionsim.medium.raymarch import ray_march_medium
 
 
@@ -39,12 +40,34 @@ def main(args):
     medium_ms = medium.model_copy(update={"multiple_scattering": True})
     lighting_ms = lighting.model_copy(update={"ground_albedo": (GROUND_ALBEDO,) * 3})
     kwargs = {"device": "cuda", "dtype": torch.float32}
+    # Shadow maps only depend on the scene, not on the camera's resolution
+    occlusion = load_occlusion(OCCLUSION, **kwargs)
     methods = {
         "closed_form": lambda i: apply_medium(
             clear[i], depth[i], transforms[i], transforms[i]["transform_matrix"], medium, lighting, **kwargs
         ),
         "closed_form_ms": lambda i: apply_medium(
             clear[i], depth[i], transforms[i], transforms[i]["transform_matrix"], medium_ms, lighting_ms, **kwargs
+        ),
+        "closed_form_occ": lambda i: apply_medium(
+            clear[i],
+            depth[i],
+            transforms[i],
+            transforms[i]["transform_matrix"],
+            medium,
+            lighting,
+            occlusion=occlusion,
+            **kwargs,
+        ),
+        "closed_form_ms_occ": lambda i: apply_medium(
+            clear[i],
+            depth[i],
+            transforms[i],
+            transforms[i]["transform_matrix"],
+            medium_ms,
+            lighting_ms,
+            occlusion=occlusion,
+            **kwargs,
         ),
         "closed_form_without_sky_quadrature": lambda i: apply_medium(
             clear[i],

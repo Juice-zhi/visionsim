@@ -12,6 +12,7 @@ import shutil
 from pathlib import Path
 
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -30,6 +31,7 @@ LABELS = {
     "raymarch_64s16": "Ray marching 64 步 + 朝太阳 16 步",
     "closed_form_m1": "闭式解（修正天光前）",
     "closed_form": "闭式解",
+    "closed_form_occ": "闭式解 + 阴影",
     "reference_seed1": "参考本身的噪声（换一个种子）",
     "reference": "参考：Cycles 4096 spp，单次散射",
 }
@@ -43,7 +45,9 @@ LABELS_MS = {
     "raymarch_64s16": LABELS["raymarch_64s16"],
     "closed_form_m1": LABELS["closed_form_m1"],
     "closed_form": "闭式解（单次散射）",
+    "closed_form_occ": "闭式解（单次散射）+ 阴影",
     "closed_form_ms": "闭式解（多次散射）",
+    "closed_form_ms_occ": "闭式解（多次散射）+ 阴影",
     "reference_seed1": LABELS["reference_seed1"],
     "reference": "参考：Cycles 4096 spp，多次散射",
 }
@@ -56,7 +60,9 @@ KINDS = {
     "raymarch_64s16": "Ray marching",
     "closed_form_m1": "闭式解",
     "closed_form": "闭式解",
+    "closed_form_occ": "闭式解",
     "closed_form_ms": "闭式解",
+    "closed_form_ms_occ": "闭式解",
     "reference_seed1": "噪声底",
 }
 
@@ -245,13 +251,33 @@ def build_prose(
     validation: dict,
     scale: dict,
     regions: dict,
+    occlusion: dict,
+    maps: dict,
 ) -> dict[str, str]:
     """Text of the report, which quotes the measured numbers."""
     r = rows
     cf, cd, nd, cl = (r[k] for k in ("closed_form", "cycles_default", "cycles_nodenoise", "clear"))
+    cf_occ = r["closed_form_occ"]
     cf_ms, ms_ms, cd_ms, nd_ms, ss_ms, cl_ms = (
         rows_ms[k]
         for k in ("closed_form", "closed_form_ms", "cycles_default", "cycles_nodenoise", "cycles_default_ss", "clear")
+    )
+    occ_ms = rows_ms["closed_form_ms_occ"]
+    shadowed_seconds = {
+        "320×180": occ_ms["update"],
+        "800×800": scale["closed_form_ms_occ"]["update"],
+        "1920×1080": timings["1920x1080"]["closed_form_ms_occ"],
+    }
+    cycles_ms_seconds = {
+        "320×180": cd_ms["update"],
+        "800×800": scale["cycles_default_ms"]["update"],
+        "1920×1080": cycles_seconds("fog_default_ms", "1920x1080"),
+    }
+    shadowed_speedups = "、".join(
+        f"{cycles_ms_seconds[k] / v:.1f} 倍（{k}，每帧 {fmt(v, 'sec')}）" for k, v in shadowed_seconds.items()
+    )
+    sun_without, sun_with, sky_without, sky_with = (
+        occlusion[k] for k in ("sun_without", "sun_with", "sky_without", "sky_with")
     )
     floor_ms = rows_ms.get("reference_seed1")
     pct = lambda v: f"{100 * v:.1f}%"
@@ -283,12 +309,13 @@ def build_prose(
     )
 
     findings = f"""<ul>
-<li><strong>加上多次散射项之后，以物理上完整的多次散射为真值，闭式解的渲染帧误差从 {pct(cf_ms["frames_rel_l1"])} 降到 {pct(ms_ms["frames_rel_l1"])}；Cycles 默认设置（打开多次散射）是 {pct(cd_ms["frames_rel_l1"])}{floor_text}。</strong>四种传感器上：RGB PSNR {ms_ms["rgb_psnr"]:.1f} dB（Cycles {cd_ms["rgb_psnr"]:.1f} dB，只算单次散射时 {cf_ms["rgb_psnr"]:.1f} dB），SPAD 检测概率 MAE {1000 * ms_ms["spad_mae"]:.0f}×10⁻³（Cycles {1000 * cd_ms["spad_mae"]:.1f}，单次散射时 {1000 * cf_ms["spad_mae"]:.0f}），DVS 事件 F1 {ms_ms["dvs_f1_pooled"]:.3f}（Cycles {cd_ms["dvs_f1_pooled"]:.3f}，单次散射时 {cf_ms["dvs_f1_pooled"]:.3f}）。</li>
-<li><strong>时间：只改雾参数时，闭式解（多次散射）比打开多次散射的 Cycles 快 {speedup_text}</strong>，每帧分别只要 {fmt(ms_ms["update"], "sec")}、{fmt(scale["closed_form_ms"]["update"], "sec")} 和 {fmt(hd_ms, "sec")}。天光、地面反射和多次散射都改成每帧一张查找表，开销基本与分辨率无关：1080p 下只算单次散射的闭式解从上一版的每帧 {hd["closed_form"]:.2f} s 降到 {fmt(timings["1920x1080"]["closed_form"], "sec")}。多次散射表与相机无关，每组雾参数只算一次（{fmt(timings["multiple_scattering_table"], "sec")}）。</li>
-<li><strong>多次散射近似本身在去掉物体的场景里和 Cycles 吻合：雾散射进相机的光整体是 Cycles 32 次弹射的 {free["all"]:.3f} 倍，各仰角在 {min(elevations.values()):.2f}～{max(elevations.values()):.2f} 倍之间。</strong>所以完整场景里剩下的误差主要来自物体：光柱、物体遮挡天空，以及表面透过雾被照亮（包括被雾光照亮），这些模型都还没有包含。</li>
+<li><strong>加上光柱和天空遮挡之后，以物理上完整的多次散射为真值，闭式解的渲染帧误差从 {pct(ms_ms["frames_rel_l1"])} 降到 {pct(occ_ms["frames_rel_l1"])}；只算单次散射时是 {pct(cf_ms["frames_rel_l1"])}，Cycles 默认设置（打开多次散射）是 {pct(cd_ms["frames_rel_l1"])}{floor_text}。</strong>四种传感器上：RGB PSNR {occ_ms["rgb_psnr"]:.1f} dB（不加阴影 {ms_ms["rgb_psnr"]:.1f} dB，Cycles {cd_ms["rgb_psnr"]:.1f} dB），SPAD 检测概率 MAE {1000 * occ_ms["spad_mae"]:.0f}×10⁻³（不加阴影 {1000 * ms_ms["spad_mae"]:.0f}，Cycles {1000 * cd_ms["spad_mae"]:.1f}），DVS 事件 F1 {occ_ms["dvs_f1_pooled"]:.3f}（不加阴影 {ms_ms["dvs_f1_pooled"]:.3f}，Cycles {cd_ms["dvs_f1_pooled"]:.3f}）。</li>
+<li><strong>阴影本身和 Cycles 吻合：</strong>第 255 帧只开太阳时，雾散射进相机的光与 Cycles 之比在表面像素上从 {sun_without["surfaces"]:.3f} 变为 {sun_with["surfaces"]:.3f}，天空像素上从 {sun_without["sky"]:.3f} 变为 {sun_with["sky"]:.3f}；只开天光时，表面像素上从 {sky_without["surfaces"]:.3f} 变为 {sky_with["surfaces"]:.3f}，天空像素上从 {sky_without["sky"]:.3f} 变为 {sky_with["sky"]:.3f}。阴影图每个场景只需渲染一次（{maps["count"]} 张正交深度图，{maps["seconds"]:.1f} s），与相机、分辨率和雾参数都无关。</li>
+<li><strong>时间：只改雾参数时，闭式解（多次散射）+ 阴影比打开多次散射的 Cycles 快 {shadowed_speedups}。</strong>阴影要沿每条视线查阴影图，所以开销随像素数增加；不加阴影时快 {speedup_text}，每帧只要 {fmt(ms_ms["update"], "sec")}、{fmt(scale["closed_form_ms"]["update"], "sec")} 和 {fmt(hd_ms, "sec")}。天光、地面反射和多次散射都是每帧一张查找表，多次散射表与相机无关，每组雾参数只算一次（{fmt(timings["multiple_scattering_table"], "sec")}）。</li>
+<li><strong>多次散射近似本身在去掉物体的场景里和 Cycles 吻合：雾散射进相机的光整体是 Cycles 32 次弹射的 {free["all"]:.3f} 倍，各仰角在 {min(elevations.values()):.2f}～{max(elevations.values()):.2f} 倍之间。</strong>加上阴影后，完整场景里剩下的误差主要来自表面透过雾被照亮（表面在 Cycles 里暗约 {pct(1 - bd["surface_dimming"]["median"])}），以及多次散射近似本身。</li>
 <li><strong>Blender 默认的 0 次体积弹射只算单次散射：</strong>用 Cycles 默认设置渲染这团雾，误差是 {pct(ss_ms["frames_rel_l1"])}，比完全不加雾（{pct(cl_ms["frames_rel_l1"])}）还差。雾散射进相机的光里有 {pct(most["indirect_share"])} 散射过不止一次，画面整体亮 {pct(most["brightness"] - 1)}。在 Cycles 里打开多次散射（8 次弹射已收敛），每帧只从 {renders["cycles_default"]:.2f} s 增加到 {renders["ms_cycles_default"]:.2f} s，用 Cycles 渲染雾时应该把体积弹射次数设到 8 以上。</li>
 <li><strong>点光源：</strong>单次散射和 Cycles 吻合（雾光比值 {point["ratio"]:.3f}），但点光源的多次散射还没有建模，在这团雾里要少约 {pct(1 - validation["point_vs_32_bounces"]["ratio"])} 的光晕。</li>
-<li><strong>以单次散射为真值时，闭式解的实现是对的：</strong>误差 {pct(cf["frames_rel_l1"])}，来自上面那三种几何效应；ray marching 与它只差 {sci(steps[16]["error_vs_closed_form"])}，耗时是它的 {steps[16]["seconds"] / cf_seconds:.1f} 倍。{temporal_text}ToF 只能由闭式解或 ray marching 生成（Cycles 不能渲染瞬态），激光在雾中的多次散射这次无法评估。</li>
+<li><strong>以单次散射为真值时，闭式解的实现是对的：</strong>加阴影后误差从 {pct(cf["frames_rel_l1"])} 降到 {pct(cf_occ["frames_rel_l1"])}，剩下的主要是表面透过雾被照亮；ray marching 与（不加阴影的）闭式解只差 {sci(steps[16]["error_vs_closed_form"])}，耗时是它的 {steps[16]["seconds"] / cf_seconds:.1f} 倍。{temporal_text}ToF 只能由闭式解或 ray marching 生成（Cycles 不能渲染瞬态），激光在雾中的多次散射这次无法评估。</li>
 </ul>"""
     ms_intro = (
         "Cycles 的“体积弹射次数”决定雾里的光最多被散射几次。Blender 默认为 0，也就是单次散射：雾中每一点只接收直接来自太阳和天空的光。"
@@ -296,14 +323,18 @@ def build_prose(
         "ray marching 是沿视线的数值积分方法，它的光源项和闭式解一样，所以和闭式解积分的是同一个模型。"
         "“闭式解（多次散射）”加上了地面反射和多次散射的近似：在一组高度上收集散射过一次的光（来自雾或地面），用相函数再散射一次，更高阶按几何级数累加"
         f"（Hillaire，EGSR 2020）。地面按 Lambert 平面处理，反照率取棋盘格地面两种颜色的平均值 {validation['ground_albedo']:.2f}。"
+        "“+ 阴影”的两行再让物体在雾里投下阴影（光柱）并遮挡天空，见下文“光柱和天空遮挡”。"
         "下表以多次散射为真值；Cycles 的三行里，“单次散射”即 Blender 的默认设置。"
     )
     ms_text = (
-        f"左图（单次散射真值）里，闭式解只改雾参数时比 Cycles 默认设置快 {cd['update'] / cf['update']:.1f} 倍，误差 {pct(cf['frames_rel_l1'])} 对 {pct(cd['frames_rel_l1'])}。"
+        f"左图（单次散射真值）里，闭式解只改雾参数时比 Cycles 默认设置快 {cd['update'] / cf['update']:.1f} 倍，误差 {pct(cf['frames_rel_l1'])} 对 {pct(cd['frames_rel_l1'])}；"
+        f"加阴影后误差降到 {pct(cf_occ['frames_rel_l1'])}，每帧 {fmt(cf_occ['update'], 'sec')}。"
         f"右图（多次散射真值）里，只算单次散射的方法都落在虚线上方，比不加雾还差；加上多次散射项后，闭式解降到 {pct(ms_ms['frames_rel_l1'])}，每帧耗时只从 {fmt(cf_ms['update'], 'sec')} 增加到 {fmt(ms_ms['update'], 'sec')}。"
-        f"它剩下的误差有方向性：整体偏亮 {signed(regions['closed_form_ms']['all'])}，其中看天空的像素只差 {signed(regions['closed_form_ms']['sky'])}，"
-        f"偏差集中在物体表面（5 m 以内 {signed(regions['closed_form_ms']['surfaces_near'])}、5–15 m {signed(regions['closed_form_ms']['surfaces_mid'])}），"
-        "正是光柱和物体遮挡天空的位置，也就是下一步要补的效应。"
+        f"不加阴影时，它的误差有方向性：整体偏亮 {signed(regions['closed_form_ms']['all'])}，其中看天空的像素只差 {signed(regions['closed_form_ms']['sky'])}，"
+        f"偏差集中在物体表面（5 m 以内 {signed(regions['closed_form_ms']['surfaces_near'])}、5–15 m {signed(regions['closed_form_ms']['surfaces_mid'])}），正是光柱和物体遮挡天空的位置。"
+        f"加上阴影后，误差降到 {pct(occ_ms['frames_rel_l1'])}，整体偏差变为 {signed(regions['closed_form_ms_occ']['all'])}：天空像素 {signed(regions['closed_form_ms_occ']['sky'])}，"
+        f"表面像素 5 m 以内 {signed(regions['closed_form_ms_occ']['surfaces_near'])}、5–15 m {signed(regions['closed_form_ms_occ']['surfaces_mid'])}、15 m 以外 {signed(regions['closed_form_ms_occ']['surfaces_far'])}；"
+        f"每帧耗时增加到 {fmt(occ_ms['update'], 'sec')}。"
         f"修正天光前的 M1 模型总误差相近（{pct(rows_ms['closed_form_m1']['frames_rel_l1'])}），但原因不同：它在天空上偏暗 {signed(regions['closed_form_m1']['sky'])}、"
         f"远处表面偏暗 {signed(regions['closed_form_m1']['surfaces_far'])}，只在近处表面碰巧抵消，没有物理依据。"
         f"多次散射也放大了 Cycles 的噪声：不降噪时渲染帧误差为 {pct(nd_ms['frames_rel_l1'])}，DVS 事件 F1 为 {nd_ms['dvs_f1_pooled']:.3f}，"
@@ -320,6 +351,25 @@ def build_prose(
         f"点光源（夜景，关掉太阳和天空，在相机前方放一盏 3000 W 的灯）的单次散射和 Cycles 的比值是 {point['ratio']:.3f}，逐像素误差 {pct(point['rel_l1'])}（含渲染噪声），"
         "证实了辐射强度按功率除以 4π 换算；多次散射下 Cycles 的灯光光晕更亮，差的部分就是尚未建模的点光源多次散射。"
     )
+    sky_texels = "～".join(f"{100 * t:.0f}" for t in maps["texels"]["sky"])
+    occlusion_intro = (
+        "光柱和天空遮挡都用阴影图（shadow map）计算：在 Blender 里沿太阳方向，以及把天空分成 107 个方向单元格后沿每个单元格的中心方向，"
+        "各渲染一张只含深度的正交投影图，记录每个方向上离光源最近的物体表面。雾中一点如果落在某张图记录的表面后面，就看不到这个方向的光。"
+        f"太阳阴影图的纹素边长为 {100 * maps['texels']['sun'][0]:.1f} cm，天空的为 {sky_texels} cm。"
+        "沿每条视线，在物体可能投下阴影的区间里采样可见性，相邻两个采样点之间仍用闭式解积分，再乘以这一段的可见性，"
+        "所以结果依然确定、没有噪声，没有遮挡的地方和原来完全一样。太阳的阴影边缘锐利，每 8 个纹素采样一次；"
+        "天光来自许多单元格，变化平缓，每条视线只取 8 个采样点（按每段对相机的贡献均匀分布），每个单元格按相函数在格内的积分乘以天光在这个仰角范围的衰减加权。"
+        "多次散射的光也来自各个方向，用同样的方式遮挡，单元格改按到达这个仰角的单次散射光加权，地平线以下的部分不遮挡。"
+        f"整套阴影图每个场景只需渲染一次（{maps['count']} 张，Cycles 每像素 1 个样本，CPU 上共 {maps['seconds']:.1f} s），与相机、分辨率和雾参数都无关。"
+        "下表把第 255 帧 Cycles 的 Volume Direct pass（单次散射）分别和不加阴影、加阴影的闭式解对比，比值为 1 表示完全一致："
+    )
+    occlusion_text = (
+        f"加阴影后，太阳项在表面像素上的比值从 {sun_without['surfaces']:.3f} 降到 {sun_with['surfaces']:.3f}，天光项从 {sky_without['surfaces']:.3f} 降到 {sky_with['surfaces']:.3f}，"
+        f"都和 Cycles 吻合到约 1%；逐像素误差分别从 {pct(sun_without['rel_l1'])} 降到 {pct(sun_with['rel_l1'])}、从 {pct(sky_without['rel_l1'])} 降到 {pct(sky_with['rel_l1'])}。"
+        "上图里方块投在雾中的阴影（斜向的暗楔）在加阴影后完整出现；剩下的天光误差主要是 Cycles 自身的渲染噪声（地面附近雾光弱，噪声相对更大），"
+        "以及物体边缘的抗锯齿差异。天空单元格宽 15°～120°，遮挡物的边缘正好落在视线的前向散射波瓣上时（例如沿墙面方向看），"
+        "整格只按中心方向判定为全遮挡或全可见，会多算或少算一部分遮挡；这在合成测试里最多差约 25%，在本场景里整体只差约 1%。"
+    )
     clear_800 = scale["clear"]
     scale_intro = (
         "VisionSIM-50 有 50 个室内场景，每个场景 12 秒，以 100 fps、800×800 渲染，共 59,950 帧，只包含真值（RGB、深度、法线、光流、分割），约 1.0 TB。"
@@ -327,9 +377,11 @@ def build_prose(
         "再乘以帧数；误差对照同分辨率第 255–264 帧的多次散射参考（4096 spp）。参考级渲染每帧要几十秒以上，不在表中。"
     )
     scale_text = (
-        f"闭式解第一份需要先渲染无雾画面（每帧 {clear_800:.1f} s，另外还要保存线性 EXR 和深度），之后每组雾参数只要 {hours(VISIONSIM50_FRAMES * scale['closed_form_ms']['update'])}；"
+        f"闭式解第一份需要先渲染无雾画面（每帧 {clear_800:.1f} s，另外还要保存线性 EXR 和深度）和阴影图（每个场景约 {maps['seconds']:.0f} s），"
+        f"之后每组雾参数加阴影要 {hours(VISIONSIM50_FRAMES * scale['closed_form_ms_occ']['update'])}，不加阴影只要 {hours(VISIONSIM50_FRAMES * scale['closed_form_ms']['update'])}；"
         f"打开多次散射的 Cycles 每组都要 {hours(VISIONSIM50_FRAMES * scale['cycles_default_ms']['update'])}。"
-        "闭式解每帧只要几十毫秒，也可以像传感器仿真一样在读取数据时现场加雾，不必把每组雾参数的结果都存下来。"
+        "阴影只和场景几何有关，与雾参数无关，所以多组雾参数还可以共用每帧的可见性，这一步目前还没有做。"
+        "闭式解每帧只要几十到几百毫秒，也可以像传感器仿真一样在读取数据时现场加雾，不必把每组雾参数的结果都存下来。"
         "注意三点：本场景比 VisionSIM-50 的室内场景简单，Cycles 的耗时会随场景复杂度和弹射次数增加，而闭式解只和像素数有关；"
         "VisionSIM-50 发布的是色调映射后的 8 位 PNG，要用闭式解需要按线性 EXR 重新渲染一遍；室内场景主要靠灯光照明，目前点光源只算单次散射，聚光灯和面光源还不支持。"
         "插帧和传感器仿真的耗时对两种方法相同，不在表中。"
@@ -344,9 +396,9 @@ def build_prose(
         f"闭式解相对它的误差随弹射次数从 {pct(single['closed_form_error'])} 升到 {pct(most['closed_form_error'])}；而打开多次散射只让 Cycles 每帧多花 {pct(most['seconds_per_frame'] / single['seconds_per_frame'] - 1)} 的时间。"
     )
     overview_ms_caption = (
-        "第 250 帧，以多次散射为真值。多次散射让远处的地面、方块和天空都更亮、更白（最右列）。只算单次散射的三列（Cycles 单次散射、ray marching、闭式解（单次散射））"
+        "第 250 帧，以多次散射为真值。多次散射让远处的地面、方块和天空都更亮、更白（最右列）。只算单次散射的两列（Cycles 单次散射、闭式解（单次散射））"
         "在远处的地面和背景上误差都超过 50%；闭式解（多次散射）把背景和地面的误差降了下来，剩下的集中在方块和它周围的雾里，也就是光柱和遮挡所在的位置；"
-        "打开多次散射的 Cycles 默认设置几乎看不出误差。"
+        "加上阴影后，方块周围的误差明显减小，剩下的主要在方块表面（表面透过雾被照亮）。打开多次散射的 Cycles 默认设置几乎看不出误差。"
     )
 
     return {
@@ -357,12 +409,15 @@ def build_prose(
         "bounces_text": bounces_text,
         "validation_intro": validation_intro,
         "validation_text": validation_text,
+        "occlusion_intro": occlusion_intro,
+        "occlusion_text": occlusion_text,
         "scale_intro": scale_intro,
         "scale_text": scale_text,
         "overview_ms_caption": overview_ms_caption,
         "tradeoff_caption": "每个点是一种方法。横轴是只改雾参数时生成一帧带雾画面的耗时（Cycles 要整帧重新渲染，闭式解和 ray marching 只需在无雾渲染上加雾），"
         "纵轴是渲染帧相对参考的 L1 误差，两轴都是对数坐标。左图以单次散射为真值，右图以多次散射为真值。虚线是完全不加雾的误差，点线是参考自身的噪声底。",
-        "overview_caption": "第一行：各方法生成的带雾画面；第二行：相对参考的误差。闭式解和 ray marching 的误差集中在方块表面和方块周围的雾里，对应“差距从哪来”中的三种可见性效应。"
+        "overview_caption": "第一行：各方法生成的带雾画面；第二行：相对参考的误差。闭式解和 ray marching 的误差集中在方块表面和方块周围的雾里，对应“差距从哪来”中的三种可见性效应；"
+        "加阴影后方块周围雾里的误差基本消失，剩下的集中在方块表面。"
         "不降噪的 Cycles 满屏都是噪声，这些噪声会原样进入每一种传感器。最后一行 DVS 里，不降噪的 Cycles 在绿色方块表面和天空中出现了大量散落的假事件；"
         "三列 Cycles 渲染（包括参考）在右上角的天空里都有少量噪声事件，闭式解和 ray marching 没有。",
         "curves_caption": "逐帧 loss。t≈2.7 s（第 340 帧）时，相机紧贴着绿色方块经过，方块占了画面右侧的一大片，三种可见性效应都集中在它身上："
@@ -391,14 +446,16 @@ def build_prose(
         "breakdown_intro": "闭式解对它自己的模型是精确的：太阳和环境光项与逐点暴力积分吻合到 6 位有效数字，天光项的方向求积误差低于 0.1%。为了找出它和单次散射真值差在哪里，在第 255 帧（相机正从红色方块旁经过）用 Cycles 渲染了几种只保留部分光源、或去掉部分物体的变体，"
         "再把 Cycles 的 Volume Direct pass（雾对相机射线的单次散射）和闭式解的散射光逐项对比。比值为 1 表示完全一致。",
         "breakdown_text": f"只要物体不参与光的可见性计算，太阳项（{bd['sun_noshadow']['surfaces']:.3f}）和天光项（{bd['sky_noobjects']['surfaces']:.3f}）都和 Cycles 吻合到 1% 以内；天空像素的透射率也一致（比值 {bd['sky_transmittance']:.3f}）。"
-        "剩下的差距全部来自三种和几何有关的可见性效应。它们都是真实存在的物理现象，当前模型都没有包含："
+        "剩下的差距全部来自三种和几何有关的可见性效应，它们都是真实存在的物理现象："
         f"① 物体在雾里投下的阴影（光柱）：物体投影后，表面像素上太阳项的比值从 {bd['sun_noshadow']['surfaces']:.3f} 升到 {bd['sun']['surfaces']:.3f}；"
         f"② 附近的物体挡住了雾中各点能看到的一部分天空：放回方块和柱子后，天光项的比值从 {bd['sky_noobjects']['surfaces']:.3f} 升到 {bd['sky']['surfaces']:.3f}；"
         f"③ 表面本身是透过雾被照亮的：阳光和天光到达表面之前都被雾衰减，雾的散射又补回一部分，净效果是表面在 Cycles 里暗了 {pct(1 - bd['surface_dimming']['median'])}（中位数，p10–p90 为 {pct(1 - bd['surface_dimming']['p90'])}–{pct(1 - bd['surface_dimming']['p10'])}）。"
+        f"①和②现在已经用阴影图建模，加阴影后两项的比值分别回到 {sun_with['surfaces']:.3f} 和 {sky_with['surfaces']:.3f}（见上文“光柱和天空遮挡”），③还没有建模。"
         f"修正前的模型让下半球也向雾里照射天光，并且天光不衰减，结果表面像素上的散射光是 Cycles 的 {bd['full_before_fix']['surfaces']:.1f} 倍。",
         "next_steps": """<ul>
-<li><strong>光柱和天光遮挡（现在最大的误差来源）</strong>：从太阳方向渲染一张 shadow map，再从 Blender 输出一张天空可见性（环境光遮蔽）pass，用来调制源项。每条射线上被遮挡的区间，仍然可以用同一套积分分段计算，结果依然确定、没有噪声。</li>
-<li><strong>表面透过雾被照亮</strong>：用 Blender 的 Light Groups 把表面上的太阳贡献和天光贡献分开，分别乘以表面点处的阳光透射率和天光透射率（高度雾都有闭式解）；雾光对表面的照明可以用多次散射表里已经算好的、散射过一次的光场来近似。</li>
+<li><strong>表面透过雾被照亮（现在最大的误差来源）</strong>：用 Blender 的 Light Groups 把表面上的太阳贡献和天光贡献分开，分别乘以表面点处的阳光透射率和天光透射率（高度雾都有闭式解，阴影图也能直接用）；雾光对表面的照明可以用多次散射表里已经算好的、散射过一次的光场来近似。</li>
+<li><strong>阴影的速度</strong>：阴影只和场景几何有关，与雾参数无关，多组雾参数可以共用每帧的可见性；天空的遮挡变化平缓，也可以在低分辨率的视线上算好再按深度插值。查阴影图的部分用自定义 GPU 核函数合并后还能再快几倍。</li>
+<li><strong>阴影的精度</strong>：天空单元格较粗，遮挡物边缘正好落在前向散射波瓣上时会整格误判，可以每个单元格渲染几张子方向的阴影图，沿视线交替使用；运动的物体需要逐帧渲染阴影图；地面反射到雾里的光和点光源也还没有阴影。</li>
 <li><strong>点光源的多次散射、聚光灯和面光源</strong>：点光源的多次散射可以用大气点扩散函数（Narasimhan 和 Nayar 2003）一类的解析近似；聚光灯只是带角度衰减的点光源，面光源可以用若干个点光源近似。</li>
 <li><strong>多次散射近似的改进</strong>：地平线附近少约 7%，俯视地面时多约 12%。可以用 Cycles 的无物体参考标定级数因子，或者把收集过程迭代两三次代替几何级数；地面也可以换成更接近 Principled BSDF 的反射模型。</li>
 <li><strong>ToF</strong>：HG 相函数会低估雾滴在 180° 附近的后向散射（真实雾有 glory 峰），可以改用 lidar ratio 参数化；激光在雾中的多次散射可以用支持瞬态渲染的 mitransient（Mitsuba 3）生成参考。</li>
@@ -429,7 +486,9 @@ def method_rows(summary: dict, seconds: dict, labels: dict[str, str], temporal: 
 # Points of the trade-off chart: label, color, marker and where the label goes relative to the point
 POINTS = {
     "closed_form": ("闭式解", "#b0304a", "D", (-8, 3, "right")),
+    "closed_form_occ": ("闭式解 + 阴影", "#d9667f", "D", (-8, 3, "right")),
     "closed_form_ms": ("闭式解（多次散射）", "#6b1d2c", "D", (7, -3, "left")),
+    "closed_form_ms_occ": ("闭式解（多次散射）+ 阴影", "#3d0f19", "D", (0, -15, "center")),
     "closed_form_m1": ("闭式解（修正前）", "#b9a3c9", "D", (0, -14, "center")),
     "raymarch_16": ("RM 16 步", "#d9822b", "s", (0, 8, "center")),
     "raymarch_64s16": ("RM 64+16 步", "#e8b27a", "s", (7, 3, "left")),
@@ -516,6 +575,38 @@ def validation_table(validation: dict) -> str:
     )
 
 
+def occlusion_table(occlusion: dict) -> str:
+    """Light scattered by the fog in the closed form, with and without shadows, against Cycles, on frame 255."""
+    body = "".join(
+        f'<tr><th scope="row">{label}</th>'
+        + "".join(
+            f"<td>{occlusion[f'{variant}_{kind}']['sky']:.3f}</td><td>{occlusion[f'{variant}_{kind}']['surfaces']:.3f}</td>"
+            f"<td>{fmt(occlusion[f'{variant}_{kind}']['rel_l1'], 'pct')}</td>"
+            for kind in ("without", "with")
+        )
+        + "</tr>"
+        for variant, label in (("sun", "只有太阳（光柱）"), ("sky", "只有天光（遮挡）"))
+    )
+    head = "".join(f'<th scope="col">{h}</th>' for h in ("天空像素", "表面像素", "逐像素误差") * 2)
+    return (
+        '<div class="table-wrap"><table><thead>'
+        '<tr><th scope="col" rowspan="2">第 255 帧，雾的散射光：闭式解 / Cycles</th>'
+        '<th scope="col" colspan="3">无阴影</th><th scope="col" colspan="3">加阴影</th></tr>'
+        f"<tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
+    )
+
+
+def shadow_maps() -> dict:
+    """Number of shadow maps of the scene, and the time it took to render them, from ``export_occlusion.py``."""
+    with np.load(ROOT / "occlusion" / "occlusion.npz") as data:
+        count = len(data["sun_texels"]) + len(data["sky_texels"])
+        texels = {
+            kind: (float(data[f"{kind}_texels"].min()), float(data[f"{kind}_texels"].max())) for kind in ("sun", "sky")
+        }
+    log = (ROOT / "occlusion" / "export.log").read_text(encoding="utf-8", errors="replace")
+    return {"count": count, "seconds": float(re.findall(r"OCCLUSION_TIME ([\d.]+)s", log)[-1]), "texels": texels}
+
+
 VISIONSIM50_FRAMES = 59_950
 """Frames of VisionSIM-50: 50 scenes animated for 12 s, rendered at 100 fps and 800x800"""
 
@@ -562,6 +653,7 @@ def scale_table(timings: dict, quality: dict, variants: int = 10) -> tuple[str, 
     rows = [
         ("Cycles 默认设置（多次散射）", cycles_seconds("fog_default_ms", "800x800"), None, "cycles_default_ms"),
         ("Cycles 默认设置（单次散射）", cycles_seconds("fog_default", "800x800"), None, "cycles_default"),
+        ("闭式解（多次散射）+ 阴影", timings["closed_form_ms_occ"], clear, "closed_form_ms_occ"),
         ("闭式解（多次散射）", timings["closed_form_ms"], clear, "closed_form_ms"),
         ("闭式解（单次散射）", timings["closed_form"], clear, "closed_form"),
         ("Ray marching 16 步", timings["raymarch_16"], clear, "raymarch_16"),
@@ -621,11 +713,21 @@ def main():
     regions = json.loads((ROOT / "results_ms" / "regions.json").read_text())
     quality_800 = json.loads((ROOT / "res800x800" / "results.json").read_text())["vs_multiple"]
     scale_html, scale = scale_table(timings["800x800"], quality_800)
+    occlusion = json.loads((RESULTS / "occlusion.json").read_text())
+    maps = shadow_maps()
 
     # Time to produce a frame with fog, the first time, and after changing only the fog's parameters
     clear_render = renders["clear"]
     seconds = {"clear": (clear_render, None), "reference_seed1": (None, None)}  # not a method, the reference's noise
-    for name in ("raymarch_16", "raymarch_64s16", "closed_form_m1", "closed_form", "closed_form_ms"):
+    for name in (
+        "raymarch_16",
+        "raymarch_64s16",
+        "closed_form_m1",
+        "closed_form",
+        "closed_form_occ",
+        "closed_form_ms",
+        "closed_form_ms_occ",
+    ):
         seconds[name] = (clear_render + medium[name], medium[name])
     seconds_ss = seconds | {
         "cycles_default": (renders["cycles_default"],) * 2,
@@ -671,6 +773,7 @@ def main():
         ),
         bounces_table=bounces_table(bounces),
         validation_table=validation_table(validation),
+        occlusion_table=occlusion_table(occlusion),
         scale_table=scale_html,
         summary_table=table(
             [*passive, "reference"],
@@ -737,8 +840,23 @@ def main():
         closed_form_seconds=fmt(convergence["closed_form_seconds"], "sec"),
         closed_form_error=fmt(convergence["closed_form_error_vs_reference"], "pct2"),
         bd=breakdown,
+        occ=occlusion,
         r=renders,
-        **build_prose(rows, rows_ms, convergence, breakdown, renders, hd, bounces, timings, validation, scale, regions),
+        **build_prose(
+            rows,
+            rows_ms,
+            convergence,
+            breakdown,
+            renders,
+            hd,
+            bounces,
+            timings,
+            validation,
+            scale,
+            regions,
+            occlusion,
+            maps,
+        ),
     )
     (RESULTS / "index.html").write_text(body, encoding="utf-8")
     print("wrote", RESULTS / "index.html")

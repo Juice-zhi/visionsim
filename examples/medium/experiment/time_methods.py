@@ -7,6 +7,7 @@ the median is saved too, to show how much the measurements were disturbed. Resul
 ``results/timings.json``, which ``make_report.py`` uses for the time taken by each method.
 """
 
+import argparse
 import json
 import subprocess
 import time
@@ -17,10 +18,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from run_experiment import FRAME, GROUND_ALBEDO, ROOT, box_depth
+from run_experiment import FRAME, GROUND_ALBEDO, OCCLUSION, ROOT, box_depth
 
 from visionsim.dataset import Dataset
 from visionsim.medium import Lighting, Medium, apply_medium
+from visionsim.medium.occlusion import load_occlusion
 from visionsim.medium.raymarch import ray_march_medium
 from visionsim.medium.scattering import multiple_scattering
 
@@ -44,8 +46,8 @@ def wait_for_idle_gpu(threshold: int = 10, timeout: float = 120.0) -> None:
         time.sleep(0.2)
 
 
-def sample(fn: Callable[[], object]) -> float:
-    wait_for_idle_gpu()
+def sample(fn: Callable[[], object], wait: float = 120.0) -> float:
+    wait_for_idle_gpu(timeout=wait)
     torch.cuda.synchronize()
     start = time.perf_counter()
     fn()
@@ -53,16 +55,23 @@ def sample(fn: Callable[[], object]) -> float:
     return time.perf_counter() - start
 
 
-def main():
+def main(args):
     lighting = Lighting.model_validate_json((ROOT / "clear" / "lighting.json").read_text())
     lighting_ms = lighting.model_copy(update={"ground_albedo": (GROUND_ALBEDO,) * 3})
     medium = Medium.model_validate_json(Path("examples/medium/media/ground_fog.json").read_text())
     medium_ms = medium.model_copy(update={"multiple_scattering": True})
     kwargs = {"device": "cuda", "dtype": torch.float32}
     m1 = Lighting(ambient=lighting.sky, suns=lighting.suns)
+    occlusion = load_occlusion(OCCLUSION, **kwargs)
     methods = {
         "closed_form": lambda f, d, t: apply_medium(f, d, t, t["transform_matrix"], medium, lighting, **kwargs),
         "closed_form_ms": lambda f, d, t: apply_medium(f, d, t, t["transform_matrix"], medium_ms, lighting_ms, **kwargs),
+        "closed_form_occ": lambda f, d, t: apply_medium(
+            f, d, t, t["transform_matrix"], medium, lighting, occlusion=occlusion, **kwargs
+        ),
+        "closed_form_ms_occ": lambda f, d, t: apply_medium(
+            f, d, t, t["transform_matrix"], medium_ms, lighting_ms, occlusion=occlusion, **kwargs
+        ),
         "closed_form_m1": lambda f, d, t: apply_medium(f, d, t, t["transform_matrix"], medium, m1, **kwargs),
         "raymarch_16": lambda f, d, t: ray_march_medium(
             f, d, t, t["transform_matrix"], medium, lighting, steps=16, **kwargs
@@ -73,7 +82,11 @@ def main():
     }
     # (resolution, method, number of samples), leaving out ray marching at high resolutions, which takes long and
     # isn't used by the report
-    plan = [(r, m, 6) for r in FOLDERS for m in ("closed_form", "closed_form_ms", "closed_form_m1")]
+    plan = [
+        (r, m, 6)
+        for r in FOLDERS
+        for m in ("closed_form", "closed_form_ms", "closed_form_m1", "closed_form_occ", "closed_form_ms_occ")
+    ]
     plan += [("320x180", "raymarch_16", 6), ("320x180", "raymarch_64s16", 4), ("800x800", "raymarch_16", 4)]
     inputs = {
         r: load(folder, min(FRAME, len(Dataset.from_path(folder / "frames")) - 1)) for r, folder in FOLDERS.items()
@@ -97,6 +110,10 @@ def main():
     plan.append(("table", "table", 6))
     inputs["table"] = inputs["320x180"]
 
+    if args.only:
+        # Only time some methods at every resolution, and update their times in the existing results
+        plan = [(r, m, args.samples) for r in FOLDERS for m in args.only]
+
     samples: dict = defaultdict(list)
     for resolution, name, _ in plan:
         methods[name](*inputs[resolution])  # warm up, and build the tables that are cached across frames
@@ -106,10 +123,14 @@ def main():
                 samples[resolution, name].append(sample(partial(methods[name], *inputs[resolution])))
         print(f"round {index + 1} done", flush=True)
 
-    results: dict = {"median": {}}
+    results: dict = json.loads((ROOT / "results" / "timings.json").read_text()) if args.only else {"median": {}}
     for (resolution, name), values in samples.items():
         results.setdefault(resolution, {})[name] = min(values)
         results["median"][f"{resolution}/{name}"] = float(np.median(values))
+    if args.only:
+        (ROOT / "results" / "timings.json").write_text(json.dumps(results, indent=1))
+        print(json.dumps({r: {m: results[r][m] for m in args.only} for r in FOLDERS}, indent=1))
+        return
     results["multiple_scattering_table"] = results.pop("table")["table"]
     convergence = results.pop("convergence")
     results["convergence"] = {
@@ -129,4 +150,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--only", nargs="+", help="only time these methods, and update them in results/timings.json")
+    parser.add_argument("--samples", type=int, default=6, help="number of timings of each method, with --only")
+    parser.add_argument("--wait", type=float, default=120.0, help="longest wait for the GPU to be idle, in seconds")
+    args = parser.parse_args()
+    sample = partial(sample, wait=args.wait)
+    main(args)

@@ -13,7 +13,7 @@ from run_experiment import ROOT, load_sequence
 
 from visionsim.dataset import Dataset
 
-METHODS = ("closed_form", "closed_form_ms", "closed_form_m1")
+METHODS = ("closed_form", "closed_form_ms", "closed_form_m1", "closed_form_occ", "closed_form_ms_occ")
 
 
 def main():

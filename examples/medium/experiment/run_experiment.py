@@ -12,6 +12,8 @@ without adaptive sampling nor denoising:
   attenuation in closed form, or with 64 steps and 16 steps towards the sun, as generic volume renderers do.
 - ``closed_form_m1``: the closed form, with the lighting model of the first version (isotropic, unattenuated sky).
 - ``closed_form``: the closed form, with the current lighting model.
+- ``closed_form_occ``: the same, with objects casting shadows onto the fog and hiding part of the sky from it,
+  through the shadow maps saved by ``export_occlusion.py``.
 - ``reference_seed1``: the reference rendered with another seed, which measures the reference's own noise.
 
 The four sensors are a conventional RGB camera (25 fps), a passive single photon camera (125 Hz binary frames), an
@@ -44,6 +46,7 @@ from sensors import SPAD, EventCamera, RGBCamera, bernoulli_kl, event_f1, event_
 from visionsim.dataset import Dataset
 from visionsim.emulate.spc import spc_avg_to_rgb
 from visionsim.medium import Lighting, Medium, apply_medium, camera_rays
+from visionsim.medium.occlusion import load_occlusion
 from visionsim.medium.raymarch import ray_march_medium
 from visionsim.medium.transient import Flash, capture_histogram, estimate_distance, flash_transient
 from visionsim.utils.color import linearrgb_to_srgb, to_linearrgb
@@ -68,6 +71,8 @@ LABELS = {
     "reference_seed1": "参考（另一种子）",
     "cycles_default_ss": "Cycles 默认（单次散射）",
     "closed_form_ms": "闭式解（多次散射）",
+    "closed_form_occ": "闭式解 + 阴影",
+    "closed_form_ms_occ": "闭式解（多次散射）+ 阴影",
 }
 FOLDERS = {  # rendered method -> folder of its render in ROOT
     "cycles_default": "cycles_default",
@@ -83,6 +88,7 @@ PASSIVE = [
     "raymarch_64s16",
     "closed_form_m1",
     "closed_form",
+    "closed_form_occ",
     "reference_seed1",
 ]
 TOF = {  # ToF method -> (passive method providing the ambient background, ray marching steps or None)
@@ -90,13 +96,22 @@ TOF = {  # ToF method -> (passive method providing the ambient background, ray m
     "raymarch_16": ("raymarch_16", 128),
     "raymarch_64s16": ("raymarch_64s16", 1024),
     "closed_form": ("closed_form", None),
+    "closed_form_occ": ("closed_form_occ", None),
     "reference_seed1": ("reference_seed1", None),
 }
 TOF_LABELS = LABELS | {"raymarch_16": "Ray marching 128 步", "raymarch_64s16": "Ray marching 1024 步"}
 COLORS = {name: f"C{i}" for i, name in enumerate(LABELS)}  # the same color for a method in every plot
 FONT = ImageFont.truetype("C:/Windows/Fonts/msyh.ttc", 13)
-STILLS: tuple[str, ...] = ("clear", "cycles_default", "cycles_nodenoise", "raymarch_16", "closed_form_m1", "closed_form")
-VIDEO: tuple[str, ...] = ("clear", "cycles_default", "cycles_nodenoise", "raymarch_16", "closed_form")
+STILLS: tuple[str, ...] = (
+    "clear",
+    "cycles_default",
+    "cycles_nodenoise",
+    "raymarch_16",
+    "closed_form",
+    "closed_form_occ",
+)
+VIDEO: tuple[str, ...] = ("clear", "cycles_default", "cycles_nodenoise", "closed_form", "closed_form_occ")
+OCCLUSION = ROOT / "occlusion" / "occlusion.npz"  # shadow maps of the scene, from export_occlusion.py
 
 
 def use_multiple_scattering() -> None:
@@ -106,8 +121,10 @@ def use_multiple_scattering() -> None:
     FOLDERS.update({name: f"ms/{folder}" for name, folder in FOLDERS.items()} | {"cycles_default_ss": "cycles_default"})
     PASSIVE.insert(PASSIVE.index("cycles_nodenoise") + 1, "cycles_default_ss")
     # The closed form's approximation of multiple scattering, including light reflected by the ground
-    PASSIVE.insert(PASSIVE.index("closed_form") + 1, "closed_form_ms")
+    PASSIVE.insert(PASSIVE.index("closed_form_occ") + 1, "closed_form_ms")
+    PASSIVE.insert(PASSIVE.index("closed_form_ms") + 1, "closed_form_ms_occ")
     TOF["closed_form_ms"] = ("closed_form_ms", None)
+    TOF["closed_form_ms_occ"] = ("closed_form_ms_occ", None)
     names = {
         "cycles_default": "Cycles 默认（多次散射）",
         "cycles_nodenoise": "Cycles 不降噪（多次散射）",
@@ -117,8 +134,8 @@ def use_multiple_scattering() -> None:
     }
     LABELS.update(names)
     TOF_LABELS.update(names)
-    STILLS = ("clear", "cycles_default_ss", "cycles_default", "raymarch_16", "closed_form", "closed_form_ms")
-    VIDEO = ("clear", "cycles_default", "closed_form", "closed_form_ms")
+    STILLS = ("clear", "cycles_default_ss", "cycles_default", "closed_form", "closed_form_ms", "closed_form_ms_occ")
+    VIDEO = ("clear", "cycles_default", "closed_form_ms", "closed_form_ms_occ")
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -149,7 +166,9 @@ def box_depth(depth: np.ndarray, transform: dict) -> np.ndarray:
     return np.where(depth >= 1e9, exit_distance / scale, depth).astype(np.float32)
 
 
-def passive_sequences(cache: Path, limit: int | None) -> tuple[dict[str, np.ndarray], list[dict], dict[str, float]]:
+def passive_sequences(
+    cache: Path, limit: int | None, timing: bool = True
+) -> tuple[dict[str, np.ndarray], list[dict], dict[str, float]]:
     """Radiance seen by the camera for every method, cached as .npy files, and the time taken per frame."""
     clear, transforms = load_sequence(ROOT / "clear" / "frames", limit=limit)
     depths = load_sequence(ROOT / "clear" / "depths", 1, limit=limit)[0]
@@ -158,7 +177,32 @@ def passive_sequences(cache: Path, limit: int | None) -> tuple[dict[str, np.ndar
     medium = Medium.model_validate_json(Path("examples/medium/media/ground_fog.json").read_text())
     medium_ms = medium.model_copy(update={"multiple_scattering": True})
     lighting_ms = lighting.model_copy(update={"ground_albedo": (GROUND_ALBEDO,) * 3})
+    occlusion = load_occlusion(OCCLUSION, device=DEVICE, dtype=DTYPE)
     computed = {
+        "closed_form_occ": lambda i: apply_medium(
+            clear[i],
+            depth[i],
+            transforms[i],
+            transforms[i]["transform_matrix"],
+            medium,
+            lighting,
+            time=i / FPS,
+            occlusion=occlusion,
+            device=DEVICE,
+            dtype=DTYPE,
+        ),
+        "closed_form_ms_occ": lambda i: apply_medium(
+            clear[i],
+            depth[i],
+            transforms[i],
+            transforms[i]["transform_matrix"],
+            medium_ms,
+            lighting_ms,
+            time=i / FPS,
+            occlusion=occlusion,
+            device=DEVICE,
+            dtype=DTYPE,
+        ),
         "closed_form": lambda i: apply_medium(
             clear[i],
             depth[i],
@@ -235,9 +279,13 @@ def passive_sequences(cache: Path, limit: int | None) -> tuple[dict[str, np.ndar
     for name, fn in computed.items():
         path = cache / f"{name}_{len(clear)}.npy"
         if not path.exists():
+            start = time.perf_counter()
             np.save(path, np.stack([fn(i).radiance.cpu().numpy() for i in range(len(clear))]).astype(np.float32))
+            print(f"computed {name} in {time.perf_counter() - start:.0f}s", flush=True)
         sequences[name] = np.load(path)
-        # Time a few frames, with the GPU otherwise idle
+        if not timing:
+            continue
+        # Time a few frames, with the GPU otherwise idle (time_methods.py measures them more carefully)
         fn(0)
         torch.cuda.synchronize()
         start = time.perf_counter()
@@ -497,8 +545,12 @@ def main(args):
     (out / "videos").mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
 
-    seqs, transforms, medium_seconds = passive_sequences(cache, args.frames)
+    global DEVICE
+    DEVICE = args.device
+    seqs, transforms, medium_seconds = passive_sequences(cache, args.frames, timing=not args.cache_only)
     print("passive sequences ready", {k: v.shape for k, v in seqs.items()}, medium_seconds, flush=True)
+    if args.cache_only:
+        return
     global FRAME
     FRAME = min(FRAME, 5 * (len(transforms) // 10))
 
@@ -686,5 +738,9 @@ if __name__ == "__main__":
         default="single",
         help="compare against Cycles with single scattering (Blender's default) or multiple scattering, whose "
         "results are saved to results_ms",
+    )
+    parser.add_argument("--device", default=DEVICE, help="torch device on which to add fog and emulate sensors")
+    parser.add_argument(
+        "--cache-only", action="store_true", help="only compute the frames of every method, without timing them"
     )
     main(parser.parse_args())

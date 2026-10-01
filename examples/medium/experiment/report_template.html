@@ -7,7 +7,7 @@
 <header style="display:flex;flex-direction:column;gap:14px">
   <div class="eyebrow">VisionSIM · feat/volumetric-media · 地面雾 · 4 种仿真传感器</div>
   <h1>雾化方法对照实验</h1>
-  <p class="lede">同一个动画场景、同一团地面雾，分别用<strong>无雾 baseline</strong>、<strong>Cycles 体积路径追踪</strong>、<strong>ray marching</strong> 和<strong>闭式解</strong>生成带雾画面，再喂给 RGB、被动 SPAD、DVS 和 ToF 四种仿真传感器，对比闭式解省下的时间和损失的精度。真值有两个：物理上完整的<strong>多次散射</strong>，以及 Blender 默认、和闭式解模型一致的<strong>单次散射</strong>。</p>
+  <p class="lede">同一个动画场景、同一团地面雾，分别用<strong>无雾 baseline</strong>、<strong>Cycles 体积路径追踪</strong>、<strong>ray marching</strong> 和<strong>闭式解</strong>（可加多次散射，以及物体投下的光柱和对天空的遮挡）生成带雾画面，再喂给 RGB、被动 SPAD、DVS 和 ToF 四种仿真传感器，对比闭式解省下的时间和损失的精度。真值有两个：物理上完整的<strong>多次散射</strong>，以及 Blender 默认、和闭式解模型一致的<strong>单次散射</strong>。</p>
   <div class="meta"><span>场景 320×180，125 fps × 500 帧（4 s）</span><span>参考：Cycles 4096 spp，多次散射每帧 {r[ms_cycles_ref]:.2f} s，单次散射每帧 {r[cycles_ref]:.2f} s</span><span>GPU：RTX 5080</span></div>
 </header>
 
@@ -31,10 +31,16 @@
   <p>{validation_intro}</p>
   {validation_table}
   <p>{validation_text}</p>
+  <h3>光柱和天空遮挡</h3>
+  <p>{occlusion_intro}</p>
+  {occlusion_table}
+  <figure><a href="images/occlusion.png" target="_blank" rel="noopener"><img src="images/occlusion.png" alt="第 255 帧雾的散射光：Cycles、不加阴影和加阴影的闭式解，以及两者的相对误差" loading="lazy"></a>
+  <figcaption>第 255 帧，雾散射进相机的光（单次散射）。上排只有太阳，下排只有天光；后两列是闭式解相对 Cycles 的误差，红色表示偏亮。不加阴影时，方块投在雾里的阴影整块缺失（中间偏右的红色斜楔），方块前方的雾也因为看到了被方块挡住的天空而偏亮。</figcaption></figure>
+  <p>{occlusion_text}</p>
   <h3>画面与传感器输出（以多次散射为真值）</h3>
   <figure><a href="images/overview_ms.png" target="_blank" rel="noopener"><img src="images/overview_ms.png" alt="以多次散射为真值时，各方法在第 250 帧的渲染帧、误差图和传感器输出" loading="lazy"></a>
   <figcaption>{overview_ms_caption}</figcaption></figure>
-  <p>整段动画，列同上图，以 12 fps 播放（约 2 倍慢放）。从上到下依次是：渲染帧、RGB、SPAD（32 帧平均）、DVS（40 ms）、ToF 测距。</p>
+  <p>整段动画，以 12 fps 播放（约 2 倍慢放）。从左到右依次是：无雾 baseline、Cycles 默认设置（多次散射）、闭式解（多次散射）、闭式解（多次散射）+ 阴影、参考；从上到下依次是：渲染帧、RGB、SPAD（32 帧平均）、DVS（40 ms）、ToF 测距。</p>
   <video src="videos/sensors_ms.mp4" controls muted loop playsinline preload="metadata"></video>
 </section>
 
@@ -68,6 +74,8 @@
       <tr><th scope="row">Ray marching</th><td style="text-align:left;font-family:var(--sans);white-space:normal">新增的 <code>visionsim.medium.ray_march_medium</code>：沿每条视线均匀分步做数值积分，每步内按能量守恒的方式积分。<em>16 步</em>版本中，光照衰减用解析式；<em>64+16 步</em>版本中，每个采样点再朝太阳方向走 16 步，这是通用体积渲染器的做法。它和闭式解积分的是同一个单次散射模型，只是换成了数值积分。</td></tr>
       <tr><th scope="row">闭式解（修正天光前）</th><td style="text-align:left;font-family:var(--sans);white-space:normal">上一版 M1 的光照模型：天空被当作来自整个球面的均匀光，并且不被雾衰减。</td></tr>
       <tr><th scope="row">闭式解</th><td style="text-align:left;font-family:var(--sans);white-space:normal">当前模型（单次散射）：天光只来自上半球（下半球被地面遮挡），按相函数加权，并且被雾衰减。每个方向的衰减都有闭式解，方向积分用固定求积，结果确定、没有噪声。</td></tr>
+      <tr><th scope="row">闭式解 + 阴影</th><td style="text-align:left;font-family:var(--sans);white-space:normal">同上，再用场景的阴影图让物体在雾里投下阴影（光柱）、遮挡雾中各点能看到的天空。阴影图每个场景渲染一次（<code>export_occlusion.py</code>），沿视线采样可见性，采样点之间仍用闭式解积分。</td></tr>
+      <tr><th scope="row">闭式解（多次散射）</th><td style="text-align:left;font-family:var(--sans);white-space:normal">加上地面反射和多次散射的近似（只在以多次散射为真值的对照里出现），可以再加阴影。</td></tr>
     </tbody>
   </table></div>
   <div class="table-wrap"><table>
@@ -87,7 +95,7 @@
   <figure><a href="images/overview.png" target="_blank" rel="noopener"><img src="images/overview.png" alt="各方法在第 250 帧的渲染帧、误差图和四种传感器输出" loading="lazy"></a>
   <figcaption>{overview_caption}</figcaption></figure>
   <h3>视频</h3>
-  <p>整段 4 秒动画，以 12 fps 播放（约 2 倍慢放）。从上到下依次是：渲染帧、RGB、SPAD（32 帧平均）、DVS（40 ms）、ToF 测距。ToF 一行里，ray marching 的瞬态用了 128 步。</p>
+  <p>整段 4 秒动画，以 12 fps 播放（约 2 倍慢放）。从左到右依次是：无雾 baseline、Cycles 默认设置、Cycles 不降噪、闭式解、闭式解 + 阴影、参考；从上到下依次是：渲染帧、RGB、SPAD（32 帧平均）、DVS（40 ms）、ToF 测距。</p>
   <video src="videos/sensors.mp4" controls muted loop playsinline preload="metadata"></video>
 </section>
 
@@ -140,6 +148,8 @@
       <tr><th scope="row">只有太阳，物体不投影</th><td>{bd[sun_noshadow][sky]:.3f}</td><td>{bd[sun_noshadow][surfaces]:.3f}</td></tr>
       <tr><th scope="row">只有天光，有物体</th><td>{bd[sky][sky]:.3f}</td><td>{bd[sky][surfaces]:.3f}</td></tr>
       <tr><th scope="row">只有天光，去掉方块和柱子</th><td>{bd[sky_noobjects][sky]:.3f}</td><td>{bd[sky_noobjects][surfaces]:.3f}</td></tr>
+      <tr><th scope="row">只有太阳，物体有投影，闭式解加阴影</th><td>{occ[sun_with][sky]:.3f}</td><td>{occ[sun_with][surfaces]:.3f}</td></tr>
+      <tr><th scope="row">只有天光，有物体，闭式解加阴影</th><td>{occ[sky_with][sky]:.3f}</td><td>{occ[sky_with][surfaces]:.3f}</td></tr>
     </tbody>
   </table></div>
   <p>{breakdown_text}</p>
@@ -161,6 +171,7 @@ pwsh examples/medium/experiment/render_refs.ps1       # 单次散射参考（两
 pwsh examples/medium/experiment/render_nodenoise.ps1  # Cycles 不降噪（单次散射）
 pwsh examples/medium/experiment/render_ms.ps1         # 多次散射：Cycles 默认、不降噪、参考（两个种子）
 blender -b runs/fog-comparison/demo.blend --python examples/medium/experiment/export_lighting.py -- runs/fog-comparison/clear/lighting.json
+blender -b runs/fog-comparison/demo.blend --python examples/medium/experiment/export_occlusion.py -- runs/fog-comparison/occlusion/occlusion.npz --exclude Plane > runs/fog-comparison/occlusion/export.log
 $env:PYTHONPATH = "examples/medium/experiment"; python examples/medium/experiment/run_experiment.py
 python examples/medium/experiment/run_experiment.py --truth multiple   # 结果在 results_ms
 python examples/medium/experiment/error_regions.py    # 多次散射真值下误差按区域和方向拆分
@@ -174,6 +185,7 @@ foreach ($blend in "demo", "fog_default", "fog_default_ms") {{ foreach ($size in
   $width, $height = $size -split "x"
   blender -b runs/fog-comparison/$blend.blend --python examples/medium/experiment/time_cycles.py -- --width $width --height $height > runs/fog-comparison/cycles_timing/${{blend}}_$size.log }} }}
 python examples/medium/experiment/validate_lighting.py   # 无物体场景和点光源的验证，渲染步骤见脚本说明
+python examples/medium/experiment/validate_occlusion.py  # 第 255 帧上光柱和天空遮挡与 Cycles 的对照
 python examples/medium/experiment/make_report.py</code></pre>
   <p>误差拆解用 <code>breakdown_scenes.py</code> 生成几种光源变体场景，再用 <code>render_passes.py --frame 255</code> 渲染，最后由 <code>breakdown.py</code> 汇总。多次散射的影响：用 <code>render_passes.py --samples 1024 --frame 255 345 --volume-bounces N</code> 把两帧以 N = 0、1、2、4、8、16、32 次体积弹射各渲染一遍（输出到 <code>runs/fog-comparison/bounces/N</code>），再由 <code>bounces.py</code> 汇总。</p>
 </section>

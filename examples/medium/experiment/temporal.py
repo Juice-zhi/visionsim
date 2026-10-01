@@ -20,7 +20,7 @@ RENDERED = {
     "cycles_nodenoise": "cycles_nodenoise",
     "reference_seed1": "cycles_ref_seed1",
 }
-COMPUTED = ("raymarch_16", "raymarch_64s16", "closed_form_m1", "closed_form")
+COMPUTED = ("raymarch_16", "raymarch_64s16", "closed_form_m1", "closed_form", "closed_form_occ")
 
 
 def log_luma(frames: np.ndarray) -> np.ndarray:
