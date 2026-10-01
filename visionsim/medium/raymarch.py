@@ -185,8 +185,12 @@ def ray_march_medium(
             transmittance = transmittance * step_transmittance
         return transmittance, optical_depth, inscatter
 
-    # Integrating skylight needs hundreds of values per pixel, so rays are marched in chunks to bound memory
-    nodes = (2 * _SKY_NODES if lit_by_sky or elevation_light else 1) * len(beta[channels])
+    # Integrating light over the sky, or the ground, needs hundreds of values per pixel, so rays are marched in chunks
+    # to bound memory
+    lit_by_ground = medium.sun_attenuation and any(albedo > 0 for albedo in lighting.ground_albedo)
+    nodes = (max(1, lit_by_sky + lit_by_ground) * _SKY_NODES if lit_by_sky or elevation_light else 1) * len(
+        beta[channels]
+    )
     transmittance, optical_depth, inscatter = _by_pixels(march, directions, distance, elements_per_pixel=nodes)
 
     return MediumResult(

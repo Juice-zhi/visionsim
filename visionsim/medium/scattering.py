@@ -118,34 +118,56 @@ def _elevation_directions(elevations: torch.Tensor) -> torch.Tensor:
     return torch.stack([(1 - elevations**2).clamp_min(0).sqrt(), torch.zeros_like(elevations), elevations], dim=-1)
 
 
-def _hemisphere_sum(
-    elevations: torch.Tensor, weights: torch.Tensor, depth: torch.Tensor, budget: float = 4e7
-) -> torch.Tensor:
-    """Sum of ``weights * exp(-depth / elevations)`` over quadrature nodes, for each ray and point along it.
+class Hemisphere(NamedTuple):
+    """Quadrature of the phase function over a hemisphere of directions, for rays of given elevations."""
+
+    inverse: torch.Tensor
+    """inverse of the absolute elevation of each node, of shape (n, k), which is huge for nodes at the horizon as
+    their light goes through an infinite amount of fog"""
+    weights: torch.Tensor
+    """weight of each node, of shape (n, k)"""
+
+
+def hemisphere(elevations: torch.Tensor, g: float, below: bool = False, **resolution) -> Hemisphere:
+    """Quadrature of the phase function over directions above the horizon, or below it, for rays of given elevations.
+
+    Directions below the horizon are those of :func:`sky_quadrature <visionsim.medium.optics.sky_quadrature>` for rays
+    mirrored across the horizon, which preserves the angles between directions.
 
     Args:
-        elevations (torch.Tensor): Elevations of the nodes, of shape (n, k), where nodes at the horizon are ignored.
-        weights (torch.Tensor): Weights of the nodes, of shape (n, k).
-        depth (torch.Tensor): Vertical optical depth crossed by light coming from each node, of shape (n, m, c).
+        elevations (torch.Tensor): Vertical component of the rays' directions, of shape (n,).
+        g (float): Asymmetry parameter of the Henyey-Greenstein phase function.
+        below (bool, optional): If true, integrate over directions below the horizon. Defaults to False.
+        **resolution: Resolution of :func:`sky_quadrature <visionsim.medium.optics.sky_quadrature>`.
 
     Returns:
-        torch.Tensor: Sum over nodes, of shape (n, m, c).
+        Hemisphere: Inverse elevations and weights of the quadrature's nodes.
     """
-    rows = max(1, int(budget // max(1, depth[0].numel() * elevations.shape[-1])))
-    parts = []
-    for start in range(0, len(depth), rows):
-        mu, w = elevations[start : start + rows, None, None, :], weights[start : start + rows, None, None, :]
-        above = mu > 0
-        attenuation = torch.exp(-depth[start : start + rows, ..., None] / torch.where(above, mu, torch.ones_like(mu)))
-        parts.append((w * torch.where(above, attenuation, torch.zeros_like(attenuation))).sum(dim=-1))
-    return torch.cat(parts)
+    mu, weights = sky_quadrature(_elevation_directions(-elevations if below else elevations), g, **resolution)
+    return Hemisphere(torch.where(mu > 0, 1 / mu.clamp_min(1e-30), torch.full_like(mu, 1e30)), weights)
+
+
+def _hemisphere_sum(quadrature: Hemisphere, depth: torch.Tensor, budget: float = 4e7) -> torch.Tensor:
+    """Sum of ``weights * exp(-depth / |μ|)`` over quadrature nodes, for each ray and point along it, where ``depth``
+    is the vertical optical depth crossed by light, of shape (n, m, c)."""
+    rows = max(1, int(budget // max(1, depth[0].numel() * quadrature.weights.shape[-1])))
+    parts = [
+        (
+            quadrature.weights[start : start + rows, None, None, :]
+            * torch.exp(
+                -depth[start : start + rows, ..., None] * quadrature.inverse[start : start + rows, None, None, :]
+            )
+        ).sum(dim=-1)
+        for start in range(0, len(depth), rows)
+    ]
+    return parts[0] if len(parts) == 1 else torch.cat(parts)
 
 
 def sky_source(
     elevations: torch.Tensor,
     depth_above: torch.Tensor,
     g: float,
-    quadrature: tuple[torch.Tensor, torch.Tensor] | None = None,
+    quadrature: Hemisphere | None = None,
     **resolution,
 ) -> torch.Tensor:
     """Skylight scattered towards rays of given elevations, at points below a given optical depth of fog.
@@ -156,16 +178,15 @@ def sky_source(
         elevations (torch.Tensor): Vertical component of the rays' directions, of shape (n,).
         depth_above (torch.Tensor): Optical depth of the fog above each point along each ray, of shape (n, m, c).
         g (float): Asymmetry parameter of the Henyey-Greenstein phase function.
-        quadrature (tuple[torch.Tensor, torch.Tensor] | None, optional): Nodes and weights of :func:`sky_quadrature
-            <visionsim.medium.optics.sky_quadrature>` for these elevations, if already computed. Defaults to None.
+        quadrature (Hemisphere | None, optional): Quadrature above the horizon for these elevations, from
+            :func:`hemisphere`, if already computed. Defaults to None.
         **resolution: Resolution of :func:`sky_quadrature <visionsim.medium.optics.sky_quadrature>`.
 
     Returns:
         torch.Tensor: Scattered radiance per unit of scattering, i.e. to be multiplied by the albedo and the sky's
         radiance, of shape (n, m, c).
     """
-    mu, weights = quadrature or sky_quadrature(_elevation_directions(elevations), g, **resolution)
-    return _hemisphere_sum(mu, weights, depth_above)
+    return _hemisphere_sum(quadrature or hemisphere(elevations, g, **resolution), depth_above)
 
 
 def ground_source(
@@ -173,32 +194,29 @@ def ground_source(
     depth_above: torch.Tensor,
     depth_ground: torch.Tensor,
     g: float,
-    quadrature: tuple[torch.Tensor, torch.Tensor] | None = None,
+    quadrature: Hemisphere | None = None,
     **resolution,
 ) -> torch.Tensor:
     """Light from a Lambertian ground, of unit radiance, scattered towards rays of given elevations.
 
     Light leaving the ground towards a point is attenuated by the fog between them, whose optical depth is
-    ``(c_ground - c) / |μ|`` for light coming from an elevation ``μ`` below the horizon. Directions below the horizon
-    are integrated by mirroring those of :func:`sky_quadrature <visionsim.medium.optics.sky_quadrature>` above it,
-    for rays mirrored across the horizon.
+    ``(c_ground - c) / |μ|`` for light coming from an elevation ``μ`` below the horizon.
 
     Args:
         elevations (torch.Tensor): Vertical component of the rays' directions, of shape (n,).
         depth_above (torch.Tensor): Optical depth of the fog above each point along each ray, of shape (n, m, c).
         depth_ground (torch.Tensor): Optical depth of the fog above the ground, of shape (c,).
         g (float): Asymmetry parameter of the Henyey-Greenstein phase function.
-        quadrature (tuple[torch.Tensor, torch.Tensor] | None, optional): Nodes and weights of :func:`sky_quadrature
-            <visionsim.medium.optics.sky_quadrature>` for the mirrored elevations, if already computed.
-            Defaults to None.
+        quadrature (Hemisphere | None, optional): Quadrature below the horizon for these elevations, from
+            :func:`hemisphere`, if already computed. Defaults to None.
         **resolution: Resolution of :func:`sky_quadrature <visionsim.medium.optics.sky_quadrature>`.
 
     Returns:
         torch.Tensor: Scattered radiance per unit of scattering, i.e. to be multiplied by the albedo and the ground's
         radiance, of shape (n, m, c).
     """
-    mu, weights = quadrature or sky_quadrature(_elevation_directions(-elevations), g, **resolution)
-    return _hemisphere_sum(mu, weights, (depth_ground - depth_above).clamp_min(0))
+    quadrature = quadrature or hemisphere(elevations, g, below=True, **resolution)
+    return _hemisphere_sum(quadrature, (depth_ground - depth_above).clamp_min(0))
 
 
 def ground_irradiance(
@@ -483,9 +501,9 @@ def elevation_source(
         if elevations is not last["elevations"]:
             last["elevations"] = elevations
             if lit_by_sky:
-                last["sky"] = sky_quadrature(_elevation_directions(elevations), g)
+                last["sky"] = hemisphere(elevations, g)
             if lit_by_ground:
-                last["ground"] = sky_quadrature(_elevation_directions(-elevations), g)
+                last["ground"] = hemisphere(elevations, g, below=True)
         total = torch.zeros(1, **kwargs)
         if lit_by_sky:
             total = total + sky * sky_source(elevations, depth, g, quadrature=last["sky"])
