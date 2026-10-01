@@ -42,7 +42,8 @@ LABELS_MS = {
     "raymarch_16": LABELS["raymarch_16"],
     "raymarch_64s16": LABELS["raymarch_64s16"],
     "closed_form_m1": LABELS["closed_form_m1"],
-    "closed_form": LABELS["closed_form"],
+    "closed_form": "闭式解（单次散射）",
+    "closed_form_ms": "闭式解（多次散射）",
     "reference_seed1": LABELS["reference_seed1"],
     "reference": "参考：Cycles 4096 spp，多次散射",
 }
@@ -55,6 +56,7 @@ KINDS = {
     "raymarch_64s16": "Ray marching",
     "closed_form_m1": "闭式解",
     "closed_form": "闭式解",
+    "closed_form_ms": "闭式解",
     "reference_seed1": "噪声底",
 }
 
@@ -232,37 +234,46 @@ def hd_timings() -> dict | None:
 
 
 def build_prose(
-    rows: dict, rows_ms: dict, convergence: dict, bd: dict, renders: dict, hd: dict, bounces: dict
+    rows: dict,
+    rows_ms: dict,
+    convergence: dict,
+    bd: dict,
+    renders: dict,
+    hd: dict,
+    bounces: dict,
+    timings: dict,
+    validation: dict,
+    scale: dict,
+    regions: dict,
 ) -> dict[str, str]:
     """Text of the report, which quotes the measured numbers."""
     r = rows
-    cf, rm, cd, nd, cl, m1 = (
-        r[k] for k in ("closed_form", "raymarch_16", "cycles_default", "cycles_nodenoise", "clear", "closed_form_m1")
-    )
-    cf_ms, rm_ms, cd_ms, nd_ms, ss_ms, cl_ms, m1_ms = (
+    cf, cd, nd, cl = (r[k] for k in ("closed_form", "cycles_default", "cycles_nodenoise", "clear"))
+    cf_ms, ms_ms, cd_ms, nd_ms, ss_ms, cl_ms = (
         rows_ms[k]
-        for k in (
-            "closed_form",
-            "raymarch_16",
-            "cycles_default",
-            "cycles_nodenoise",
-            "cycles_default_ss",
-            "clear",
-            "closed_form_m1",
-        )
+        for k in ("closed_form", "closed_form_ms", "cycles_default", "cycles_nodenoise", "cycles_default_ss", "clear")
     )
     floor_ms = rows_ms.get("reference_seed1")
     pct = lambda v: f"{100 * v:.1f}%"
+    signed = lambda region: f"{100 * region['signed']:+.1f}%"
     steps = {c["steps"]: c for c in convergence["ray_marching"] if c["shadow_steps"] == 0}
     shadow = {c["steps"]: c for c in convergence["ray_marching"] if c["shadow_steps"]}
+    converged = [c["error_vs_reference"] for c in convergence["ray_marching"] if c["steps"] >= 8]
     cf_seconds = convergence["closed_form_seconds"]
     extra_events = nd["dvs_events"] / r["reference"]["dvs_events"] - 1
-    # The model before the sky was fixed is the same closed form, without integrating skylight over directions
-    sky_share = 1 - m1["update"] / cf["update"]
     by_bounces = {b["volume_bounces"]: b for b in bounces["bounces"]}
     single, most = by_bounces[0], by_bounces[max(by_bounces)]
-    speedup, speedup_hd = cd_ms["update"] / cf["update"], hd["cycles_default_ms"] / hd["closed_form"]
-    floor_text = f"（参考自身的噪声底为 {pct(floor_ms['frames_rel_l1'])}）" if floor_ms else ""
+    hd_ms = timings["1920x1080"]["closed_form_ms"]
+    speedups = {
+        "320×180": cd_ms["update"] / ms_ms["update"],
+        "800×800": scale["cycles_default_ms"]["update"] / scale["closed_form_ms"]["update"],
+        "1920×1080": cycles_seconds("fog_default_ms", "1920x1080") / hd_ms,
+    }
+    speedup_text = "、".join(f"{v:.0f} 倍（{k}）" for k, v in speedups.items())
+    floor_text = f"，参考自身的噪声底为 {pct(floor_ms['frames_rel_l1'])}" if floor_ms else ""
+    free = validation["multiple_vs_32_bounces"]
+    elevations = {k: v for k, v in free.items() if k != "all"}
+    point = validation["point_vs_0_bounces"]
     temporal_text = (
         f"DVS 只对亮度随时间的变化敏感：闭式解在 v2e 看到的对数亮度上，单帧误差是 Cycles 默认设置的 {cf['log_static'] / cd['log_static']:.1f} 倍"
         f"（{cf['log_static']:.3f} 对 {cd['log_static']:.3f}），但相邻两帧之间误差的变化反而更小（{cf['log_temporal']:.4f} 对 {cd['log_temporal']:.4f}），"
@@ -272,26 +283,56 @@ def build_prose(
     )
 
     findings = f"""<ul>
-<li><strong>以物理上完整的多次散射为真值：闭式解只改雾参数时比 Cycles 快 {speedup:.1f} 倍（1080p 下 {speedup_hd:.1f} 倍），但渲染帧误差是 {pct(cf_ms["frames_rel_l1"])}，Cycles 默认设置只有 {pct(cd_ms["frames_rel_l1"])}{floor_text}。</strong>四种传感器上的差距同样大：RGB PSNR {cf_ms["rgb_psnr"]:.1f} 对 {cd_ms["rgb_psnr"]:.1f} dB，SPAD 检测概率 MAE {1000 * cf_ms["spad_mae"]:.0f} 对 {1000 * cd_ms["spad_mae"]:.1f}（×10⁻³），DVS 事件 F1 {cf_ms["dvs_f1_pooled"]:.3f} 对 {cd_ms["dvs_f1_pooled"]:.3f}。当前的闭式解在这团雾里甚至比完全不加雾（{pct(cl_ms["frames_rel_l1"])}）还差：以现在的模型，这个时间优势换来的精度损失不可接受。</li>
-<li><strong>原因是多次散射，而闭式解和 ray marching 都只算单次散射。</strong>这团雾完全不吸收（反照率为 1），沿地面方向的光学厚度约为 10：雾散射进相机的光里有 {pct(most["indirect_share"])} 散射过不止一次，画面整体比单次散射亮 {pct(most["brightness"] - 1)}。ray marching 只是沿视线的数值积分，每一步的光源项和闭式解一样只含直接光，所以两者对多次散射真值的误差几乎一样（{pct(rm_ms["frames_rel_l1"])} 和 {pct(cf_ms["frames_rel_l1"])}）。多次散射没有一般的闭式解，因为雾中每一点的光源项本身取决于整团雾里的光场。</li>
-<li><strong>Blender 默认的 0 次体积弹射也只是单次散射：</strong>用 Cycles 默认设置渲染这团雾，误差是 {pct(ss_ms["frames_rel_l1"])}。在 Cycles 里打开多次散射（8 次弹射就已收敛），每帧只从 {renders["cycles_default"]:.2f} s 增加到 {renders["ms_cycles_default"]:.2f} s（1080p 下从 {hd["cycles_default"]:.2f} s 增加到 {hd["cycles_default_ms"]:.2f} s）。在 visionsim 里用 Cycles 渲染雾时，应该把体积弹射次数设到 8 以上。</li>
-<li><strong>加一个近似的多次散射项，就能收回大部分差距。</strong>修正天光前的 M1 模型把整个球面的天光都当成不衰减的入射光，多算的光恰好和多次散射补上的量级相近，所以它对多次散射真值的误差只有 {pct(m1_ms["frames_rel_l1"])}。这是巧合，不是正确的物理，但它说明给闭式解加上一个随高度变化的多次散射光源项，是最值得做的下一步（见“局限与下一步”）。</li>
-<li><strong>和同样只算单次散射的真值比，闭式解的实现是对的：</strong>误差 {pct(cf["frames_rel_l1"])}，剩下的来自光柱、物体遮挡天空、表面透过雾被照亮这三种几何效应；ray marching 与它只差 {sci(steps[16]["error_vs_closed_form"])}，但耗时是它的 {steps[16]["seconds"] / cf_seconds:.1f} 倍。这时闭式解只改雾参数时比 Cycles 默认设置快 {cd["update"] / cf["update"]:.1f} 倍，误差 {pct(cf["frames_rel_l1"])} 对 {pct(cd["frames_rel_l1"])}。{temporal_text}细节见后面各节。</li>
-<li><strong>ToF 只能由闭式解或 ray marching 生成</strong>，因为 Cycles 不能渲染时间分辨的瞬态。瞬态模型同样只算单次散射，参考也只能用这个模型自己，所以雾中激光的多次散射（它会拉长回波的拖尾）这次无法评估。在单次散射模型内，闭式解和每 bin 16 点积分的收敛解在 float32 精度内一致；ray marching 用 128 步时，{pct(rm["tof_disagree_expected"])} 的像素测距与参考不一致，要大约每个 bin 一步才准。</li>
+<li><strong>加上多次散射项之后，以物理上完整的多次散射为真值，闭式解的渲染帧误差从 {pct(cf_ms["frames_rel_l1"])} 降到 {pct(ms_ms["frames_rel_l1"])}；Cycles 默认设置（打开多次散射）是 {pct(cd_ms["frames_rel_l1"])}{floor_text}。</strong>四种传感器上：RGB PSNR {ms_ms["rgb_psnr"]:.1f} dB（Cycles {cd_ms["rgb_psnr"]:.1f} dB，只算单次散射时 {cf_ms["rgb_psnr"]:.1f} dB），SPAD 检测概率 MAE {1000 * ms_ms["spad_mae"]:.0f}×10⁻³（Cycles {1000 * cd_ms["spad_mae"]:.1f}，单次散射时 {1000 * cf_ms["spad_mae"]:.0f}），DVS 事件 F1 {ms_ms["dvs_f1_pooled"]:.3f}（Cycles {cd_ms["dvs_f1_pooled"]:.3f}，单次散射时 {cf_ms["dvs_f1_pooled"]:.3f}）。</li>
+<li><strong>时间：只改雾参数时，闭式解（多次散射）比打开多次散射的 Cycles 快 {speedup_text}</strong>，每帧分别只要 {fmt(ms_ms["update"], "sec")}、{fmt(scale["closed_form_ms"]["update"], "sec")} 和 {fmt(hd_ms, "sec")}。天光、地面反射和多次散射都改成每帧一张查找表，开销基本与分辨率无关：1080p 下只算单次散射的闭式解从上一版的每帧 {hd["closed_form"]:.2f} s 降到 {fmt(timings["1920x1080"]["closed_form"], "sec")}。多次散射表与相机无关，每组雾参数只算一次（{fmt(timings["multiple_scattering_table"], "sec")}）。</li>
+<li><strong>多次散射近似本身在去掉物体的场景里和 Cycles 吻合：雾散射进相机的光整体是 Cycles 32 次弹射的 {free["all"]:.3f} 倍，各仰角在 {min(elevations.values()):.2f}～{max(elevations.values()):.2f} 倍之间。</strong>所以完整场景里剩下的误差主要来自物体：光柱、物体遮挡天空，以及表面透过雾被照亮（包括被雾光照亮），这些模型都还没有包含。</li>
+<li><strong>Blender 默认的 0 次体积弹射只算单次散射：</strong>用 Cycles 默认设置渲染这团雾，误差是 {pct(ss_ms["frames_rel_l1"])}，比完全不加雾（{pct(cl_ms["frames_rel_l1"])}）还差。雾散射进相机的光里有 {pct(most["indirect_share"])} 散射过不止一次，画面整体亮 {pct(most["brightness"] - 1)}。在 Cycles 里打开多次散射（8 次弹射已收敛），每帧只从 {renders["cycles_default"]:.2f} s 增加到 {renders["ms_cycles_default"]:.2f} s，用 Cycles 渲染雾时应该把体积弹射次数设到 8 以上。</li>
+<li><strong>点光源：</strong>单次散射和 Cycles 吻合（雾光比值 {point["ratio"]:.3f}），但点光源的多次散射还没有建模，在这团雾里要少约 {pct(1 - validation["point_vs_32_bounces"]["ratio"])} 的光晕。</li>
+<li><strong>以单次散射为真值时，闭式解的实现是对的：</strong>误差 {pct(cf["frames_rel_l1"])}，来自上面那三种几何效应；ray marching 与它只差 {sci(steps[16]["error_vs_closed_form"])}，耗时是它的 {steps[16]["seconds"] / cf_seconds:.1f} 倍。{temporal_text}ToF 只能由闭式解或 ray marching 生成（Cycles 不能渲染瞬态），激光在雾中的多次散射这次无法评估。</li>
 </ul>"""
     ms_intro = (
         "Cycles 的“体积弹射次数”决定雾里的光最多被散射几次。Blender 默认为 0，也就是单次散射：雾中每一点只接收直接来自太阳和天空的光。"
         "真实的雾里，光会在雾滴之间反复散射，所以这里把弹射次数设到 16（8 次时已收敛），渲染出物理上完整的多次散射参考。"
-        "闭式解和 ray marching 都只算单次散射：ray marching 是沿视线的数值积分方法，它的光源项和闭式解一样只包含直接光，所以只是闭式解的数值版本，而不是更完整的物理模型。"
+        "ray marching 是沿视线的数值积分方法，它的光源项和闭式解一样，所以和闭式解积分的是同一个模型。"
+        "“闭式解（多次散射）”加上了地面反射和多次散射的近似：在一组高度上收集散射过一次的光（来自雾或地面），用相函数再散射一次，更高阶按几何级数累加"
+        f"（Hillaire，EGSR 2020）。地面按 Lambert 平面处理，反照率取棋盘格地面两种颜色的平均值 {validation['ground_albedo']:.2f}。"
         "下表以多次散射为真值；Cycles 的三行里，“单次散射”即 Blender 的默认设置。"
     )
     ms_text = (
-        f"左图里，闭式解只改雾参数时比 Cycles 默认设置快 {cd['update'] / cf['update']:.1f} 倍，误差 {pct(cf['frames_rel_l1'])} 对 {pct(cd['frames_rel_l1'])}，还算一个可以讨论的折中。"
-        "换成物理上完整的真值（右图）后，只算单次散射的方法（闭式解、ray marching、Cycles 的默认设置）都落到了虚线上方，比不加雾还差；只有打开多次散射的 Cycles 贴近噪声底。"
-        f"1080p 下，闭式解每帧 {hd['closed_form']:.2f} s，打开多次散射的 Cycles 每帧 {hd['cycles_default_ms']:.2f} s（含 Blender 启动时间，10 帧平均），闭式解的优势只有 {speedup_hd:.1f} 倍；"
-        f"它 {100 * sky_share:.0f}% 的时间花在天光的方向求积上，改成查找表后才能拉开差距。"
+        f"左图（单次散射真值）里，闭式解只改雾参数时比 Cycles 默认设置快 {cd['update'] / cf['update']:.1f} 倍，误差 {pct(cf['frames_rel_l1'])} 对 {pct(cd['frames_rel_l1'])}。"
+        f"右图（多次散射真值）里，只算单次散射的方法都落在虚线上方，比不加雾还差；加上多次散射项后，闭式解降到 {pct(ms_ms['frames_rel_l1'])}，每帧耗时只从 {fmt(cf_ms['update'], 'sec')} 增加到 {fmt(ms_ms['update'], 'sec')}。"
+        f"它剩下的误差有方向性：整体偏亮 {signed(regions['closed_form_ms']['all'])}，其中看天空的像素只差 {signed(regions['closed_form_ms']['sky'])}，"
+        f"偏差集中在物体表面（5 m 以内 {signed(regions['closed_form_ms']['surfaces_near'])}、5–15 m {signed(regions['closed_form_ms']['surfaces_mid'])}），"
+        "正是光柱和物体遮挡天空的位置，也就是下一步要补的效应。"
+        f"修正天光前的 M1 模型总误差相近（{pct(rows_ms['closed_form_m1']['frames_rel_l1'])}），但原因不同：它在天空上偏暗 {signed(regions['closed_form_m1']['sky'])}、"
+        f"远处表面偏暗 {signed(regions['closed_form_m1']['surfaces_far'])}，只在近处表面碰巧抵消，没有物理依据。"
         f"多次散射也放大了 Cycles 的噪声：不降噪时渲染帧误差为 {pct(nd_ms['frames_rel_l1'])}，DVS 事件 F1 为 {nd_ms['dvs_f1_pooled']:.3f}，"
         f"都比单次散射时（{pct(nd['frames_rel_l1'])}、{nd['dvs_f1_pooled']:.3f}）更差，所以降噪器在这里必不可少。"
+    )
+    validation_intro = (
+        f"为了把多次散射近似本身的误差和物体造成的误差分开，把去掉方块和柱子、只剩地面和雾的场景的第 {validation['frames'][0]} 和 {validation['frames'][1]} 帧，"
+        "用 Cycles 分别以 0 次和 32 次体积弹射渲染（1024 spp），比较雾散射进相机的光（Cycles 的 Volume Direct 和 Indirect pass）。比值为 1 表示完全一致："
+    )
+    validation_text = (
+        f"单次散射部分在所有仰角都和 Cycles 吻合到 ±1%（整体 {validation['single_vs_0_bounces']['all']:.3f}），这同时验证了天光查找表。"
+        f"加上地面反射和多次散射后整体是 {free['all']:.3f}：地平线附近少 {pct(1 - min(elevations.values()))}，俯视地面时多 {pct(max(elevations.values()) - 1)}，"
+        "说明各向同性的级数近似在水平方向略弱，而地面的 Lambert 近似略强。"
+        f"点光源（夜景，关掉太阳和天空，在相机前方放一盏 3000 W 的灯）的单次散射和 Cycles 的比值是 {point['ratio']:.3f}，逐像素误差 {pct(point['rel_l1'])}（含渲染噪声），"
+        "证实了辐射强度按功率除以 4π 换算；多次散射下 Cycles 的灯光光晕更亮，差的部分就是尚未建模的点光源多次散射。"
+    )
+    clear_800 = scale["clear"]
+    scale_intro = (
+        "VisionSIM-50 有 50 个室内场景，每个场景 12 秒，以 100 fps、800×800 渲染，共 59,950 帧，只包含真值（RGB、深度、法线、光流、分割），约 1.0 TB。"
+        "下表在同样的 800×800 分辨率下，实测本实验场景每帧的耗时（RTX 5080；Cycles 用 visionsim 的默认设置把第 255 帧反复渲染 12 次取最快的一次，不含 Blender 启动和保存文件），"
+        "再乘以帧数；误差对照同分辨率第 255–264 帧的多次散射参考（4096 spp）。参考级渲染每帧要几十秒以上，不在表中。"
+    )
+    scale_text = (
+        f"闭式解第一份需要先渲染无雾画面（每帧 {clear_800:.1f} s，另外还要保存线性 EXR 和深度），之后每组雾参数只要 {hours(VISIONSIM50_FRAMES * scale['closed_form_ms']['update'])}；"
+        f"打开多次散射的 Cycles 每组都要 {hours(VISIONSIM50_FRAMES * scale['cycles_default_ms']['update'])}。"
+        "闭式解每帧只要几十毫秒，也可以像传感器仿真一样在读取数据时现场加雾，不必把每组雾参数的结果都存下来。"
+        "注意三点：本场景比 VisionSIM-50 的室内场景简单，Cycles 的耗时会随场景复杂度和弹射次数增加，而闭式解只和像素数有关；"
+        "VisionSIM-50 发布的是色调映射后的 8 位 PNG，要用闭式解需要按线性 EXR 重新渲染一遍；室内场景主要靠灯光照明，目前点光源只算单次散射，聚光灯和面光源还不支持。"
+        "插帧和传感器仿真的耗时对两种方法相同，不在表中。"
     )
     bounces_intro = (
         f"把第 {bounces['frames'][0]} 和 {bounces['frames'][1]} 帧（后者是闭式解误差最大的一帧）用 Cycles 以 0 到 {max(by_bounces)} 次体积弹射各渲染一遍"
@@ -303,9 +344,9 @@ def build_prose(
         f"闭式解相对它的误差随弹射次数从 {pct(single['closed_form_error'])} 升到 {pct(most['closed_form_error'])}；而打开多次散射只让 Cycles 每帧多花 {pct(most['seconds_per_frame'] / single['seconds_per_frame'] - 1)} 的时间。"
     )
     overview_ms_caption = (
-        "第 250 帧，以多次散射为真值。多次散射让远处的地面、方块和天空都更亮、更白（最右列）。只算单次散射的三列（Cycles 单次散射、ray marching、闭式解）"
-        "在远处的地面和背景上误差都超过 50%；打开多次散射的 Cycles 默认设置几乎看不出误差。多次散射也让 Cycles 的蒙特卡洛噪声更大："
-        "不降噪时 DVS 满屏都是假事件，Cycles 默认设置和参考在绿色方块表面也都有一些噪声事件。"
+        "第 250 帧，以多次散射为真值。多次散射让远处的地面、方块和天空都更亮、更白（最右列）。只算单次散射的三列（Cycles 单次散射、ray marching、闭式解（单次散射））"
+        "在远处的地面和背景上误差都超过 50%；闭式解（多次散射）把背景和地面的误差降了下来，剩下的集中在方块和它周围的雾里，也就是光柱和遮挡所在的位置；"
+        "打开多次散射的 Cycles 默认设置几乎看不出误差。"
     )
 
     return {
@@ -314,6 +355,10 @@ def build_prose(
         "ms_text": ms_text,
         "bounces_intro": bounces_intro,
         "bounces_text": bounces_text,
+        "validation_intro": validation_intro,
+        "validation_text": validation_text,
+        "scale_intro": scale_intro,
+        "scale_text": scale_text,
         "overview_ms_caption": overview_ms_caption,
         "tradeoff_caption": "每个点是一种方法。横轴是只改雾参数时生成一帧带雾画面的耗时（Cycles 要整帧重新渲染，闭式解和 ray marching 只需在无雾渲染上加雾），"
         "纵轴是渲染帧相对参考的 L1 误差，两轴都是对数坐标。左图以单次散射为真值，右图以多次散射为真值。虚线是完全不加雾的误差，点线是参考自身的噪声底。",
@@ -340,9 +385,9 @@ def build_prose(
         "测距取期望光通量的峰值（无噪声），或者取 500 个周期的首光子直方图经 Coates 校正后的峰值（含光子噪声）。"
         f"闭式解在含光子噪声时的 {pct(cf['tof_disagree'])} 不一致，来自背景光水平的差异改变了随机采样结果；无噪声时两者完全一致。",
         "convergence_text": f"Ray marching 在这种平滑的高度雾里收敛得很快：误差大约按步数的平方下降，16 步时和闭式解只差 {sci(steps[16]['error_vs_closed_form'])}，256 步时降到 {sci(steps[256]['error_vs_closed_form'])}，接近 float32 的精度下限。"
-        "但它的每一步都要重新计算到达这一点的光：天空要对 1152 个方向求和，所以耗时和步数成正比。闭式解每个像素只需要对这些方向各算一次。"
+        "但它的每一步都要重新计算到达这一点的光：天空要对 1152 个方向求和，所以耗时和步数成正比；闭式解则把天光按仰角制成查找表，每帧只算一次。"
         f"如果朝太阳方向也用 ray marching 来算衰减，误差会被这部分主导，停在 {sci(shadow[64]['error_vs_closed_form'])} 左右。"
-        f"不管哪种设置，和参考之间的误差都在 {pct(convergence['closed_form_error_vs_reference'])} 左右：剩下的是模型误差，不是数值误差。",
+        f"8 步以上时，和参考之间的误差都在 {pct(min(converged))}～{pct(max(converged))} 之间，闭式解是 {pct(convergence['closed_form_error_vs_reference'])}：剩下的是模型误差，不是数值误差。",
         "breakdown_intro": "闭式解对它自己的模型是精确的：太阳和环境光项与逐点暴力积分吻合到 6 位有效数字，天光项的方向求积误差低于 0.1%。为了找出它和单次散射真值差在哪里，在第 255 帧（相机正从红色方块旁经过）用 Cycles 渲染了几种只保留部分光源、或去掉部分物体的变体，"
         "再把 Cycles 的 Volume Direct pass（雾对相机射线的单次散射）和闭式解的散射光逐项对比。比值为 1 表示完全一致。",
         "breakdown_text": f"只要物体不参与光的可见性计算，太阳项（{bd['sun_noshadow']['surfaces']:.3f}）和天光项（{bd['sky_noobjects']['surfaces']:.3f}）都和 Cycles 吻合到 1% 以内；天空像素的透射率也一致（比值 {bd['sky_transmittance']:.3f}）。"
@@ -351,12 +396,12 @@ def build_prose(
         f"② 附近的物体挡住了雾中各点能看到的一部分天空：放回方块和柱子后，天光项的比值从 {bd['sky_noobjects']['surfaces']:.3f} 升到 {bd['sky']['surfaces']:.3f}；"
         f"③ 表面本身是透过雾被照亮的：阳光和天光到达表面之前都被雾衰减，雾的散射又补回一部分，净效果是表面在 Cycles 里暗了 {pct(1 - bd['surface_dimming']['median'])}（中位数，p10–p90 为 {pct(1 - bd['surface_dimming']['p90'])}–{pct(1 - bd['surface_dimming']['p10'])}）。"
         f"修正前的模型让下半球也向雾里照射天光，并且天光不衰减，结果表面像素上的散射光是 Cycles 的 {bd['full_before_fix']['surfaces']:.1f} 倍。",
-        "next_steps": f"""<ul>
-<li><strong>多次散射项（最优先）</strong>：给闭式解加一个多次散射光源。一种做法沿用 Hillaire（2020）在大气渲染中的思路：假设多次散射光近似各向同性，由二阶散射加几何级数求和得到每个高度上的多次散射光源，预计算成以高度和太阳高度角为变量的查找表；再把它随高度的变化拟合成几个指数项，沿视线的积分就仍有闭式解，结果依然确定、没有噪声，对所有传感器一致。另一种做法是用 Cycles 为每组雾参数渲染空场景，标定一个随视线仰角和距离变化的补偿系数，更准，但每换一组雾参数都要重新标定。这次的多次散射参考可以直接用来验证。</li>
-<li><strong>性能</strong>：闭式解 {100 * sky_share:.0f}% 的时间花在天光的 1152 个求积方向上（没有这一项的修正前模型每帧只要 {fmt(m1["update"], "sec")}），而且这部分和像素数成正比。同一帧的所有射线起点相同，天光项只取决于射线方向的 v<sub>z</sub> 和射线长度，所以可以每帧预计算一张 (v<sub>z</sub>, 距离) 的二维查找表，这样开销就和分辨率基本无关。</li>
-<li><strong>光柱和天光遮挡</strong>：从太阳方向渲染一张 shadow map，再从 Blender 输出一张天空可见性（环境光遮蔽）pass，用来调制源项。每条射线上被遮挡的区间，仍然可以用同一个闭式积分分段计算，结果依然确定、没有噪声。</li>
-<li><strong>表面透过雾被照亮</strong>：用 Blender 的 Light Groups 把表面上的太阳贡献和天光贡献分开，分别乘以表面点处的阳光透射率和天光透射率（高度雾都有闭式解）。雾对表面的回照，可以用天光那套方向求积来计算。</li>
-<li><strong>ToF 的后向散射</strong>：HG 相函数会低估雾滴在 180° 附近的后向散射（真实雾有 glory 峰），主动传感器可以改用 lidar ratio 来参数化。</li>
+        "next_steps": """<ul>
+<li><strong>光柱和天光遮挡（现在最大的误差来源）</strong>：从太阳方向渲染一张 shadow map，再从 Blender 输出一张天空可见性（环境光遮蔽）pass，用来调制源项。每条射线上被遮挡的区间，仍然可以用同一套积分分段计算，结果依然确定、没有噪声。</li>
+<li><strong>表面透过雾被照亮</strong>：用 Blender 的 Light Groups 把表面上的太阳贡献和天光贡献分开，分别乘以表面点处的阳光透射率和天光透射率（高度雾都有闭式解）；雾光对表面的照明可以用多次散射表里已经算好的、散射过一次的光场来近似。</li>
+<li><strong>点光源的多次散射、聚光灯和面光源</strong>：点光源的多次散射可以用大气点扩散函数（Narasimhan 和 Nayar 2003）一类的解析近似；聚光灯只是带角度衰减的点光源，面光源可以用若干个点光源近似。</li>
+<li><strong>多次散射近似的改进</strong>：地平线附近少约 7%，俯视地面时多约 12%。可以用 Cycles 的无物体参考标定级数因子，或者把收集过程迭代两三次代替几何级数；地面也可以换成更接近 Principled BSDF 的反射模型。</li>
+<li><strong>ToF</strong>：HG 相函数会低估雾滴在 180° 附近的后向散射（真实雾有 glory 峰），可以改用 lidar ratio 参数化；激光在雾中的多次散射可以用支持瞬态渲染的 mitransient（Mitsuba 3）生成参考。</li>
 <li><strong>其他</strong>：visionsim 保存的相机坐标系法线方向是反的，实验里已经换算回世界坐标。这个问题已经单独开了一个修复任务。</li>
 </ul>""",
     }
@@ -384,7 +429,8 @@ def method_rows(summary: dict, seconds: dict, labels: dict[str, str], temporal: 
 # Points of the trade-off chart: label, color, marker and where the label goes relative to the point
 POINTS = {
     "closed_form": ("闭式解", "#b0304a", "D", (-8, 3, "right")),
-    "closed_form_m1": ("闭式解（修正前）", "#b9a3c9", "D", (7, 3, "left")),
+    "closed_form_ms": ("闭式解（多次散射）", "#6b1d2c", "D", (7, -3, "left")),
+    "closed_form_m1": ("闭式解（修正前）", "#b9a3c9", "D", (0, -14, "center")),
     "raymarch_16": ("RM 16 步", "#d9822b", "s", (0, 8, "center")),
     "raymarch_64s16": ("RM 64+16 步", "#e8b27a", "s", (7, 3, "left")),
 }
@@ -450,6 +496,107 @@ def bounces_table(bounces: dict) -> str:
     )
 
 
+def validation_table(validation: dict) -> str:
+    """Ratio of the closed form's in-scattering to Cycles' in the scene without objects, by elevation of the rays."""
+    ranges = [k for k in validation["multiple_vs_32_bounces"] if k != "all"]
+    head = "".join(f'<th scope="col">{k.replace("..", " ～ ")}°</th>' for k in ranges)
+    rows = [
+        ("单次散射 ÷ Cycles 0 次弹射", validation["single_vs_0_bounces"]),
+        ("加上地面反射和多次散射 ÷ Cycles 32 次弹射", validation["multiple_vs_32_bounces"]),
+    ]
+    body = "".join(
+        f'<tr><th scope="row">{label}</th><td>{r["all"]:.3f}</td>'
+        + "".join(f"<td>{r[k]:.2f}</td>" for k in ranges)
+        + "</tr>"
+        for label, r in rows
+    )
+    return (
+        f'<div class="table-wrap"><table><thead><tr><th scope="col">雾散射进相机的光</th><th scope="col">全部</th>'
+        f"{head}</tr></thead><tbody>{body}</tbody></table></div>"
+    )
+
+
+VISIONSIM50_FRAMES = 59_950
+"""Frames of VisionSIM-50: 50 scenes animated for 12 s, rendered at 100 fps and 800x800"""
+
+
+def cycles_seconds(scene: str, resolution: str) -> float:
+    """Fastest of repeated Cycles renders of frame 255 with visionsim's default settings, from ``time_cycles.py``,
+    where ``scene`` is ``demo`` (without fog), ``fog_default`` or ``fog_default_ms``."""
+    text = (ROOT / "cycles_timing" / f"{scene}_{resolution}.log").read_text(encoding="utf-8", errors="replace")
+    return float(re.findall(r"CYCLES_TIME min=([\d.]+)s", text)[-1])
+
+
+def hours(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{seconds / 60:.0f} 分钟"
+    if seconds < 10 * 3600:
+        return f"{seconds / 3600:.1f} h"
+    return f"{seconds / 3600:,.0f} h" if seconds < 72 * 3600 else f"{seconds / 86400:,.1f} 天"
+
+
+def convergence_chart(convergence: dict, seconds: dict, path: Path) -> None:
+    """Error of ray marching against the closed form, against its time per frame, as the number of steps grows."""
+    times = {(c["steps"], c["shadow_steps"]): c["seconds"] for c in seconds["ray_marching"]}
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    for shadow, marker in ((0, "o"), (16, "s")):
+        points = [c for c in convergence["ray_marching"] if c["shadow_steps"] == shadow]
+        x = [times[c["steps"], shadow] for c in points]
+        y = [c["error_vs_closed_form"] for c in points]
+        ax.loglog(x, y, marker=marker, label=f"Ray marching（{'光照衰减用闭式' if shadow == 0 else '朝太阳 16 步'}）")
+        for c, xi, yi in zip(points, x, y):
+            ax.annotate(str(c["steps"]), (xi, yi), fontsize=8, xytext=(3, 3), textcoords="offset points")
+    ax.axvline(seconds["closed_form"], color="k", ls="--", lw=1, label="闭式解耗时")
+    ax.set_xlabel("每帧耗时 (s)")
+    ax.set_ylabel("与闭式解的相对 L1 误差")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+def scale_table(timings: dict, quality: dict, variants: int = 10) -> tuple[str, dict]:
+    """Time to produce fog for as many frames as VisionSIM-50 at its resolution, from 10 frames of the experiment's
+    scene rendered at 800x800 (timing_resolution.ps1) and the time taken by the closed form and ray marching."""
+    clear = cycles_seconds("demo", "800x800")
+    rows = [
+        ("Cycles 默认设置（多次散射）", cycles_seconds("fog_default_ms", "800x800"), None, "cycles_default_ms"),
+        ("Cycles 默认设置（单次散射）", cycles_seconds("fog_default", "800x800"), None, "cycles_default"),
+        ("闭式解（多次散射）", timings["closed_form_ms"], clear, "closed_form_ms"),
+        ("闭式解（单次散射）", timings["closed_form"], clear, "closed_form"),
+        ("Ray marching 16 步", timings["raymarch_16"], clear, "raymarch_16"),
+    ]
+    body: list[str] = []
+    numbers: dict[str, float | dict] = {"clear": clear}
+    for label, update, base, key in rows:
+        error = quality.get(key, {}).get("rel_l1")
+        first = (base or 0) + update
+        cells = [
+            fmt(update, "sec"),
+            fmt(error, "pct") if error is not None else "—",
+            hours(VISIONSIM50_FRAMES * first),
+            hours(VISIONSIM50_FRAMES * update),
+            hours(VISIONSIM50_FRAMES * ((base or 0) + variants * update)),
+        ]
+        body.append(f'<tr><th scope="row">{html.escape(label)}</th>' + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+        numbers[key] = {"update": update, "first": first, "error": error}
+    head = "".join(
+        f'<th scope="col">{h}</th>'
+        for h in (
+            "只改雾参数时每帧",
+            "渲染帧误差（多次散射真值）",
+            "第一份（含无雾渲染）",
+            "每多一组雾参数",
+            f"{variants} 组雾参数",
+        )
+    )
+    table = (
+        f'<div class="table-wrap"><table><thead><tr><th scope="col">方法（800×800）</th>{head}</tr></thead>'
+        f"<tbody>{''.join(body)}</tbody></table></div>"
+    )
+    return table, numbers
+
+
 def main():
     metrics = json.loads((RESULTS / "metrics.json").read_text(encoding="utf-8"))
     summary = metrics["summary"]
@@ -462,13 +609,23 @@ def main():
     hd = hd_timings()
     passive = [m for m in LABELS if m in summary["rgb"]]
     passive_ms = [m for m in LABELS_MS if m in summary_ms["rgb"]]
-    medium = summary["seconds"]["medium"]
+    # The closed form and ray marching are timed separately with the GPU otherwise idle, see time_methods.py
+    timings = json.loads((RESULTS / "timings.json").read_text())
+    medium = timings["320x180"]
+    times = {(c["steps"], c["shadow_steps"]): c["seconds"] for c in timings["convergence"]["ray_marching"]}
+    convergence["closed_form_seconds"] = timings["convergence"]["closed_form"]
+    for entry in convergence["ray_marching"]:
+        entry["seconds"] = times[entry["steps"], entry["shadow_steps"]]
+    convergence_chart(convergence, timings["convergence"], RESULTS / "images" / "convergence.png")
+    validation = json.loads((RESULTS / "validation.json").read_text())
+    regions = json.loads((ROOT / "results_ms" / "regions.json").read_text())
+    quality_800 = json.loads((ROOT / "res800x800" / "results.json").read_text())["vs_multiple"]
+    scale_html, scale = scale_table(timings["800x800"], quality_800)
 
-    # Time to produce a frame with fog, the first time, and after changing only the fog's parameters. The closed form
-    # and ray marching are timed in the first run, as they don't depend on the reference
+    # Time to produce a frame with fog, the first time, and after changing only the fog's parameters
     clear_render = renders["clear"]
     seconds = {"clear": (clear_render, None), "reference_seed1": (None, None)}  # not a method, the reference's noise
-    for name in ("raymarch_16", "raymarch_64s16", "closed_form_m1", "closed_form"):
+    for name in ("raymarch_16", "raymarch_64s16", "closed_form_m1", "closed_form", "closed_form_ms"):
         seconds[name] = (clear_render + medium[name], medium[name])
     seconds_ss = seconds | {
         "cycles_default": (renders["cycles_default"],) * 2,
@@ -513,6 +670,8 @@ def main():
             labels=LABELS_MS,
         ),
         bounces_table=bounces_table(bounces),
+        validation_table=validation_table(validation),
+        scale_table=scale_html,
         summary_table=table(
             [*passive, "reference"],
             [
@@ -579,7 +738,7 @@ def main():
         closed_form_error=fmt(convergence["closed_form_error_vs_reference"], "pct2"),
         bd=breakdown,
         r=renders,
-        **build_prose(rows, rows_ms, convergence, breakdown, renders, hd, bounces),
+        **build_prose(rows, rows_ms, convergence, breakdown, renders, hd, bounces, timings, validation, scale, regions),
     )
     (RESULTS / "index.html").write_text(body, encoding="utf-8")
     print("wrote", RESULTS / "index.html")

@@ -1,8 +1,8 @@
 """Save variants of a fog scene that isolate each source of light, to break down where the closed form differs.
 
 Variants, each saved next to the output prefix: ``sun`` (black world), ``sun_noshadow`` (black world, objects cast
-no shadows), ``sky`` (no sun) and ``sky_noobjects`` (no sun, only the ground and the fog remain). This needs to run
-from within Blender, e.g.::
+no shadows), ``sky`` (no sun), ``sky_noobjects`` (no sun, only the ground and the fog remain) and ``noobjects`` (only
+the ground and the fog remain, lit by the sun and the sky). This needs to run from within Blender, e.g.::
 
     blender -b fog.blend --python breakdown_scenes.py -- output/fog
 """
@@ -36,3 +36,5 @@ save("sky")
 for obj in objects:
     bpy.data.objects.remove(obj, do_unlink=True)
 save("sky_noobjects")
+sun.hide_render = False
+save("noobjects")

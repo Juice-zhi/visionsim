@@ -54,6 +54,7 @@ FPS, DEVICE, DTYPE = 125.0, "cuda", torch.float32
 FLASH = Flash(wavelength=905.0, bins=1000, bin_width=0.4e-9, pulse_width=1e-9, signal=0.5, background=2.0)
 CYCLES = 500
 FRAME = 250  # frame used for still images, clamped to the number of frames
+GROUND_ALBEDO = 0.39  # area average of the checkered ground's base colors, 0.6 and 0.18
 
 LABELS = {
     "clear": "无雾 baseline",
@@ -66,6 +67,7 @@ LABELS = {
     "reference": "参考 Cycles 4096spp",
     "reference_seed1": "参考（另一种子）",
     "cycles_default_ss": "Cycles 默认（单次散射）",
+    "closed_form_ms": "闭式解（多次散射）",
 }
 FOLDERS = {  # rendered method -> folder of its render in ROOT
     "cycles_default": "cycles_default",
@@ -93,8 +95,8 @@ TOF = {  # ToF method -> (passive method providing the ambient background, ray m
 TOF_LABELS = LABELS | {"raymarch_16": "Ray marching 128 步", "raymarch_64s16": "Ray marching 1024 步"}
 COLORS = {name: f"C{i}" for i, name in enumerate(LABELS)}  # the same color for a method in every plot
 FONT = ImageFont.truetype("C:/Windows/Fonts/msyh.ttc", 13)
-STILLS = ("clear", "cycles_default", "cycles_nodenoise", "raymarch_16", "closed_form_m1", "closed_form")
-VIDEO = ("clear", "cycles_default", "cycles_nodenoise", "raymarch_16", "closed_form")
+STILLS: tuple[str, ...] = ("clear", "cycles_default", "cycles_nodenoise", "raymarch_16", "closed_form_m1", "closed_form")
+VIDEO: tuple[str, ...] = ("clear", "cycles_default", "cycles_nodenoise", "raymarch_16", "closed_form")
 
 
 def use_multiple_scattering() -> None:
@@ -103,16 +105,20 @@ def use_multiple_scattering() -> None:
     global STILLS, VIDEO
     FOLDERS.update({name: f"ms/{folder}" for name, folder in FOLDERS.items()} | {"cycles_default_ss": "cycles_default"})
     PASSIVE.insert(PASSIVE.index("cycles_nodenoise") + 1, "cycles_default_ss")
+    # The closed form's approximation of multiple scattering, including light reflected by the ground
+    PASSIVE.insert(PASSIVE.index("closed_form") + 1, "closed_form_ms")
+    TOF["closed_form_ms"] = ("closed_form_ms", None)
     names = {
         "cycles_default": "Cycles 默认（多次散射）",
         "cycles_nodenoise": "Cycles 不降噪（多次散射）",
+        "closed_form": "闭式解（单次散射）",
         "reference": "参考（多次散射）",
         "reference_seed1": "参考（多次散射，另一种子）",
     }
     LABELS.update(names)
     TOF_LABELS.update(names)
-    STILLS = ("clear", "cycles_default_ss", "cycles_default", "cycles_nodenoise", "raymarch_16", "closed_form")
-    VIDEO = ("clear", "cycles_default_ss", "cycles_default", "raymarch_16", "closed_form")
+    STILLS = ("clear", "cycles_default_ss", "cycles_default", "raymarch_16", "closed_form", "closed_form_ms")
+    VIDEO = ("clear", "cycles_default", "closed_form", "closed_form_ms")
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -124,6 +130,7 @@ def load_sequence(path: Path, channels: int = 3, limit: int | None = None) -> tu
     dataset = Dataset.from_path(path)
     for index in range(min(len(dataset), limit or len(dataset))):
         data, transform = dataset[index]
+        assert isinstance(transform, dict)
         data = np.asarray(data)
         if channels == 3:
             data = to_linearrgb(data, transform["file_path"])
@@ -149,6 +156,8 @@ def passive_sequences(cache: Path, limit: int | None) -> tuple[dict[str, np.ndar
     depth = np.stack([box_depth(d[..., 0], t) for d, t in zip(depths, transforms)])
     lighting = Lighting.model_validate_json((ROOT / "clear" / "lighting.json").read_text())
     medium = Medium.model_validate_json(Path("examples/medium/media/ground_fog.json").read_text())
+    medium_ms = medium.model_copy(update={"multiple_scattering": True})
+    lighting_ms = lighting.model_copy(update={"ground_albedo": (GROUND_ALBEDO,) * 3})
     computed = {
         "closed_form": lambda i: apply_medium(
             clear[i],
@@ -157,6 +166,17 @@ def passive_sequences(cache: Path, limit: int | None) -> tuple[dict[str, np.ndar
             transforms[i]["transform_matrix"],
             medium,
             lighting,
+            time=i / FPS,
+            device=DEVICE,
+            dtype=DTYPE,
+        ),
+        "closed_form_ms": lambda i: apply_medium(
+            clear[i],
+            depth[i],
+            transforms[i],
+            transforms[i]["transform_matrix"],
+            medium_ms,
+            lighting_ms,
             time=i / FPS,
             device=DEVICE,
             dtype=DTYPE,
@@ -294,7 +314,7 @@ def tof_results(seqs: dict[str, np.ndarray], transforms: list[dict]) -> tuple[di
     normals = Dataset.from_path(ROOT / "clear" / "normals")
     albedos = Dataset.from_path(ROOT / "clear" / "diffuse" / "color")
     keys = ("rel_l1", "rel_l1_laser", "disagree", "disagree_expected", "valid", "distance", "pixels")
-    results = {name: {key: [] for key in keys} for name in [*TOF, "reference"]}
+    results: dict[str, dict[str, list]] = {name: {key: [] for key in keys} for name in [*TOF, "reference"]}
     seconds: dict[str, list[float]] = {name: [] for name in TOF}
     pixels = [(165, 160), (100, 300), (70, 180)]  # near ground, green cube, sky near the horizon
 

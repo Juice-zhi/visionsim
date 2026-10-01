@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from run_experiment import ROOT, box_depth, psnr, relative_l1, tonemap
+from run_experiment import GROUND_ALBEDO, ROOT, box_depth, psnr, relative_l1, tonemap
 
 from visionsim.dataset import Dataset
 from visionsim.medium import Lighting, Medium, apply_medium
@@ -36,10 +36,15 @@ def main(args):
     depth = [box_depth(np.asarray(depths[i][0])[..., 0], t) for i, t in enumerate(transforms)]
     lighting = Lighting.model_validate_json((ROOT / "clear" / "lighting.json").read_text())
     medium = Medium.model_validate_json(Path("examples/medium/media/ground_fog.json").read_text())
+    medium_ms = medium.model_copy(update={"multiple_scattering": True})
+    lighting_ms = lighting.model_copy(update={"ground_albedo": (GROUND_ALBEDO,) * 3})
     kwargs = {"device": "cuda", "dtype": torch.float32}
     methods = {
         "closed_form": lambda i: apply_medium(
             clear[i], depth[i], transforms[i], transforms[i]["transform_matrix"], medium, lighting, **kwargs
+        ),
+        "closed_form_ms": lambda i: apply_medium(
+            clear[i], depth[i], transforms[i], transforms[i]["transform_matrix"], medium_ms, lighting_ms, **kwargs
         ),
         "closed_form_without_sky_quadrature": lambda i: apply_medium(
             clear[i],

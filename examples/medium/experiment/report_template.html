@@ -27,11 +27,22 @@
   <p>{bounces_intro}</p>
   {bounces_table}
   <p>{bounces_text}</p>
+  <h3>多次散射近似的验证</h3>
+  <p>{validation_intro}</p>
+  {validation_table}
+  <p>{validation_text}</p>
   <h3>画面与传感器输出（以多次散射为真值）</h3>
   <figure><a href="images/overview_ms.png" target="_blank" rel="noopener"><img src="images/overview_ms.png" alt="以多次散射为真值时，各方法在第 250 帧的渲染帧、误差图和传感器输出" loading="lazy"></a>
   <figcaption>{overview_ms_caption}</figcaption></figure>
   <p>整段动画，列同上图，以 12 fps 播放（约 2 倍慢放）。从上到下依次是：渲染帧、RGB、SPAD（32 帧平均）、DVS（40 ms）、ToF 测距。</p>
   <video src="videos/sensors_ms.mp4" controls muted loop playsinline preload="metadata"></video>
+</section>
+
+<section>
+  <h2>按 VisionSIM-50 的规模估算</h2>
+  <p>{scale_intro}</p>
+  {scale_table}
+  <p>{scale_text}</p>
 </section>
 
 <section>
@@ -152,9 +163,17 @@ pwsh examples/medium/experiment/render_ms.ps1         # 多次散射：Cycles �
 blender -b runs/fog-comparison/demo.blend --python examples/medium/experiment/export_lighting.py -- runs/fog-comparison/clear/lighting.json
 $env:PYTHONPATH = "examples/medium/experiment"; python examples/medium/experiment/run_experiment.py
 python examples/medium/experiment/run_experiment.py --truth multiple   # 结果在 results_ms
+python examples/medium/experiment/error_regions.py    # 多次散射真值下误差按区域和方向拆分
 python examples/medium/experiment/temporal.py         # DVS 一节的对数亮度误差
-pwsh examples/medium/experiment/timing_1080p.ps1      # 1080p 计时：渲染 10 帧
-python examples/medium/experiment/timing_1080p.py
+pwsh examples/medium/experiment/timing_1080p.ps1      # 1080p：渲染 10 帧
+pwsh examples/medium/experiment/timing_resolution.ps1 -Width 800 -Height 800   # 800×800：渲染 10 帧和参考
+python examples/medium/experiment/resolution_check.py # 800×800 下各方法的误差
+python examples/medium/experiment/time_methods.py     # 闭式解和 ray marching 的计时，需要 GPU 空闲
+New-Item -ItemType Directory -Force runs/fog-comparison/cycles_timing
+foreach ($blend in "demo", "fog_default", "fog_default_ms") {{ foreach ($size in "800x800", "1920x1080") {{   # Cycles 的计时，同样需要 GPU 空闲
+  $width, $height = $size -split "x"
+  blender -b runs/fog-comparison/$blend.blend --python examples/medium/experiment/time_cycles.py -- --width $width --height $height > runs/fog-comparison/cycles_timing/${{blend}}_$size.log }} }}
+python examples/medium/experiment/validate_lighting.py   # 无物体场景和点光源的验证，渲染步骤见脚本说明
 python examples/medium/experiment/make_report.py</code></pre>
   <p>误差拆解用 <code>breakdown_scenes.py</code> 生成几种光源变体场景，再用 <code>render_passes.py --frame 255</code> 渲染，最后由 <code>breakdown.py</code> 汇总。多次散射的影响：用 <code>render_passes.py --samples 1024 --frame 255 345 --volume-bounces N</code> 把两帧以 N = 0、1、2、4、8、16、32 次体积弹射各渲染一遍（输出到 <code>runs/fog-comparison/bounces/N</code>），再由 <code>bounces.py</code> 汇总。</p>
 </section>
