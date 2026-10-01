@@ -37,6 +37,12 @@
   <figure><a href="images/occlusion.png" target="_blank" rel="noopener"><img src="images/occlusion.png" alt="第 255 帧雾的散射光：Cycles、不加阴影和加阴影的闭式解，以及两者的相对误差" loading="lazy"></a>
   <figcaption>第 255 帧，雾散射进相机的光（单次散射）。上排只有太阳，下排只有天光；后两列是闭式解相对 Cycles 的误差，红色表示偏亮。不加阴影时，方块投在雾里的阴影整块缺失（中间偏右的红色斜楔），方块前方的雾也因为看到了被方块挡住的天空而偏亮。</figcaption></figure>
   <p>{occlusion_text}</p>
+  <h3>多组雾参数共用阴影</h3>
+  <p>{reuse_intro}</p>
+  {reuse_error_table}
+  <p>{reuse_text}</p>
+  {reuse_time_table}
+  <p>{reuse_time_text}</p>
   <h3>画面与传感器输出（以多次散射为真值）</h3>
   <figure><a href="images/overview_ms.png" target="_blank" rel="noopener"><img src="images/overview_ms.png" alt="以多次散射为真值时，各方法在第 250 帧的渲染帧、误差图和传感器输出" loading="lazy"></a>
   <figcaption>{overview_ms_caption}</figcaption></figure>
@@ -74,7 +80,7 @@
       <tr><th scope="row">Ray marching</th><td style="text-align:left;font-family:var(--sans);white-space:normal">新增的 <code>visionsim.medium.ray_march_medium</code>：沿每条视线均匀分步做数值积分，每步内按能量守恒的方式积分。<em>16 步</em>版本中，光照衰减用解析式；<em>64+16 步</em>版本中，每个采样点再朝太阳方向走 16 步，这是通用体积渲染器的做法。它和闭式解积分的是同一个单次散射模型，只是换成了数值积分。</td></tr>
       <tr><th scope="row">闭式解（修正天光前）</th><td style="text-align:left;font-family:var(--sans);white-space:normal">上一版 M1 的光照模型：天空被当作来自整个球面的均匀光，并且不被雾衰减。</td></tr>
       <tr><th scope="row">闭式解</th><td style="text-align:left;font-family:var(--sans);white-space:normal">当前模型（单次散射）：天光只来自上半球（下半球被地面遮挡），按相函数加权，并且被雾衰减。每个方向的衰减都有闭式解，方向积分用固定求积，结果确定、没有噪声。</td></tr>
-      <tr><th scope="row">闭式解 + 阴影</th><td style="text-align:left;font-family:var(--sans);white-space:normal">同上，再用场景的阴影图让物体在雾里投下阴影（光柱）、遮挡雾中各点能看到的天空。阴影图每个场景渲染一次（<code>export_occlusion.py</code>），沿视线采样可见性，采样点之间仍用闭式解积分。</td></tr>
+      <tr><th scope="row">闭式解 + 阴影</th><td style="text-align:left;font-family:var(--sans);white-space:normal">同上，再用场景的阴影图让物体在雾里投下阴影（光柱）、遮挡雾中各点能看到的天空。阴影图每个场景渲染一次（<code>export_occlusion.py</code>），沿视线采样可见性，采样点之间仍用闭式解积分。可见性每帧追踪一次，多组雾参数共用。</td></tr>
       <tr><th scope="row">闭式解（多次散射）</th><td style="text-align:left;font-family:var(--sans);white-space:normal">加上地面反射和多次散射的近似（只在以多次散射为真值的对照里出现），可以再加阴影。</td></tr>
     </tbody>
   </table></div>
@@ -180,6 +186,7 @@ pwsh examples/medium/experiment/timing_1080p.ps1      # 1080p：渲染 10 帧
 pwsh examples/medium/experiment/timing_resolution.ps1 -Width 800 -Height 800   # 800×800：渲染 10 帧和参考
 python examples/medium/experiment/resolution_check.py # 800×800 下各方法的误差
 python examples/medium/experiment/time_methods.py     # 闭式解和 ray marching 的计时，需要 GPU 空闲
+python examples/medium/experiment/shadow_reuse.py     # 多组雾参数共用阴影的误差和计时，计时同样需要 GPU 空闲
 New-Item -ItemType Directory -Force runs/fog-comparison/cycles_timing
 foreach ($blend in "demo", "fog_default", "fog_default_ms") {{ foreach ($size in "800x800", "1920x1080") {{   # Cycles 的计时，同样需要 GPU 空闲
   $width, $height = $size -split "x"

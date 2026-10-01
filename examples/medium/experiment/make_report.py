@@ -253,6 +253,8 @@ def build_prose(
     regions: dict,
     occlusion: dict,
     maps: dict,
+    reuse: dict,
+    cycles_ms_seconds: dict[str, float],
 ) -> dict[str, str]:
     """Text of the report, which quotes the measured numbers."""
     r = rows
@@ -263,19 +265,19 @@ def build_prose(
         for k in ("closed_form", "closed_form_ms", "cycles_default", "cycles_nodenoise", "cycles_default_ss", "clear")
     )
     occ_ms = rows_ms["closed_form_ms_occ"]
-    shadowed_seconds = {
-        "320×180": occ_ms["update"],
-        "800×800": scale["closed_form_ms_occ"]["update"],
-        "1920×1080": timings["1920x1080"]["closed_form_ms_occ"],
-    }
-    cycles_ms_seconds = {
-        "320×180": cd_ms["update"],
-        "800×800": scale["cycles_default_ms"]["update"],
-        "1920×1080": cycles_seconds("fog_default_ms", "1920x1080"),
-    }
+    # Shadows are traced once per frame, then reused to add each fog
+    traced = {k: v["trace"] for k, v in reuse["seconds"].items()}
+    shadowed_seconds = {k: v["closed_form_ms_occ"] for k, v in reuse["seconds"].items()}
     shadowed_speedups = "、".join(
-        f"{cycles_ms_seconds[k] / v:.1f} 倍（{k}，每帧 {fmt(v, 'sec')}）" for k, v in shadowed_seconds.items()
+        f"{cycles_ms_seconds[k] / v:.1f} 倍（{k.replace('x', '×')}，每帧 {fmt(v, 'sec')}）"
+        for k, v in shadowed_seconds.items()
     )
+    traced_speedups = "、".join(f"{cycles_ms_seconds[k] / (traced[k] + v):.1f}" for k, v in shadowed_seconds.items())
+    traced_text = "、".join(fmt(v, "sec") for v in traced.values())
+    reuse_all, reuse_sun, reuse_sky = (reuse["errors"][k] for k in ("all", "sun", "sky"))
+    of_inscatter = [e["of_inscatter"] for e in reuse_all.values()]
+    of_shadowed = [e["of_shadowed_light"] for e in reuse_all.values()]
+    densest = reuse_sky[max(reuse_sky, key=float)]
     sun_without, sun_with, sky_without, sky_with = (
         occlusion[k] for k in ("sun_without", "sun_with", "sky_without", "sky_with")
     )
@@ -291,9 +293,9 @@ def build_prose(
     single, most = by_bounces[0], by_bounces[max(by_bounces)]
     hd_ms = timings["1920x1080"]["closed_form_ms"]
     speedups = {
-        "320×180": cd_ms["update"] / ms_ms["update"],
-        "800×800": scale["cycles_default_ms"]["update"] / scale["closed_form_ms"]["update"],
-        "1920×1080": cycles_seconds("fog_default_ms", "1920x1080") / hd_ms,
+        "320×180": cycles_ms_seconds["320x180"] / ms_ms["update"],
+        "800×800": cycles_ms_seconds["800x800"] / scale["closed_form_ms"]["update"],
+        "1920×1080": cycles_ms_seconds["1920x1080"] / hd_ms,
     }
     speedup_text = "、".join(f"{v:.0f} 倍（{k}）" for k, v in speedups.items())
     floor_text = f"，参考自身的噪声底为 {pct(floor_ms['frames_rel_l1'])}" if floor_ms else ""
@@ -311,7 +313,7 @@ def build_prose(
     findings = f"""<ul>
 <li><strong>加上光柱和天空遮挡之后，以物理上完整的多次散射为真值，闭式解的渲染帧误差从 {pct(ms_ms["frames_rel_l1"])} 降到 {pct(occ_ms["frames_rel_l1"])}；只算单次散射时是 {pct(cf_ms["frames_rel_l1"])}，Cycles 默认设置（打开多次散射）是 {pct(cd_ms["frames_rel_l1"])}{floor_text}。</strong>四种传感器上：RGB PSNR {occ_ms["rgb_psnr"]:.1f} dB（不加阴影 {ms_ms["rgb_psnr"]:.1f} dB，Cycles {cd_ms["rgb_psnr"]:.1f} dB），SPAD 检测概率 MAE {1000 * occ_ms["spad_mae"]:.0f}×10⁻³（不加阴影 {1000 * ms_ms["spad_mae"]:.0f}，Cycles {1000 * cd_ms["spad_mae"]:.1f}），DVS 事件 F1 {occ_ms["dvs_f1_pooled"]:.3f}（不加阴影 {ms_ms["dvs_f1_pooled"]:.3f}，Cycles {cd_ms["dvs_f1_pooled"]:.3f}）。</li>
 <li><strong>阴影本身和 Cycles 吻合：</strong>第 255 帧只开太阳时，雾散射进相机的光与 Cycles 之比在表面像素上从 {sun_without["surfaces"]:.3f} 变为 {sun_with["surfaces"]:.3f}，天空像素上从 {sun_without["sky"]:.3f} 变为 {sun_with["sky"]:.3f}；只开天光时，表面像素上从 {sky_without["surfaces"]:.3f} 变为 {sky_with["surfaces"]:.3f}，天空像素上从 {sky_without["sky"]:.3f} 变为 {sky_with["sky"]:.3f}。阴影图每个场景只需渲染一次（{maps["count"]} 张正交深度图，{maps["seconds"]:.1f} s），与相机、分辨率和雾参数都无关。</li>
-<li><strong>时间：只改雾参数时，闭式解（多次散射）+ 阴影比打开多次散射的 Cycles 快 {shadowed_speedups}。</strong>阴影要沿每条视线查阴影图，所以开销随像素数增加；不加阴影时快 {speedup_text}，每帧只要 {fmt(ms_ms["update"], "sec")}、{fmt(scale["closed_form_ms"]["update"], "sec")} 和 {fmt(hd_ms, "sec")}。天光、地面反射和多次散射都是每帧一张查找表，多次散射表与相机无关，每组雾参数只算一次（{fmt(timings["multiple_scattering_table"], "sec")}）。</li>
+<li><strong>时间：阴影与雾参数无关，每帧只需沿视线追踪一次，之后每组雾参数都复用。只改雾参数时，闭式解（多次散射）+ 阴影比打开多次散射的 Cycles 快 {shadowed_speedups}。</strong>追踪阴影要查阴影图，开销随像素数增加，三种分辨率下每帧分别要 {traced_text}，算上它也分别快 {traced_speedups} 倍；复用的误差只占雾散射光的 {fmt(min(of_inscatter), "pct2")}～{fmt(max(of_inscatter), "pct2")}。不加阴影时快 {speedup_text}，每帧只要 {fmt(ms_ms["update"], "sec")}、{fmt(scale["closed_form_ms"]["update"], "sec")} 和 {fmt(hd_ms, "sec")}。天光、地面反射和多次散射都是每帧一张查找表，多次散射表与相机无关，每组雾参数只算一次（{fmt(timings["multiple_scattering_table"], "sec")}）。</li>
 <li><strong>多次散射近似本身在去掉物体的场景里和 Cycles 吻合：雾散射进相机的光整体是 Cycles 32 次弹射的 {free["all"]:.3f} 倍，各仰角在 {min(elevations.values()):.2f}～{max(elevations.values()):.2f} 倍之间。</strong>加上阴影后，完整场景里剩下的误差主要来自表面透过雾被照亮（表面在 Cycles 里暗约 {pct(1 - bd["surface_dimming"]["median"])}），以及多次散射近似本身。</li>
 <li><strong>Blender 默认的 0 次体积弹射只算单次散射：</strong>用 Cycles 默认设置渲染这团雾，误差是 {pct(ss_ms["frames_rel_l1"])}，比完全不加雾（{pct(cl_ms["frames_rel_l1"])}）还差。雾散射进相机的光里有 {pct(most["indirect_share"])} 散射过不止一次，画面整体亮 {pct(most["brightness"] - 1)}。在 Cycles 里打开多次散射（8 次弹射已收敛），每帧只从 {renders["cycles_default"]:.2f} s 增加到 {renders["ms_cycles_default"]:.2f} s，用 Cycles 渲染雾时应该把体积弹射次数设到 8 以上。</li>
 <li><strong>点光源：</strong>单次散射和 Cycles 吻合（雾光比值 {point["ratio"]:.3f}），但点光源的多次散射还没有建模，在这团雾里要少约 {pct(1 - validation["point_vs_32_bounces"]["ratio"])} 的光晕。</li>
@@ -328,13 +330,13 @@ def build_prose(
     )
     ms_text = (
         f"左图（单次散射真值）里，闭式解只改雾参数时比 Cycles 默认设置快 {cd['update'] / cf['update']:.1f} 倍，误差 {pct(cf['frames_rel_l1'])} 对 {pct(cd['frames_rel_l1'])}；"
-        f"加阴影后误差降到 {pct(cf_occ['frames_rel_l1'])}，每帧 {fmt(cf_occ['update'], 'sec')}。"
+        f"加阴影后误差降到 {pct(cf_occ['frames_rel_l1'])}，复用每帧的阴影时每帧 {fmt(cf_occ['update'], 'sec')}。"
         f"右图（多次散射真值）里，只算单次散射的方法都落在虚线上方，比不加雾还差；加上多次散射项后，闭式解降到 {pct(ms_ms['frames_rel_l1'])}，每帧耗时只从 {fmt(cf_ms['update'], 'sec')} 增加到 {fmt(ms_ms['update'], 'sec')}。"
         f"不加阴影时，它的误差有方向性：整体偏亮 {signed(regions['closed_form_ms']['all'])}，其中看天空的像素只差 {signed(regions['closed_form_ms']['sky'])}，"
         f"偏差集中在物体表面（5 m 以内 {signed(regions['closed_form_ms']['surfaces_near'])}、5–15 m {signed(regions['closed_form_ms']['surfaces_mid'])}），正是光柱和物体遮挡天空的位置。"
         f"加上阴影后，误差降到 {pct(occ_ms['frames_rel_l1'])}，整体偏差变为 {signed(regions['closed_form_ms_occ']['all'])}：天空像素 {signed(regions['closed_form_ms_occ']['sky'])}，"
         f"表面像素 5 m 以内 {signed(regions['closed_form_ms_occ']['surfaces_near'])}、5–15 m {signed(regions['closed_form_ms_occ']['surfaces_mid'])}、15 m 以外 {signed(regions['closed_form_ms_occ']['surfaces_far'])}；"
-        f"每帧耗时增加到 {fmt(occ_ms['update'], 'sec')}。"
+        f"每帧先追踪一次阴影（{fmt(traced['320x180'], 'sec')}），之后每组雾参数只要 {fmt(occ_ms['update'], 'sec')}。"
         f"修正天光前的 M1 模型总误差相近（{pct(rows_ms['closed_form_m1']['frames_rel_l1'])}），但原因不同：它在天空上偏暗 {signed(regions['closed_form_m1']['sky'])}、"
         f"远处表面偏暗 {signed(regions['closed_form_m1']['surfaces_far'])}，只在近处表面碰巧抵消，没有物理依据。"
         f"多次散射也放大了 Cycles 的噪声：不降噪时渲染帧误差为 {pct(nd_ms['frames_rel_l1'])}，DVS 事件 F1 为 {nd_ms['dvs_f1_pooled']:.3f}，"
@@ -370,7 +372,35 @@ def build_prose(
         "以及物体边缘的抗锯齿差异。天空单元格宽 15°～120°，遮挡物的边缘正好落在视线的前向散射波瓣上时（例如沿墙面方向看），"
         "整格只按中心方向判定为全遮挡或全可见，会多算或少算一部分遮挡；这在合成测试里最多差约 25%，在本场景里整体只差约 1%。"
     )
+    reuse_intro = (
+        "沿视线追踪阴影，也就是找出每条视线上太阳被挡住的区间、在采样点上查每个天空单元格是否可见，只和场景几何与相机有关，"
+        "所以每帧只需追踪一次，之后每组雾参数都复用这些可见性，只重新做闭式积分；雾的各向异性变了也能复用，单元格的相函数权重会按保存的可见性重新计算。"
+        "不过天光的采样点是按追踪时的雾选的（按每段对相机的贡献均匀分布），视线上的采样范围也截到这团雾光学厚度为 12 的位置，所以换一组雾后，结果和为它重新追踪略有不同。"
+        "下表每隔 10 帧（共 50 帧）用这团雾追踪一次阴影，再用于密度乘以不同倍数的雾，和为每组雾各自追踪的结果对比："
+    )
+    reuse_text = (
+        f"复用的误差只相当于阴影带来的修正的 {pct(min(of_shadowed))}～{pct(max(of_shadowed))}，占雾散射光的 {fmt(min(of_inscatter), 'pct2')}～{fmt(max(of_inscatter), 'pct2')}。"
+        f"误差几乎全部来自天光：太阳被挡住的区间与雾无关，复用后最多差 {fmt(max(e['of_shadowed_light'] for e in reuse_sun.values()), 'pct2')}；"
+        "天光每条视线只有 8 个采样点，雾一变，它们就不再按新的贡献均匀分布。雾变浓时，贡献集中到离相机更近的地方，那里的采样点偏少，"
+        f"密度变为 {float(max(reuse_sky, key=float)):g} 倍时，天光的遮挡差了 {pct(densest['of_shadowed_light'])}，"
+        f"不过这时被物体挡住的天光只占雾所散射天光的 {pct(densest['of_inscatter'] / densest['of_shadowed_light'])}。雾参数的范围很大时，可以按几档密度各追踪一次。"
+        "下表是每帧的开销（RTX 5080，GPU 空闲时取最快的一次）："
+    )
+    reused = [s[k] for s in reuse["seconds"].values() for k in ("closed_form_occ", "closed_form_ms_occ")]
+    reused_speedups = [cycles_ms_seconds[k] / v for k, v in shadowed_seconds.items()]
+    reuse_time_text = (
+        f"复用阴影后加一组雾只要 {fmt(min(reused), 'sec')}～{fmt(max(reused), 'sec')}，多次散射 + 阴影仍比打开多次散射的 Cycles 快 {min(reused_speedups):.0f}～{max(reused_speedups):.0f} 倍。"
+        "它比不加阴影慢，是因为每条视线都要按保存的可见性逐段重新积分，开销随像素数增加，而不加阴影时的开销主要是与分辨率无关的查找表。追踪阴影是加阴影的主要开销，"
+        f"每帧的阴影在 800×800 时占 {size(reuse['bytes']['800x800'])} 显存，存盘并不划算，所以生成多组雾参数时应在同一遍里处理完每帧的所有雾参数。"
+    )
     clear_800 = scale["clear"]
+    shadowed_first = scale["closed_form_ms_occ"]["first"]
+    first_ratio = shadowed_first / scale["cycles_default_ms"]["first"]
+    first_versus = (
+        "和打开多次散射的 Cycles 相当"
+        if 0.8 < first_ratio < 1.25
+        else f"是打开多次散射的 Cycles 的 {first_ratio:.1f} 倍"
+    )
     scale_intro = (
         "VisionSIM-50 有 50 个室内场景，每个场景 12 秒，以 100 fps、800×800 渲染，共 59,950 帧，只包含真值（RGB、深度、法线、光流、分割），约 1.0 TB。"
         "下表在同样的 800×800 分辨率下，实测本实验场景每帧的耗时（RTX 5080；Cycles 用 visionsim 的默认设置把第 255 帧反复渲染 12 次取最快的一次，不含 Blender 启动和保存文件），"
@@ -378,10 +408,13 @@ def build_prose(
     )
     scale_text = (
         f"闭式解第一份需要先渲染无雾画面（每帧 {clear_800:.1f} s，另外还要保存线性 EXR 和深度）和阴影图（每个场景约 {maps['seconds']:.0f} s），"
-        f"之后每组雾参数加阴影要 {hours(VISIONSIM50_FRAMES * scale['closed_form_ms_occ']['update'])}，不加阴影只要 {hours(VISIONSIM50_FRAMES * scale['closed_form_ms']['update'])}；"
+        f"加阴影时每帧还要追踪一次阴影（{fmt(scale['trace'], 'sec')}，共 {hours(VISIONSIM50_FRAMES * scale['trace'])}）；"
+        f"之后每组雾参数复用这些阴影，加阴影要 {hours(VISIONSIM50_FRAMES * scale['closed_form_ms_occ']['update'])}，不加阴影只要 {hours(VISIONSIM50_FRAMES * scale['closed_form_ms']['update'])}；"
         f"打开多次散射的 Cycles 每组都要 {hours(VISIONSIM50_FRAMES * scale['cycles_default_ms']['update'])}。"
-        "阴影只和场景几何有关，与雾参数无关，所以多组雾参数还可以共用每帧的可见性，这一步目前还没有做。"
-        "闭式解每帧只要几十到几百毫秒，也可以像传感器仿真一样在读取数据时现场加雾，不必把每组雾参数的结果都存下来。"
+        f"所以加阴影时，第一份（{hours(VISIONSIM50_FRAMES * shadowed_first)}）{first_versus}，好处在于之后的每组雾参数；"
+        f"如果数据集本来就要渲染无雾画面，加一组带阴影的雾只需追踪阴影再加雾，共 {hours(VISIONSIM50_FRAMES * (scale['trace'] + scale['closed_form_ms_occ']['update']))}。"
+        "复用要求在同一遍里为每帧加上所有雾参数（见上文“多组雾参数共用阴影”）。"
+        "不加阴影时每帧只要几十毫秒，也可以像传感器仿真一样在读取数据时现场加雾，不必把每组雾参数的结果都存下来；加阴影时每次读取都要先追踪阴影，更适合一次生成多组雾参数。"
         "注意三点：本场景比 VisionSIM-50 的室内场景简单，Cycles 的耗时会随场景复杂度和弹射次数增加，而闭式解只和像素数有关；"
         "VisionSIM-50 发布的是色调映射后的 8 位 PNG，要用闭式解需要按线性 EXR 重新渲染一遍；室内场景主要靠灯光照明，目前点光源只算单次散射，聚光灯和面光源还不支持。"
         "插帧和传感器仿真的耗时对两种方法相同，不在表中。"
@@ -411,10 +444,13 @@ def build_prose(
         "validation_text": validation_text,
         "occlusion_intro": occlusion_intro,
         "occlusion_text": occlusion_text,
+        "reuse_intro": reuse_intro,
+        "reuse_text": reuse_text,
+        "reuse_time_text": reuse_time_text,
         "scale_intro": scale_intro,
         "scale_text": scale_text,
         "overview_ms_caption": overview_ms_caption,
-        "tradeoff_caption": "每个点是一种方法。横轴是只改雾参数时生成一帧带雾画面的耗时（Cycles 要整帧重新渲染，闭式解和 ray marching 只需在无雾渲染上加雾），"
+        "tradeoff_caption": "每个点是一种方法。横轴是只改雾参数时生成一帧带雾画面的耗时（Cycles 要整帧重新渲染，闭式解和 ray marching 只需在无雾渲染上加雾，加阴影时复用每帧追踪好的阴影），"
         "纵轴是渲染帧相对参考的 L1 误差，两轴都是对数坐标。左图以单次散射为真值，右图以多次散射为真值。虚线是完全不加雾的误差，点线是参考自身的噪声底。",
         "overview_caption": "第一行：各方法生成的带雾画面；第二行：相对参考的误差。闭式解和 ray marching 的误差集中在方块表面和方块周围的雾里，对应“差距从哪来”中的三种可见性效应；"
         "加阴影后方块周围雾里的误差基本消失，剩下的集中在方块表面。"
@@ -452,9 +488,9 @@ def build_prose(
         f"③ 表面本身是透过雾被照亮的：阳光和天光到达表面之前都被雾衰减，雾的散射又补回一部分，净效果是表面在 Cycles 里暗了 {pct(1 - bd['surface_dimming']['median'])}（中位数，p10–p90 为 {pct(1 - bd['surface_dimming']['p90'])}–{pct(1 - bd['surface_dimming']['p10'])}）。"
         f"①和②现在已经用阴影图建模，加阴影后两项的比值分别回到 {sun_with['surfaces']:.3f} 和 {sky_with['surfaces']:.3f}（见上文“光柱和天空遮挡”），③还没有建模。"
         f"修正前的模型让下半球也向雾里照射天光，并且天光不衰减，结果表面像素上的散射光是 Cycles 的 {bd['full_before_fix']['surfaces']:.1f} 倍。",
-        "next_steps": """<ul>
+        "next_steps": f"""<ul>
 <li><strong>表面透过雾被照亮（现在最大的误差来源）</strong>：用 Blender 的 Light Groups 把表面上的太阳贡献和天光贡献分开，分别乘以表面点处的阳光透射率和天光透射率（高度雾都有闭式解，阴影图也能直接用）；雾光对表面的照明可以用多次散射表里已经算好的、散射过一次的光场来近似。</li>
-<li><strong>阴影的速度</strong>：阴影只和场景几何有关，与雾参数无关，多组雾参数可以共用每帧的可见性；天空的遮挡变化平缓，也可以在低分辨率的视线上算好再按深度插值。查阴影图的部分用自定义 GPU 核函数合并后还能再快几倍。</li>
+<li><strong>阴影的速度</strong>：多组雾参数已经可以共用每帧的阴影，剩下的开销主要是每帧追踪一次阴影（800×800 时 {fmt(scale["trace"], "sec")}，是无雾渲染的 {pct(scale["trace"] / clear_800)}）。天空的遮挡变化平缓，可以在低分辨率的视线上追踪再按深度插值；查阴影图的部分用自定义 GPU 核函数合并后还能再快几倍，保存的阴影也能随之变小。</li>
 <li><strong>阴影的精度</strong>：天空单元格较粗，遮挡物边缘正好落在前向散射波瓣上时会整格误判，可以每个单元格渲染几张子方向的阴影图，沿视线交替使用；运动的物体需要逐帧渲染阴影图；地面反射到雾里的光和点光源也还没有阴影。</li>
 <li><strong>点光源的多次散射、聚光灯和面光源</strong>：点光源的多次散射可以用大气点扩散函数（Narasimhan 和 Nayar 2003）一类的解析近似；聚光灯只是带角度衰减的点光源，面光源可以用若干个点光源近似。</li>
 <li><strong>多次散射近似的改进</strong>：地平线附近少约 7%，俯视地面时多约 12%。可以用 Cycles 的无物体参考标定级数因子，或者把收集过程迭代两三次代替几何级数；地面也可以换成更接近 Principled BSDF 的反射模型。</li>
@@ -486,7 +522,7 @@ def method_rows(summary: dict, seconds: dict, labels: dict[str, str], temporal: 
 # Points of the trade-off chart: label, color, marker and where the label goes relative to the point
 POINTS = {
     "closed_form": ("闭式解", "#b0304a", "D", (-8, 3, "right")),
-    "closed_form_occ": ("闭式解 + 阴影", "#d9667f", "D", (-8, 3, "right")),
+    "closed_form_occ": ("闭式解 + 阴影", "#d9667f", "D", (7, 3, "left")),
     "closed_form_ms": ("闭式解（多次散射）", "#6b1d2c", "D", (7, -3, "left")),
     "closed_form_ms_occ": ("闭式解（多次散射）+ 阴影", "#3d0f19", "D", (0, -15, "center")),
     "closed_form_m1": ("闭式解（修正前）", "#b9a3c9", "D", (0, -14, "center")),
@@ -607,6 +643,50 @@ def shadow_maps() -> dict:
     return {"count": count, "seconds": float(re.findall(r"OCCLUSION_TIME ([\d.]+)s", log)[-1]), "texels": texels}
 
 
+def reuse_tables(reuse: dict, timings: dict, cycles: dict[str, float]) -> tuple[str, str]:
+    """Error of reusing the shadows of a frame for fogs of other densities, and time to trace shadows and to add a fog
+    with them, against adding it without shadows and rendering it with Cycles, from ``shadow_reuse.py``."""
+    errors = reuse["errors"]
+    lines = [
+        ("全部光源（多次散射）：相对阴影带来的修正", errors["all"], "of_shadowed_light", "pct"),
+        ("全部光源（多次散射）：相对雾的散射光", errors["all"], "of_inscatter", "pct2"),
+        ("只有太阳：相对阴影带来的修正", errors["sun"], "of_shadowed_light", "pct"),
+        ("只有天光：相对阴影带来的修正", errors["sky"], "of_shadowed_light", "pct"),
+    ]
+    head = "".join(f'<th scope="col">{float(k):g} 倍</th>' for k in errors["all"])
+    body = "".join(
+        f'<tr><th scope="row">{label}</th>' + "".join(f"<td>{fmt(e[key], kind)}</td>" for e in values.values()) + "</tr>"
+        for label, values, key, kind in lines
+    )
+    error_table = (
+        f'<div class="table-wrap"><table><thead><tr><th scope="col">复用的误差（相对 L1），雾的密度</th>{head}</tr></thead>'
+        f"<tbody>{body}</tbody></table></div>"
+    )
+    seconds = reuse["seconds"]
+    lines = [
+        ("追踪阴影（每帧一次）", [s["trace"] for s in seconds.values()]),
+        ("复用阴影，加一组雾（单次散射）", [s["closed_form_occ"] for s in seconds.values()]),
+        ("复用阴影，加一组雾（多次散射）", [s["closed_form_ms_occ"] for s in seconds.values()]),
+        ("对照：不加阴影（多次散射）", [timings[k]["closed_form_ms"] for k in seconds]),
+        ("对照：Cycles 默认设置（多次散射）", [cycles[k] for k in seconds]),
+    ]
+    head = "".join(f'<th scope="col">{k.replace("x", "×")}</th>' for k in seconds)
+    body = "".join(
+        f'<tr><th scope="row">{label}</th>' + "".join(f"<td>{fmt(v, 'sec')}</td>" for v in values) + "</tr>"
+        for label, values in lines
+    )
+    body += (
+        '<tr><th scope="row">每帧阴影占用的显存</th>'
+        + "".join(f"<td>{size(reuse['bytes'][k])}</td>" for k in seconds)
+        + "</tr>"
+    )
+    time_table = (
+        f'<div class="table-wrap"><table><thead><tr><th scope="col">每帧的开销</th>{head}</tr></thead>'
+        f"<tbody>{body}</tbody></table></div>"
+    )
+    return error_table, time_table
+
+
 VISIONSIM50_FRAMES = 59_950
 """Frames of VisionSIM-50: 50 scenes animated for 12 s, rendered at 100 fps and 800x800"""
 
@@ -616,6 +696,11 @@ def cycles_seconds(scene: str, resolution: str) -> float:
     where ``scene`` is ``demo`` (without fog), ``fog_default`` or ``fog_default_ms``."""
     text = (ROOT / "cycles_timing" / f"{scene}_{resolution}.log").read_text(encoding="utf-8", errors="replace")
     return float(re.findall(r"CYCLES_TIME min=([\d.]+)s", text)[-1])
+
+
+def size(count: int) -> str:
+    """Number of bytes in MB or GB."""
+    return f"{count / 1e6:.0f} MB" if count < 1e9 else f"{count / 1e9:.1f} GB"
 
 
 def hours(seconds: float) -> str:
@@ -646,20 +731,21 @@ def convergence_chart(convergence: dict, seconds: dict, path: Path) -> None:
     plt.close(fig)
 
 
-def scale_table(timings: dict, quality: dict, variants: int = 10) -> tuple[str, dict]:
+def scale_table(timings: dict, quality: dict, shadows: dict, variants: int = 10) -> tuple[str, dict]:
     """Time to produce fog for as many frames as VisionSIM-50 at its resolution, from 10 frames of the experiment's
-    scene rendered at 800x800 (timing_resolution.ps1) and the time taken by the closed form and ray marching."""
+    scene rendered at 800x800 (timing_resolution.ps1) and the time taken by the closed form and ray marching, where
+    shadows are traced once per frame and reused for every fog (shadow_reuse.py)."""
     clear = cycles_seconds("demo", "800x800")
     rows = [
         ("Cycles 默认设置（多次散射）", cycles_seconds("fog_default_ms", "800x800"), None, "cycles_default_ms"),
         ("Cycles 默认设置（单次散射）", cycles_seconds("fog_default", "800x800"), None, "cycles_default"),
-        ("闭式解（多次散射）+ 阴影", timings["closed_form_ms_occ"], clear, "closed_form_ms_occ"),
+        ("闭式解（多次散射）+ 阴影", shadows["closed_form_ms_occ"], clear + shadows["trace"], "closed_form_ms_occ"),
         ("闭式解（多次散射）", timings["closed_form_ms"], clear, "closed_form_ms"),
         ("闭式解（单次散射）", timings["closed_form"], clear, "closed_form"),
         ("Ray marching 16 步", timings["raymarch_16"], clear, "raymarch_16"),
     ]
     body: list[str] = []
-    numbers: dict[str, float | dict] = {"clear": clear}
+    numbers: dict[str, float | dict] = {"clear": clear, "trace": shadows["trace"]}
     for label, update, base, key in rows:
         error = quality.get(key, {}).get("rel_l1")
         first = (base or 0) + update
@@ -677,7 +763,7 @@ def scale_table(timings: dict, quality: dict, variants: int = 10) -> tuple[str, 
         for h in (
             "只改雾参数时每帧",
             "渲染帧误差（多次散射真值）",
-            "第一份（含无雾渲染）",
+            "第一份（含无雾渲染和追踪阴影）",
             "每多一组雾参数",
             f"{variants} 组雾参数",
         )
@@ -712,23 +798,26 @@ def main():
     validation = json.loads((RESULTS / "validation.json").read_text())
     regions = json.loads((ROOT / "results_ms" / "regions.json").read_text())
     quality_800 = json.loads((ROOT / "res800x800" / "results.json").read_text())["vs_multiple"]
-    scale_html, scale = scale_table(timings["800x800"], quality_800)
+    # Shadows are traced once per frame, then reused for every fog, see shadow_reuse.py
+    reuse = json.loads((RESULTS / "shadow_reuse.json").read_text())
+    scale_html, scale = scale_table(timings["800x800"], quality_800, reuse["seconds"]["800x800"])
     occlusion = json.loads((RESULTS / "occlusion.json").read_text())
     maps = shadow_maps()
 
     # Time to produce a frame with fog, the first time, and after changing only the fog's parameters
     clear_render = renders["clear"]
     seconds = {"clear": (clear_render, None), "reference_seed1": (None, None)}  # not a method, the reference's noise
-    for name in (
-        "raymarch_16",
-        "raymarch_64s16",
-        "closed_form_m1",
-        "closed_form",
-        "closed_form_occ",
-        "closed_form_ms",
-        "closed_form_ms_occ",
-    ):
+    for name in ("raymarch_16", "raymarch_64s16", "closed_form_m1", "closed_form", "closed_form_ms"):
         seconds[name] = (clear_render + medium[name], medium[name])
+    shadowed = reuse["seconds"]["320x180"]
+    for name in ("closed_form_occ", "closed_form_ms_occ"):
+        seconds[name] = (clear_render + shadowed["trace"] + shadowed[name], shadowed[name])
+    cycles_ms = {
+        "320x180": renders["ms_cycles_default"],
+        "800x800": cycles_seconds("fog_default_ms", "800x800"),
+        "1920x1080": cycles_seconds("fog_default_ms", "1920x1080"),
+    }
+    reuse_error_table, reuse_time_table = reuse_tables(reuse, timings, cycles_ms)
     seconds_ss = seconds | {
         "cycles_default": (renders["cycles_default"],) * 2,
         "cycles_nodenoise": (renders["cycles_nodenoise"],) * 2,
@@ -767,13 +856,16 @@ def main():
             ],
             rows_ms,
             "所有 loss 都相对多次散射参考（Cycles 4096 spp，最多 16 次体积弹射）计算。绿色为除参考外的最佳值，灰色为参考自身的噪声底。"
-            "“只改雾参数时”：Cycles 要整帧重新渲染，闭式解和 ray marching 只需在无雾渲染上加雾。耗时包含 Blender 启动时间，在 RTX 5080 上测得。"
+            "“只改雾参数时”：Cycles 要整帧重新渲染，闭式解和 ray marching 只需在无雾渲染上加雾；加阴影的行复用每帧追踪好的阴影，“生成一帧”包含追踪阴影的时间。"
+            "耗时包含 Blender 启动时间，在 RTX 5080 上测得。"
             "ToF 不在表中：Cycles 不能渲染瞬态，瞬态的参考只能用同一个单次散射模型，无法评估多次散射对激光回波的影响。",
             labels=LABELS_MS,
         ),
         bounces_table=bounces_table(bounces),
         validation_table=validation_table(validation),
         occlusion_table=occlusion_table(occlusion),
+        reuse_error_table=reuse_error_table,
+        reuse_time_table=reuse_time_table,
         scale_table=scale_html,
         summary_table=table(
             [*passive, "reference"],
@@ -789,7 +881,7 @@ def main():
             rows,
             "所有 loss 都是相对单次散射参考（Cycles 4096 spp，0 次体积弹射）计算的。绿色为除参考外的最佳值。灰色的“参考本身的噪声”一行：换一个随机种子把参考重新渲染一遍，它和参考之间的差异就是参考的蒙特卡洛噪声底，"
             "任何方法的 loss 都不会明显低于它。— 表示不适用：Cycles 不能渲染时间分辨的瞬态，所以没有 ToF 结果。ToF 一列里，两行 ray marching 的瞬态分别用了 128 步和 1024 步。"
-            "耗时包含 Blender 启动时间，在 RTX 5080 上测得。",
+            "加阴影的行“只改雾参数时”复用每帧追踪好的阴影，“生成一帧”包含追踪阴影的时间。耗时包含 Blender 启动时间，在 RTX 5080 上测得。",
         ),
         rgb_table=table(
             passive,
@@ -856,6 +948,8 @@ def main():
             regions,
             occlusion,
             maps,
+            reuse,
+            cycles_ms,
         ),
     )
     (RESULTS / "index.html").write_text(body, encoding="utf-8")
