@@ -166,8 +166,9 @@ def apply_medium(
         shadows (Shadows | None, optional): Shadows already traced along the rays of this frame by
             :func:`trace_shadows`, which avoids tracing them again when adding several media to the same frame. Takes
             precedence over ``occlusion``. Defaults to None.
-        shadow_step (float, optional): Distance between samples of the visibility of suns along rays, in texels of
-            their shadow maps. Defaults to 8.
+        shadow_step (float, optional): Length of the intervals of rays over which the visibility of suns is checked
+            at once, in texels of their shadow maps, see :func:`trace <visionsim.medium.occlusion.trace>`.
+            Defaults to 8.
         shadow_samples (int, optional): Number of samples of the visibility of the sky along each ray.
             Defaults to 8.
         device (torch.device | str | None, optional): Device to run on. Defaults to None (CPU).
@@ -339,8 +340,9 @@ def trace_shadows(
         lighting (Lighting): Lighting of the medium, whose suns cast shadows.
         background_depth (float, optional): Depth from which pixels are considered to see the background.
             Defaults to 1e9.
-        shadow_step (float, optional): Distance between samples of the visibility of suns along rays, in texels of
-            their shadow maps. Defaults to 8.
+        shadow_step (float, optional): Length of the intervals of rays over which the visibility of suns is checked
+            at once, in texels of their shadow maps, see :func:`trace <visionsim.medium.occlusion.trace>`.
+            Defaults to 8.
         shadow_samples (int, optional): Number of samples of the visibility of the sky along each ray.
             Defaults to 8.
         device (torch.device | str | None, optional): Device to run on. Defaults to None (CPU).

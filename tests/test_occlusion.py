@@ -13,7 +13,13 @@ from visionsim.medium.model import HeightFog
 from visionsim.medium.occlusion import (
     Occlusion,
     ShadowMaps,
+    _cell_centers,
+    _depth_windows,
     _pack,
+    _ragged,
+    _ragged_chunks,
+    _snap,
+    _surely_lit,
     _unpack,
     band_attenuation,
     cell_phases,
@@ -356,6 +362,50 @@ def test_sun_shadow_of_a_rectangle():
     unoccluded = brute_force(origin, directions, distance, lambda p, v: source(p, v, shadows=False))
     assert (expected < 0.95 * unoccluded).sum() >= 2  # some rays do cross the shadow
     assert np.allclose(result[:, 0].numpy(), expected, rtol=5e-3, atol=1e-6)
+
+    # Longer intervals are only sampled every texel where the shadow's edge may cross them, which is as accurate
+    coarse = occluded_inscatter(occlusion, FOG, origin, directions, distance, beta, [(T(sun), T([1.0]))], {}, bias=1.0)
+    assert np.allclose(coarse[:, 0].numpy(), expected, rtol=5e-3, atol=1e-6)
+
+
+def test_surely_lit_intervals_are():
+    """Intervals along rays found to be entirely lit or hidden from tiles of a shadow map are so at every point."""
+    sun = np.array([0.2, 0.5, 0.84])
+    sun /= np.linalg.norm(sun)
+    bounds = [[-4.0, 10.0, 4.0], [4.0, 30.0, 4.0]]
+    maps = render_maps([sun], bounds, rectangle(4.0, (-4, 4), (10, 30)), 256)
+    generator = np.random.default_rng(0)
+    origin = T([0.0, 0.0, 1.6])
+    directions = T(generator.normal(size=(4000, 3)) * [1.0, 1.0, 0.3] + [0.0, 1.0, 0.3])
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+    texel = float(maps.texels[0])
+    starts = T(generator.uniform(0, 40, 4000))
+    ends = starts + T(generator.uniform(0, 8 * texel, 4000))
+    lit = _surely_lit(maps, _depth_windows(maps, 10), 10, origin, directions, starts, ends, 0.5)
+    points = torch.lerp(starts[:, None], ends[:, None], torch.linspace(0, 1, 65, dtype=torch.float64))
+    along = visibility(maps, origin, directions, points)[..., 0]
+    assert (lit == 1).sum() > 100 and (lit == 0).sum() > 100 and (lit < 0).sum() > 10
+    assert (along[lit == 1] == 1).all() and (along[lit == 0] == 0).all()
+
+
+def test_snapping_to_a_grid():
+    generator = np.random.default_rng(1)
+    low, high = T([-5.0, -3.0, 0.0]), T([5.0, 7.0, 2.0])
+    points = T(generator.uniform(low.numpy(), high.numpy(), size=(1000, 3)))
+    cell = _snap(points, low, high, 0.3)
+    assert ((_cell_centers(cell, low, high, 0.3) - points).abs() <= 0.15 + 1e-12).all()
+    # Points outside of the box go to its closest cell
+    outside = _snap(T([[-50.0, 0.0, 1.0], [float("inf"), 0.0, 1.0]]), low, high, 0.3)
+    centers = _cell_centers(outside, low, high, 0.3)
+    assert centers[:, 0].tolist() == pytest.approx([-5.0 + 0.5 * 0.3, -5.0 + 33.5 * 0.3])  # the box has 34 cells
+
+
+def test_ragged_layout():
+    counts = torch.as_tensor([2, 0, 3, 1])
+    ray, index = _ragged(counts)
+    assert ray.tolist() == [0, 0, 2, 2, 2, 3] and index.tolist() == [0, 1, 0, 1, 2, 0]
+    assert list(_ragged_chunks(counts, 3)) == [slice(0, 2), slice(2, 3), slice(3, 4)]
+    assert list(_ragged_chunks(torch.as_tensor([5, 1]), 2)) == [slice(0, 1), slice(1, 2)]
 
 
 def sky_table(beta):

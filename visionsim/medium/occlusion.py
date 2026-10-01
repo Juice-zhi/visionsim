@@ -234,7 +234,8 @@ def visibility(
         return ~inside | (depth <= maps.depths[index])
 
     def texel(coordinate: torch.Tensor, size: torch.Tensor) -> torch.Tensor:
-        return torch.minimum(coordinate.clamp_min(-1), size).int()
+        # Far enough from the map that the next texel, which filtering also reads, is still outside of it
+        return torch.minimum(coordinate.clamp_min(-2), size).int()
 
     if not filtered:
         return lit_at(texel(x.round(), right), texel(y.round(), top)).to(x.dtype)
@@ -395,6 +396,26 @@ def _chunks(count: int, size: int) -> Iterator[slice]:
     return (slice(start, start + size) for start in range(0, count, max(1, size)))
 
 
+def _ragged_chunks(counts: torch.Tensor, size: int) -> Iterator[slice]:
+    """Slices of consecutive rays with at most ``size`` samples in all, given the number of samples of each ray, or
+    single rays with more samples."""
+    total = torch.cumsum(counts, dim=0).cpu()
+    start = 0
+    while start < len(total):
+        before = int(total[start - 1]) if start else 0
+        stop = max(int(torch.searchsorted(total, before + max(1, size), right=True)), start + 1)
+        yield slice(start, stop)
+        start = stop
+
+
+def _ragged(counts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Index of the ray of each sample, and of each sample along its ray, of shape (s,), when rays have given numbers
+    of samples, laid out one ray after another."""
+    ray = torch.repeat_interleave(torch.arange(len(counts), device=counts.device), counts)
+    first = torch.cumsum(counts, dim=0) - counts
+    return ray, torch.arange(len(ray), device=counts.device) - first[ray]
+
+
 def _pack(bits: torch.Tensor) -> torch.Tensor:
     """Pack booleans along the last dimension into bytes, of shape (..., ceil(k / 8))."""
     padded = torch.nn.functional.pad(bits.to(torch.uint8), (0, -bits.shape[-1] % 8))
@@ -408,21 +429,100 @@ def _unpack(packed: torch.Tensor, count: int) -> torch.Tensor:
     return ((packed[..., None] >> shifts) & 1).reshape(*packed.shape[:-1], -1)[..., :count]
 
 
-def _hidden_segments(hidden: torch.Tensor, s: torch.Tensor, offset: int) -> tuple[torch.Tensor, ...]:
-    """Segments of rays along which light is hidden, from its hidden fraction between consecutive points along rays,
-    of shapes (r, m) and (r, m + 1). Runs of points that are entirely hidden are merged into a single segment."""
+def _hidden_segments(
+    hidden: torch.Tensor,
+    ray: torch.Tensor,
+    first: torch.Tensor,
+    last: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    """Segments of rays along which light is hidden, from its hidden fraction along consecutive intervals of rays,
+    laid out one ray after another, given the ray of each interval, whether it is the first or last of its ray, and
+    where it starts and ends, all of shape (s,). Runs of intervals that are entirely hidden are merged."""
     full = hidden >= 1
     partial = (hidden > 0) & ~full
-    edge = torch.zeros_like(full[:, :1])
-    ray, first = (full & ~torch.cat([edge, full[:, :-1]], dim=1)).nonzero(as_tuple=True)
-    last = (full & ~torch.cat([full[:, 1:], edge], dim=1)).nonzero(as_tuple=True)[1]
-    some, index = partial.nonzero(as_tuple=True)
+    edge = torch.zeros_like(full[:1])
+    begin = (full & (first | ~torch.cat([edge, full[:-1]]))).nonzero()[:, 0]
+    end = (full & (last | ~torch.cat([full[1:], edge]))).nonzero()[:, 0]
+    some = partial.nonzero()[:, 0]
     return (
-        torch.cat([ray, some]) + offset,
-        torch.cat([s[ray, first], s[some, index]]),
-        torch.cat([s[ray, last + 1], s[some, index + 1]]),
-        torch.cat([torch.ones_like(first, dtype=hidden.dtype), hidden[some, index]]),
+        torch.cat([ray[begin], ray[some]]),
+        torch.cat([starts[begin], starts[some]]),
+        torch.cat([ends[end], ends[some]]),
+        torch.cat([torch.ones_like(starts[begin]), hidden[some]]),
     )
+
+
+def _snap(points: torch.Tensor, low: torch.Tensor, high: torch.Tensor, size: float) -> torch.Tensor:
+    """Index of the cell of a grid of a given size over a box that contains each point, of shape (...), where points
+    outside of the box are moved to its closest cell."""
+    dims = torch.ceil((high - low) / size).long().clamp_min(1)
+    cell = torch.floor((points - low) / size).nan_to_num(0).clamp(-1, 2**40).long()
+    cell = torch.minimum(cell.clamp_min(0), dims - 1)
+    return cell[..., 0] + dims[0] * (cell[..., 1] + dims[1] * cell[..., 2])
+
+
+def _depth_windows(maps: ShadowMaps, size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Least and greatest depth recorded by the first of shadow maps over the square window of texels of a given size
+    whose first texel is each texel, from ``size`` texels before the map to its end, where texels outside of the map
+    let all light through, each of shape (h + size, w + size)."""
+    height, width = (int(s) for s in maps.shapes[0])
+    offset = int(maps.offsets[0])
+    image = maps.depths[offset : offset + height * width].reshape(1, 1, height, width)
+    image = torch.nn.functional.pad(image, (size, size - 1, size, size - 1), value=torch.inf)
+
+    def pool(values: torch.Tensor) -> torch.Tensor:
+        # Along rows, then columns
+        values = torch.nn.functional.max_pool2d(values, (1, size), stride=1)
+        return torch.nn.functional.max_pool2d(values, (size, 1), stride=1)[0, 0]
+
+    return -pool(-image), pool(image)
+
+
+def _surely_lit(
+    maps: ShadowMaps,
+    windows: tuple[torch.Tensor, torch.Tensor],
+    size: int,
+    origin: torch.Tensor,
+    directions: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    bias: float,
+) -> torch.Tensor:
+    """Whether intervals along rays are entirely lit (1) or hidden (0) by the first of shadow maps, given the depths
+    over windows of its texels from :func:`_depth_windows`, or may be partly hidden (-1), of shape (s,)."""
+    distances = torch.stack([starts, ends], dim=-1)
+    x, y, depth = (c[..., 0] for c in _texel_coordinates(maps, origin, directions, distances, bias))  # (s, 2)
+    least, most = windows
+    # The window from the first texel that filtered lookups read along each axis must also hold the last one
+    x0, y0 = (c.amin(dim=-1).nan_to_num(0).clamp(-size, 2.0**30).floor() for c in (x, y))
+    narrow = (x.amax(dim=-1).floor() + 1 - x0 < size) & (y.amax(dim=-1).floor() + 1 - y0 < size)
+    # Windows beyond the map are moved back to its last texels, which only makes them less likely to be sure
+    rows, columns = least.shape
+    index = (y0.clamp(max=rows - size - 1).long() + size) * columns + x0.clamp(max=columns - size - 1).long() + size
+    lit = narrow & (depth.amax(dim=-1) <= least.reshape(-1)[index])
+    hidden = narrow & (depth.amin(dim=-1) > most.reshape(-1)[index])
+    return torch.where(lit, 1, torch.where(hidden, 0, -1))
+
+
+_DIRECTION_BIN = 0.01
+"""Size of the bins of directions of rays which share the weights of the sky's cells, in units of their components"""
+
+
+def _direction_bins(directions: torch.Tensor, size: float) -> torch.Tensor:
+    """Bin of each unit direction on a grid of a given size over its components, of shape (n,)."""
+    side = 2 * math.ceil(1 / size) + 3
+    index = (torch.floor(directions / size).long() + math.ceil(1 / size) + 1).clamp(0, side - 1)
+    return index[:, 0] + side * (index[:, 1] + side * index[:, 2])
+
+
+def _cell_centers(index: torch.Tensor, low: torch.Tensor, high: torch.Tensor, size: float) -> torch.Tensor:
+    """Center of the cells of the grid of :func:`_snap` with given indices, of shape (u, 3)."""
+    dims = torch.ceil((high - low) / size).long().clamp_min(1)
+    x, rest = index % dims[0], index // dims[0]
+    cell = torch.stack([x, rest % dims[1], rest // dims[1]], dim=-1)
+    return low + (cell.to(low.dtype) + 0.5) * size
 
 
 class SunShadows(NamedTuple):
@@ -467,7 +567,7 @@ class Shadows(NamedTuple):
     """anisotropy of the phase function the following weights were computed with"""
     visible_weights: torch.Tensor
     """sum over the visible cells of each band of the phase function integrated over them, from the middle of each
-    sample, of shape (n, m, b)"""
+    sample, of shape (n, m, b), which is the same as ``weights`` for bands that are entirely visible"""
     weights: torch.Tensor
     """sum over the cells of each band of the phase function integrated over them, of shape (n, b)"""
     weights_below: torch.Tensor
@@ -484,6 +584,7 @@ def trace(
     sun_step: float = 8.0,
     max_sun_samples: int = 1024,
     sky_samples: int = 8,
+    sky_grid: float = 1.0,
     bias: float = 0.5,
     max_depth: float = 12.0,
     memory: float = 2**30,
@@ -493,9 +594,11 @@ def trace(
     Rays are only sampled where objects can cast shadows, i.e. anywhere below them as light comes from above, and as
     long as light scattered there can still reach the camera. Sunlight casts sharp shadows, and is sampled every few
     texels of its map, while the visibility of the sky, which is softened by the many cells it comes from, is sampled
-    more coarsely, at points spread evenly over the light that the medium scatters towards the camera. The result
-    doesn't depend on the medium otherwise, so that it can be reused for media of similar density, whose light is
-    then scattered from roughly the same places.
+    more coarsely, at points spread evenly over the light that the medium scatters towards the camera. Rays close to
+    each other then sample places close to each other, so that these points are snapped to a grid finer than the
+    texels of the sky's maps, and the sky is only looked up once per cell of the grid. The result doesn't depend on
+    the medium otherwise, so that it can be reused for media of similar density, whose light is then scattered from
+    roughly the same places.
 
     Args:
         occlusion (Occlusion): Shadow maps of the scene, on the same device and with the same precision as the rays.
@@ -505,11 +608,13 @@ def trace(
         distance (torch.Tensor): Length of the rays, of shape (n,), which is infinite for rays that hit nothing.
         suns (Sequence[torch.Tensor]): Unit direction towards each sun, of shape (3,). Suns without a shadow map cast
             no shadows.
-        sun_step (float, optional): Distance between samples of sunlight's visibility, in texels of its map.
-            Defaults to 8.
-        max_sun_samples (int, optional): Maximum number of samples of sunlight's visibility along a ray, beyond which
-            samples get further apart. Defaults to 1024.
+        sun_step (float, optional): Length of the intervals of rays over which sunlight's visibility is checked at
+            once, in texels of its map. Those that a shadow's edge may cross are sampled every texel. Defaults to 8.
+        max_sun_samples (int, optional): Maximum number of such intervals along a ray, beyond which they get longer.
+            Defaults to 1024.
         sky_samples (int, optional): Number of samples of the sky's visibility along a ray. Defaults to 8.
+        sky_grid (float, optional): Size of the cells of the grid to which samples of the sky's visibility are
+            snapped, in texels of the finest map of the sky. Defaults to 1.
         bias (float, optional): Depth bias of shadow maps, in texels, see :func:`visibility`. Defaults to 0.5.
         max_depth (float, optional): Optical depth beyond which rays are no longer sampled, as hardly any light
             scattered further reaches the camera. Defaults to 12.
@@ -550,16 +655,34 @@ def trace(
         index = alignment.index(max(alignment))
         maps = select_maps(occlusion.sun_maps, index)
         start, end = segment(height * math.sqrt(1 - sun_z**2) / sun_z)
-        step = sun_step * texels[index]
-        longest = float((end - start).max()) if n else 0.0
-        count = int(min(max(math.ceil(longest / step), 1), max_sun_samples))
-        fraction = torch.linspace(0, 1, count + 1, **kwargs)
-        parts = [torch.zeros(0, dtype=torch.long, device=directions.device)] + [torch.zeros(0, **kwargs)] * 3
-        segments = [parts]
-        for rays in _chunks(n, int(memory // (count * 256))):
-            s = torch.addcmul(start[rays, None], (end - start)[rays, None], fraction)
-            lit = visibility(maps, origin, directions[rays], (s[:, 1:] + s[:, :-1]) / 2, bias)[..., 0]
-            segments.append(list(_hidden_segments(1 - lit, s, rays.start or 0)))
+        # Each ray is split into intervals of a few texels, laid out one ray after another, so that the many rays
+        # that only cross a short stretch where objects can cast shadows have few of them. Intervals that are surely
+        # lit or hidden, as they lie above or below every surface around them, are only looked up once, and the
+        # others, which a shadow's edge may cross, every texel
+        length, texel = end - start, texels[index]
+        counts = torch.ceil(length / (sun_step * texel)).clamp(0, max_sun_samples).long()
+        window = math.ceil(sun_step) + 2
+        windows = _depth_windows(maps, window)
+        empty = [torch.zeros(0, dtype=torch.long, device=directions.device)] + [torch.zeros(0, **kwargs)] * 3
+        segments = [empty]
+        for rays in _ragged_chunks(counts, int(memory // 512)):
+            ray, j = _ragged(counts[rays])
+            ray = ray + (rays.start or 0)
+            total = counts[ray]
+            starts = torch.addcmul(start[ray], length[ray], j / total)
+            ends = torch.addcmul(start[ray], length[ray], (j + 1) / total)
+            sure = _surely_lit(maps, windows, window, origin, directions[ray], starts, ends, bias)
+            segments.append(list(_hidden_segments((sure == 0).to(start), ray, j == 0, j == total - 1, starts, ends)))
+            unsure = (sure < 0).nonzero()[:, 0]
+            steps = torch.ceil((ends - starts)[unsure] / texel).clamp_min(1).long()
+            for part in _ragged_chunks(steps, int(memory // 256)):
+                which, i = _ragged(steps[part])
+                interval, count = unsure[part][which], steps[part][which]
+                below = torch.addcmul(starts[interval], (ends - starts)[interval], i / count)
+                above = torch.addcmul(starts[interval], (ends - starts)[interval], (i + 1) / count)
+                lit = visibility(maps, origin, directions[ray[interval]], ((below + above) / 2)[:, None], bias)
+                refined = _hidden_segments(1 - lit[:, 0, 0], ray[interval], i == 0, i == count - 1, below, above)
+                segments.append(list(refined))
         hidden_suns.append(SunShadows(towards, *(torch.cat(columns) for columns in zip(*segments))))
 
     # Skylight comes from many cells, which smooths out its variations, so it is sampled more coarsely, evenly in the
@@ -567,30 +690,80 @@ def trace(
     # Points beside the objects can have low cells of the sky hidden, even far from them
     edges, counts = occlusion.sky_edges, occlusion.sky_counts
     cells, bands = len(occlusion.sky_maps.texels), len(counts)
-    sky = {
-        "bounds": [torch.zeros(n, 0, **kwargs)],
-        "middles": [torch.zeros(n, 0, **kwargs)],
-        "visible": [torch.zeros(n, 0, 0, dtype=torch.uint8, device=directions.device)],
-        "visible_weights": [torch.zeros(n, 0, bands, **kwargs)],
-        "weights": [torch.zeros(n, bands, **kwargs)],
-        "weights_below": [torch.zeros(n, bands, **kwargs)],
-    }
-    if cells:
-        sky = {name: [] for name in sky}
-        low_mu = (edges[0] + edges[1]) / 2
-        start, end = segment(height * math.sqrt(1 - low_mu**2) / low_mu)
-        first = -torch.expm1(-height_fog_optical_depth(fog, origin, directions, start)[:, None] * beta)
-        last = -torch.expm1(-height_fog_optical_depth(fog, origin, directions, end)[:, None] * beta)
-        fraction = torch.linspace(0, 1, 2 * sky_samples + 1, **kwargs)
-        for rays in _chunks(n, int(memory // (sky_samples * cells * 64))):
-            y = torch.addcmul(first[rays], last[rays] - first[rays], fraction).clamp_max(1 - 1e-7)
-            at = _distance_at(fog, origin_z, v_z[rays], -torch.log1p(-y) / beta)
-            lit = visibility(occlusion.sky_maps, origin, directions[rays], at[:, 1::2], bias, filtered=False) > 0.5
-            weights = _band_weights(edges, counts, medium.anisotropy, directions[rays], lit.to(directions.dtype))
-            for name, value in zip(sky, (at[:, 0::2], at[:, 1::2], _pack(lit), *weights)):
-                sky[name].append(value.contiguous())
-    fields = {name: torch.cat(values) for name, values in sky.items()}
-    return Shadows(n, tuple(hidden_suns), sky_edges=edges, sky_counts=counts, anisotropy=medium.anisotropy, **fields)
+    if not cells:
+        empty = torch.zeros(n, 0, **kwargs)
+        return Shadows(
+            n,
+            tuple(hidden_suns),
+            bounds=empty,
+            middles=empty,
+            visible=torch.zeros(n, 0, 0, dtype=torch.uint8, device=directions.device),
+            sky_edges=edges,
+            sky_counts=counts,
+            anisotropy=medium.anisotropy,
+            visible_weights=torch.zeros(n, 0, bands, **kwargs),
+            weights=torch.zeros(n, bands, **kwargs),
+            weights_below=torch.zeros(n, bands, **kwargs),
+        )
+    low_mu = (edges[0] + edges[1]) / 2
+    margin = height * math.sqrt(1 - low_mu**2) / low_mu
+    start, end = segment(margin)
+    first = -torch.expm1(-height_fog_optical_depth(fog, origin, directions, start)[:, None] * beta)
+    last = -torch.expm1(-height_fog_optical_depth(fog, origin, directions, end)[:, None] * beta)
+    y = torch.addcmul(first, last - first, torch.linspace(0, 1, 2 * sky_samples + 1, **kwargs)).clamp_max(1 - 1e-7)
+    at = _distance_at(fog, origin_z, v_z, -torch.log1p(-y) / beta)
+    bounds, middles = at[:, 0::2].contiguous(), at[:, 1::2].contiguous()
+
+    # The weights of the sky's cells only depend on the direction of rays, and are shared by rays of similar directions
+    bins, ray_bin = torch.unique(_direction_bins(directions, _DIRECTION_BIN), return_inverse=True)  # (d,), (n,)
+    mean = torch.zeros(len(bins), 3, **kwargs).index_add_(0, ray_bin, directions)
+    mean = torch.nn.functional.normalize(mean, dim=-1)
+    one_hot = _band_one_hot(counts, **kwargs)
+    phases = cell_phases(edges, counts, medium.anisotropy, mean)  # (d, k)
+    weights_below = (cell_phases(edges, counts, medium.anisotropy, mean, below=True) @ one_hot)[ray_bin]
+
+    # Rays close to each other also sample places close to each other, so that points are snapped to a grid finer than
+    # the maps' texels, and the sky's visibility is only looked up once per cell of the grid
+    size = sky_grid * float(occlusion.sky_maps.texels.min())
+    pad = torch.as_tensor([margin, margin, 0.0], **kwargs)
+    box = (torch.cat([low[:2], low.new_full((1,), lowest)]) - pad, high + pad)
+    grid = [_snap(origin + directions[rays, None] * middles[rays, ..., None], *box, size) for rays in _chunks(n, 2**20)]
+    used, grid_cell = torch.unique(torch.cat(grid), return_inverse=True)  # (v,), (n, m)
+    zero, chunk = torch.zeros_like(origin), int(memory // (cells * 64))
+    packed = []
+    for part in _chunks(len(used), chunk):
+        centers = _cell_centers(used[part], *box, size)
+        lit = visibility(occlusion.sky_maps, zero, centers, torch.ones_like(centers[:, :1]), bias, filtered=False)
+        packed.append(_pack(lit[:, 0] > 0.5))
+    visible = torch.cat(packed)
+
+    # Samples in the same cell of the grid, along rays of similar directions, see the same fraction of each band
+    groups, group = torch.unique(grid_cell * len(bins) + ray_bin[:, None], return_inverse=True)  # (u,), (n, m)
+    fractions = []
+    for part in _chunks(len(groups), chunk):
+        lit = _unpack(visible[groups[part] // len(bins)], cells).to(directions.dtype)
+        weighted = phases[groups[part] % len(bins)]
+        fractions.append(_ratio((lit * weighted) @ one_hot, weighted @ one_hot))
+    weights = (phases @ one_hot)[ray_bin]
+    return Shadows(
+        n,
+        tuple(hidden_suns),
+        bounds=bounds,
+        middles=middles,
+        visible=visible[grid_cell],
+        sky_edges=edges,
+        sky_counts=counts,
+        anisotropy=medium.anisotropy,
+        visible_weights=torch.cat(fractions)[group] * weights[:, None],
+        weights=weights,
+        weights_below=weights_below,
+    )
+
+
+def _band_one_hot(counts: Sequence[int], dtype: torch.dtype, device: torch.device | str | None) -> torch.Tensor:
+    """Band of each cell of the sky, one-hot encoded, of shape (k, b)."""
+    bands = torch.repeat_interleave(torch.arange(len(counts), device=device), torch.as_tensor(counts, device=device))
+    return torch.nn.functional.one_hot(bands, len(counts)).to(dtype)
 
 
 def _band_weights(
@@ -598,9 +771,7 @@ def _band_weights(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Phase function integrated over the visible cells of each band from points along rays, given the visibility of
     each cell, of shape (r, m, k), over all the cells of each band, and over the cells mirrored below the horizon."""
-    device = directions.device
-    bands = torch.repeat_interleave(torch.arange(len(counts), device=device), torch.as_tensor(counts, device=device))
-    one_hot = torch.nn.functional.one_hot(bands, len(counts)).to(directions.dtype)  # (k, b)
+    one_hot = _band_one_hot(counts, directions.dtype, directions.device)  # (k, b)
     phases = cell_phases(edges, counts, g, directions)  # (r, k)
     below = cell_phases(edges, counts, g, directions, below=True) @ one_hot
     return torch.bmm(lit, phases[:, :, None] * one_hot), phases @ one_hot, below
@@ -759,6 +930,7 @@ def occluded_inscatter(
     sun_step: float = 8.0,
     max_sun_samples: int = 1024,
     sky_samples: int = 8,
+    sky_grid: float = 1.0,
     bias: float = 0.5,
     max_depth: float = 12.0,
     memory: float = 2**30,
@@ -780,11 +952,13 @@ def occluded_inscatter(
             :func:`tabulate_along_rays <visionsim.medium.scattering.tabulate_along_rays>`.
         scattering (ScatteringTable | None, optional): Light scattered more than once, needed to occlude the
             "scattered" table, which is otherwise not occluded. Defaults to None.
-        sun_step (float, optional): Distance between samples of sunlight's visibility, in texels of its map.
-            Defaults to 8.
-        max_sun_samples (int, optional): Maximum number of samples of sunlight's visibility along a ray, beyond which
-            samples get further apart. Defaults to 1024.
+        sun_step (float, optional): Length of the intervals of rays over which sunlight's visibility is checked at
+            once, in texels of its map. Those that a shadow's edge may cross are sampled every texel. Defaults to 8.
+        max_sun_samples (int, optional): Maximum number of such intervals along a ray, beyond which they get longer.
+            Defaults to 1024.
         sky_samples (int, optional): Number of samples of the sky's visibility along a ray. Defaults to 8.
+        sky_grid (float, optional): Size of the cells of the grid to which samples of the sky's visibility are
+            snapped, in texels of the finest map of the sky. Defaults to 1.
         bias (float, optional): Depth bias of shadow maps, in texels, see :func:`visibility`. Defaults to 0.5.
         max_depth (float, optional): Optical depth beyond which rays are no longer sampled, as hardly any light
             scattered further reaches the camera. Defaults to 12.
@@ -804,6 +978,7 @@ def occluded_inscatter(
         sun_step=sun_step,
         max_sun_samples=max_sun_samples,
         sky_samples=sky_samples,
+        sky_grid=sky_grid,
         bias=bias,
         max_depth=max_depth,
         memory=memory,

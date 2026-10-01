@@ -132,10 +132,13 @@ around them, such as the fog in front of a wall. Both are modeled with shadow ma
 scene rendered by Cycles along the direction of each sun, and along the central direction of each of the cells into
 which the sky is split. Visibility is sampled along each ray where objects can cast shadows, and the closed-form
 integral of each source between consecutive samples is weighted by the visibility in between, so the result stays
-deterministic, and exact wherever nothing is occluded. Sunlight is sampled every few texels of its map, as its shadows
-are sharp, whereas skylight and light scattered more than once are sampled more coarsely, as each point is lit by many
-cells, each weighted by how much light it scatters towards the camera. See :mod:`visionsim.medium.occlusion` for
-details.
+deterministic, and exact wherever nothing is occluded. The shadows of suns are sharp: rays are split into intervals of
+a few texels of the sun's map, intervals that lie entirely above or below the surfaces recorded around them are lit or
+hidden as a whole, and the others, which the edge of a shadow may cross, are sampled every texel. Skylight and light
+scattered more than once are sampled more coarsely, as each point is lit by many cells, each weighted by how much
+light it scatters towards the camera. As rays close to each other sample places close to each other, these places are
+snapped to a grid finer than the texels of the sky's maps, whose cells are each looked up once. See
+:mod:`visionsim.medium.occlusion` for details.
 
 |
 
