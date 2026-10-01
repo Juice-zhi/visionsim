@@ -10,7 +10,7 @@ import numpy.typing as npt
 import torch
 
 from visionsim.medium.model import HeightFog, Lighting, Medium
-from visionsim.medium.occlusion import Occlusion, occluded_inscatter, occlusion_to
+from visionsim.medium.occlusion import Occlusion, Shadows, occlusion_to, shade, shadows_to, trace
 from visionsim.medium.optics import (
     _per_channel,
     height_fog_sun_inscatter,
@@ -120,6 +120,7 @@ def apply_medium(
     background_depth: float = 1e9,
     table_size: tuple[int, int] = TABLE_SIZE,
     occlusion: Occlusion | None = None,
+    shadows: Shadows | None = None,
     shadow_step: float = 8.0,
     shadow_samples: int = 8,
     device: torch.device | str | None = None,
@@ -162,6 +163,9 @@ def apply_medium(
         occlusion (Occlusion | None, optional): Shadow maps of the scene, see :func:`load_occlusion
             <visionsim.medium.occlusion.load_occlusion>`, through which objects cast shadows onto the medium. This
             requires ``sun_attenuation``. Defaults to None.
+        shadows (Shadows | None, optional): Shadows already traced along the rays of this frame by
+            :func:`trace_shadows`, which avoids tracing them again when adding several media to the same frame. Takes
+            precedence over ``occlusion``. Defaults to None.
         shadow_step (float, optional): Distance between samples of the visibility of suns along rays, in texels of
             their shadow maps. Defaults to 8.
         shadow_samples (int, optional): Number of samples of the visibility of the sky along each ray.
@@ -207,7 +211,7 @@ def apply_medium(
     sky = medium.albedo * _per_channel(lighting.sky, n, "sky", **kwargs)
     attenuated_suns = []
 
-    if occlusion is not None and not medium.sun_attenuation:
+    if (occlusion is not None or shadows is not None) and not medium.sun_attenuation:
         raise ValueError("Shadows can only be cast onto media that attenuate sunlight, see `Medium.sun_attenuation`.")
 
     for sun in lighting.suns:
@@ -247,7 +251,7 @@ def apply_medium(
         def tabulate(source: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]):
             return tabulate_along_rays(source, origin_extinction[channels] * fog.falloff, table_size)
 
-        if occlusion is None:
+        if occlusion is None and shadows is None:
             args = (origin_extinction, fog.falloff, directions[..., 2:3], distance[..., None])
             for towards_sun, color in attenuated_suns:
                 phase = henyey_greenstein(directions @ towards_sun, medium.anisotropy)[..., None]
@@ -255,20 +259,26 @@ def apply_medium(
             if source := elevation_source(medium, lighting, beta[channels], n):
                 inscatter = inscatter + lookup(tabulate(source), directions[..., 2], tau[..., channels])
         else:
+            rays, lengths = directions.reshape(-1, 3), distance.reshape(-1)
+            if shadows is None:
+                assert occlusion is not None
+                towards = [towards_sun for towards_sun, _ in attenuated_suns]
+                occlusion = occlusion_to(occlusion, device=device, dtype=dtype)
+                shadows = trace(
+                    occlusion, medium, origin, rays, lengths, towards, sun_step=shadow_step, sky_samples=shadow_samples
+                )
             sources = elevation_sources(medium, lighting, beta[channels], n)
             scattered = medium.multiple_scattering and "scattered" in sources
-            shaded = occluded_inscatter(
-                occlusion_to(occlusion, device=device, dtype=dtype),
+            shaded = shade(
+                shadows_to(shadows, device=device, dtype=dtype),
                 medium,
                 origin,
-                directions.reshape(-1, 3),
-                distance.reshape(-1),
+                rays,
+                lengths,
                 beta[channels],
                 suns=attenuated_suns,
                 tables={name: tabulate(source) for name, source in sources.items()},
                 scattering=cached_multiple_scattering(medium, lighting, beta[channels], n) if scattered else None,
-                sun_step=shadow_step,
-                sky_samples=shadow_samples,
             )
             inscatter = inscatter + shaded.reshape(*distance.shape, -1)
 
@@ -293,4 +303,73 @@ def apply_medium(
         transmittance=transmittance,
         optical_depth=tau,
         inscatter=inscatter,
+    )
+
+
+def trace_shadows(
+    occlusion: Occlusion,
+    depth: npt.ArrayLike | torch.Tensor,
+    camera: Mapping[str, Any],
+    transform_matrix: npt.ArrayLike,
+    medium: Medium,
+    lighting: Lighting,
+    background_depth: float = 1e9,
+    shadow_step: float = 8.0,
+    shadow_samples: int = 8,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.float64,
+) -> Shadows:
+    """Trace where objects hide suns and the sky along the rays of a frame, to add several media to it.
+
+    Tracing shadows takes most of the time of :func:`apply_medium` with shadow maps, but doesn't depend on the medium,
+    so it can be done once per frame and reused for media of similar density, whose light is scattered from roughly
+    the same places along rays, see :func:`trace <visionsim.medium.occlusion.trace>`. For instance, to render a frame
+    with fogs of several visibilities::
+
+        shadows = trace_shadows(occlusion, depth, camera, pose, media[0], lighting)
+        frames = [apply_medium(radiance, depth, camera, pose, m, lighting, shadows=shadows) for m in media]
+
+    Args:
+        occlusion (Occlusion): Shadow maps of the scene, see :func:`load_occlusion
+            <visionsim.medium.occlusion.load_occlusion>`.
+        depth (npt.ArrayLike | torch.Tensor): Depth of the scene, as given to :func:`apply_medium`.
+        camera (Mapping[str, Any]): Camera intrinsics, see :func:`camera_rays`.
+        transform_matrix (npt.ArrayLike): Camera-to-world transform, see :func:`camera_rays`.
+        medium (Medium): Participating medium, made of a single height fog, which sets where rays are sampled.
+        lighting (Lighting): Lighting of the medium, whose suns cast shadows.
+        background_depth (float, optional): Depth from which pixels are considered to see the background.
+            Defaults to 1e9.
+        shadow_step (float, optional): Distance between samples of the visibility of suns along rays, in texels of
+            their shadow maps. Defaults to 8.
+        shadow_samples (int, optional): Number of samples of the visibility of the sky along each ray.
+            Defaults to 8.
+        device (torch.device | str | None, optional): Device to run on. Defaults to None (CPU).
+        dtype (torch.dtype, optional): Floating point precision. Defaults to torch.float64.
+
+    Raises:
+        ValueError: raised if the medium doesn't attenuate sunlight, or if the depth doesn't match the camera.
+
+    Returns:
+        Shadows: Where suns and cells of the sky are hidden along each ray, to be given to :func:`apply_medium`.
+    """
+    if not medium.sun_attenuation:
+        raise ValueError("Shadows can only be cast onto media that attenuate sunlight, see `Medium.sun_attenuation`.")
+    kwargs: dict[str, Any] = {"dtype": dtype, "device": device}
+    depth = depth.to(**kwargs) if torch.is_tensor(depth) else torch.tensor(np.asarray(depth), **kwargs)
+    depth = depth[..., 0] if depth.ndim == 3 else depth
+    origin, directions, scale = camera_rays(camera, transform_matrix, **kwargs)
+    if depth.shape != directions.shape[:2]:
+        raise ValueError(f"Depth {tuple(depth.shape)} does not match the camera's resolution.")
+    background = ~torch.isfinite(depth) | (depth >= background_depth)
+    distance = torch.where(background, torch.full_like(depth, torch.inf), depth * scale)
+    towards = [torch.as_tensor(sun.direction, **kwargs) for sun in lighting.suns]
+    return trace(
+        occlusion_to(occlusion, device=device, dtype=dtype),
+        medium,
+        origin,
+        directions.reshape(-1, 3),
+        distance.reshape(-1),
+        [t / t.norm() for t in towards],
+        sun_step=shadow_step,
+        sky_samples=shadow_samples,
     )

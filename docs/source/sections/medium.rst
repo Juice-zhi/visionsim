@@ -44,6 +44,14 @@ of the scene by adding ``--config.include-occlusion`` when rendering, and exclud
 otherwise make the maps span all of it, with ``--config.occlusion.exclude Plane``. ``medium.apply`` then uses the
 ``occlusion.npz`` it finds in the renders.
 
+Tracing where objects hide the lights along the rays of a frame takes most of the time of shadows, but doesn't depend
+on the medium. To add several media to the same frame, such as fogs of different visibilities, trace shadows once with
+:func:`trace_shadows <visionsim.medium.render.trace_shadows>` and pass them to :func:`apply_medium
+<visionsim.medium.render.apply_medium>` as ``shadows``, which then only integrates each medium. As skylight is sampled
+where the medium the shadows were traced with scatters light, this is approximate for media of other densities: in
+``examples/medium``, the light scattered by fogs from a quarter to four times as dense differs by less than 0.4% from
+tracing shadows for each of them.
+
 |
 
 Describing a medium

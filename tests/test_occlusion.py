@@ -8,11 +8,13 @@ import torch
 from tests.test_medium import make_render
 from visionsim.cli.medium import apply
 from visionsim.dataset import Dataset
-from visionsim.medium import Lighting, Medium, Sun, apply_medium
+from visionsim.medium import Lighting, Medium, Sun, apply_medium, trace_shadows
 from visionsim.medium.model import HeightFog
 from visionsim.medium.occlusion import (
     Occlusion,
     ShadowMaps,
+    _pack,
+    _unpack,
     band_attenuation,
     cell_phases,
     load_occlusion,
@@ -244,6 +246,58 @@ def test_without_occluders_shadows_change_nothing(device):
     expected = apply_medium(radiance, depth, camera, pose, medium, lighting, device=device)
     result = apply_medium(radiance, depth, camera, pose, medium, lighting, occlusion=occlusion, device=device)
     assert torch.allclose(result.radiance, expected.radiance, rtol=1e-10, atol=1e-12)
+
+
+def test_pack_bits():
+    bits = torch.rand(3, 5, 19) > 0.5
+    packed = _pack(bits)
+    assert packed.dtype == torch.uint8 and packed.shape == (3, 5, 3)
+    assert torch.equal(_unpack(packed, 19), bits.to(torch.uint8))
+
+
+def demo_scene():
+    """Fog in front of a camera looking along +y at a box, lit by a low sun and the sky, with shadow maps."""
+    lighting = Lighting(sky=SKY, suns=[Sun(direction=(0.6, -0.3, 0.5), irradiance=(4.0,))], ground_albedo=(0.3,) * 3)
+    sun = np.array(lighting.suns[0].direction) / np.linalg.norm(lighting.suns[0].direction)
+    bounds = [[-2.0, 10.0, 0.0], [2.0, 14.0, 4.0]]
+    roof = rectangle(4.0, (-2, 2), (10, 14))
+    occlusion = occlusion_of(
+        render_maps([sun], bounds, roof, 256),
+        [sun],
+        render_maps(sky_cell_directions(EDGES, CELLS), bounds, roof, 64),
+        bounds,
+    )
+    camera = {"w": 24, "h": 16, "fl_x": 12.0, "fl_y": 12.0, "cx": 12.0, "cy": 8.0}
+    pose = np.eye(4)
+    pose[:3, :3] = [[1, 0, 0], [0, 0, -1], [0, 1, 0]]  # looking along +y
+    pose[:3, 3] = [0.0, 0.0, 1.6]
+    depth = np.full((16, 24), 30.0)
+    depth[:4] = 1e10  # the top rows see the sky
+    return occlusion, lighting, camera, pose, depth, np.full((16, 24, 3), 0.2)
+
+
+def test_reused_shadows():
+    """Shadows traced once give the same frame as tracing them along with the medium, and most of the shadows of media
+    of similar density."""
+    occlusion, lighting, camera, pose, depth, radiance = demo_scene()
+    medium = FOG.model_copy(update={"multiple_scattering": True})
+    shadows = trace_shadows(occlusion, depth, camera, pose, medium, lighting)
+    traced = apply_medium(radiance, depth, camera, pose, medium, lighting, occlusion=occlusion)
+    reused = apply_medium(radiance, depth, camera, pose, medium, lighting, shadows=shadows)
+    assert torch.allclose(reused.radiance, traced.radiance, rtol=1e-10, atol=1e-12)
+    unoccluded = apply_medium(radiance, depth, camera, pose, medium, lighting)
+    assert not torch.allclose(reused.inscatter, unoccluded.inscatter, rtol=1e-2)
+
+    # Fog that's a bit denser scatters light from about the same places, so the same shadows mostly fit it, but the
+    # samples of the sky's visibility were placed for the other fog, here about 10% of the shadows' effect
+    denser = medium.model_copy(update={"extinction": 1.5 * medium.extinction})
+    own = apply_medium(radiance, depth, camera, pose, denser, lighting, occlusion=occlusion)
+    borrowed = apply_medium(radiance, depth, camera, pose, denser, lighting, shadows=shadows)
+    shadowed = (apply_medium(radiance, depth, camera, pose, denser, lighting).inscatter - own.inscatter).abs().sum()
+    assert (borrowed.inscatter - own.inscatter).abs().sum() < 0.2 * shadowed
+
+    with pytest.raises(ValueError, match="traced along"):
+        apply_medium(radiance[:8], depth[:8], camera | {"h": 8}, pose, medium, lighting, shadows=shadows)
 
 
 def test_occlusion_requires_attenuated_sunlight():
