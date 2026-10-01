@@ -12,6 +12,14 @@ visionsim.medium.model module
    :show-inheritance:
    :undoc-members:
 
+visionsim.medium.occlusion module
+---------------------------------
+
+.. automodule:: visionsim.medium.occlusion
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 visionsim.medium.optics module
 ------------------------------
 

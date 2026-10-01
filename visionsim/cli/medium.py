@@ -25,6 +25,7 @@ def apply(
     output_dir: Path,
     medium: Path,
     lighting: Path | None = None,
+    occlusion: Path | None = None,
     frames: str = "frames",
     depths: str = "depths",
     wavelengths: tuple[float, ...] | None = None,
@@ -44,6 +45,9 @@ def apply(
         medium: path to a JSON file describing the medium, see :class:`Medium <visionsim.medium.model.Medium>`
         lighting: path to a JSON file describing the lighting, see :class:`Lighting <visionsim.medium.model.Lighting>`.
             Defaults to the ``lighting.json`` saved in ``input_dir`` when rendering with ``--include-lighting``
+        occlusion: path to the shadow maps through which objects cast shadows onto the medium, see
+            :mod:`visionsim.medium.occlusion`. Defaults to the ``occlusion.npz`` saved in ``input_dir`` when rendering
+            with ``--include-occlusion``, if any. Only used by media that attenuate sunlight
         frames: name of the directory containing frames within ``input_dir``, these should be linear (EXR/HDR)
             as tonemapped frames have clipped highlights
         depths: name of the directory containing depth maps within ``input_dir``
@@ -59,6 +63,7 @@ def apply(
     from visionsim.cli import _log
     from visionsim.dataset import Dataset, Metadata
     from visionsim.medium import Blob, Lighting, Medium, apply_medium
+    from visionsim.medium.occlusion import load_occlusion
     from visionsim.utils.color import LINEAR_EXTENSIONS, to_linearrgb
     from visionsim.utils.progress import ElapsedProgress
 
@@ -76,9 +81,14 @@ def apply(
         )
     medium_spec = Medium.model_validate_json(Path(medium).read_text())
     lighting_spec = Lighting.model_validate_json(lighting.read_text())
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    if lighting_spec.points:
-        _log.warning(f"Ignoring {len(lighting_spec.points)} point light(s), as these are not yet supported.")
+    if occlusion is None and (input_dir / "occlusion.npz").exists():
+        occlusion = input_dir / "occlusion.npz"
+    if occlusion is not None and not medium_spec.sun_attenuation:
+        _log.warning("Ignoring shadow maps, as the medium does not attenuate sunlight, see `sun_attenuation`.")
+        occlusion = None
+    shadows = load_occlusion(occlusion, device=device, dtype=torch.float64) if occlusion is not None else None
 
     ds_frames = Dataset.from_path(input_dir / frames)
     ds_depths = Dataset.from_path(input_dir / depths)
@@ -92,7 +102,6 @@ def apply(
     if not fps and any(isinstance(c, Blob) and any(c.velocity) for c in medium_spec.components):
         raise ValueError("The medium moves but the frame rate is unknown, please specify it with `--fps`.")
 
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     outputs: dict[str, list[dict]] = {"frames": [], "transmittance": [], "optical-depth": [], "inscatter": []}
 
     with ElapsedProgress() as progress:
@@ -120,6 +129,7 @@ def apply(
                 lighting_spec,
                 wavelengths=wavelengths,
                 time=i / fps if fps else 0.0,
+                occlusion=shadows,
                 device=device,
             )
             relative = path.relative_to(ds_frames.root or "").with_suffix(".exr")

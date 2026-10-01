@@ -80,6 +80,8 @@ def render_job(
     if config.include_lighting:
         # All clients load the same scene, so a single one saves its lighting
         (client[0] if isinstance(client, BlenderClients) else client).save_lighting()
+    if config.include_occlusion:
+        (client[0] if isinstance(client, BlenderClients) else client).save_occlusion(**asdict(config.occlusion))
 
     if config.unbind_camera:
         client.unbind_camera()

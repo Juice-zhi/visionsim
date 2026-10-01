@@ -10,7 +10,7 @@ from docstring_parser import parse_from_object
 from visionsim.cli import _cli_modules
 from visionsim.dataset import dataset, models
 from visionsim.interpolate import pose
-from visionsim.medium import model, optics, raymarch, render, scattering, transient
+from visionsim.medium import model, occlusion, optics, raymarch, render, scattering, transient
 from visionsim.simulate import blender, config, install, job, schema
 
 
@@ -59,7 +59,22 @@ def test_output_configs(func, conf):
     [
         pytest.param(m, id=f"{mod.__name__}.{m.__qualname__}")
         for mod in _cli_modules
-        + [blender, install, job, schema, dataset, models, pose, model, optics, render, raymarch, scattering, transient]
+        + [
+            blender,
+            install,
+            job,
+            schema,
+            dataset,
+            models,
+            pose,
+            model,
+            occlusion,
+            optics,
+            render,
+            raymarch,
+            scattering,
+            transient,
+        ]
         for m in get_public_members(mod)
     ],
 )

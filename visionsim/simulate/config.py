@@ -154,6 +154,18 @@ class PointsConfig:
 
 
 @dataclass
+class OcclusionConfig:
+    """For more information see :meth:`save_occlusion <visionsim.simulate.blender.BlenderService.exposed_save_occlusion>`."""
+
+    exclude: tuple[str, ...] = ()
+    """Names of objects that do not cast shadows onto participating media, typically a large ground plane"""
+    sun_resolution: int = 2048
+    """Number of texels along the longest side of the shadow maps of suns"""
+    sky_resolution: int = 512
+    """Number of texels along the longest side of the shadow maps of the sky"""
+
+
+@dataclass
 class RenderConfig:
     executable: Path | None = None
     """Path to blender executable"""
@@ -205,6 +217,11 @@ class RenderConfig:
     """Point maps configuration options"""
     include_lighting: bool = False
     """If true, save the scene's lighting to ``lighting.json``, as needed to add participating media with ``medium.apply``"""
+    include_occlusion: bool = False
+    """If true, save shadow maps of the scene to ``occlusion.npz``, through which its objects cast shadows onto
+    participating media added with ``medium.apply``. Objects should be static"""
+    occlusion: OcclusionConfig = field(default_factory=OcclusionConfig)
+    """Shadow maps configuration options"""
     include_all: bool = False
     """If true, enable all ground truth outputs"""
     previews: bool = True

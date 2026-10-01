@@ -10,6 +10,7 @@ import numpy.typing as npt
 import torch
 
 from visionsim.medium.model import HeightFog, Lighting, Medium
+from visionsim.medium.occlusion import Occlusion, occluded_inscatter, occlusion_to
 from visionsim.medium.optics import (
     _per_channel,
     height_fog_sun_inscatter,
@@ -18,7 +19,14 @@ from visionsim.medium.optics import (
     point_light_inscatter,
     sky_quadrature,
 )
-from visionsim.medium.scattering import TABLE_SIZE, elevation_source, lookup, tabulate_along_rays
+from visionsim.medium.scattering import (
+    TABLE_SIZE,
+    cached_multiple_scattering,
+    elevation_source,
+    elevation_sources,
+    lookup,
+    tabulate_along_rays,
+)
 
 RGB_WAVELENGTHS: tuple[float, float, float] = (610.0, 550.0, 465.0)
 """Approximate effective wavelengths, in nm, of the red, green and blue channels of linear sRGB images"""
@@ -111,6 +119,9 @@ def apply_medium(
     time: float = 0.0,
     background_depth: float = 1e9,
     table_size: tuple[int, int] = TABLE_SIZE,
+    occlusion: Occlusion | None = None,
+    shadow_step: float = 8.0,
+    shadow_samples: int = 8,
     device: torch.device | str | None = None,
     dtype: torch.dtype = torch.float64,
 ) -> MediumResult:
@@ -121,14 +132,15 @@ def apply_medium(
     marching, light that reaches the medium from many directions (from the sky, from the ground, and light scattered
     more than once) is integrated once per frame along rays of every elevation and interpolated, see
     :mod:`visionsim.medium.scattering`, and light from point lights is integrated with a quadrature that removes its
-    singularity, see :func:`point_light_inscatter <visionsim.medium.optics.point_light_inscatter>`. The result is
-    deterministic and noise-free for the given model, which makes it suitable as the common input of all sensor
-    emulators, which then only add their own noise.
+    singularity, see :func:`point_light_inscatter <visionsim.medium.optics.point_light_inscatter>`. When shadow maps of
+    the scene are given, objects cast shadows onto the medium (light shafts) and hide part of the sky from it, see
+    :mod:`visionsim.medium.occlusion`. The result is deterministic and noise-free for the given model, which makes it
+    suitable as the common input of all sensor emulators, which then only add their own noise.
 
     Note:
-        Shadows cast onto the medium (light shafts) and the dimming of surfaces lit through the medium are not yet
-        modeled, and light from point lights is only scattered once. The sky is assumed to have a uniform radiance
-        above the horizon, and to be occluded by the ground below it.
+        The dimming of surfaces lit through the medium is not yet modeled, light from point lights is only scattered
+        once and isn't occluded, and neither is light reflected by the ground into the medium. The sky is assumed to
+        have a uniform radiance above the horizon, and to be occluded by the ground below it.
 
     Args:
         radiance (npt.ArrayLike | torch.Tensor): Linear radiance of the scene without the medium, of shape (h, w, c).
@@ -147,6 +159,13 @@ def apply_medium(
         table_size (tuple[int, int], optional): Number of elevations and optical depths at which light from the sky,
             the ground and multiple scattering is tabulated along rays. Defaults to :data:`TABLE_SIZE
             <visionsim.medium.scattering.TABLE_SIZE>`.
+        occlusion (Occlusion | None, optional): Shadow maps of the scene, see :func:`load_occlusion
+            <visionsim.medium.occlusion.load_occlusion>`, through which objects cast shadows onto the medium. This
+            requires ``sun_attenuation``. Defaults to None.
+        shadow_step (float, optional): Distance between samples of the visibility of suns along rays, in texels of
+            their shadow maps. Defaults to 8.
+        shadow_samples (int, optional): Number of samples of the visibility of the sky along each ray.
+            Defaults to 8.
         device (torch.device | str | None, optional): Device to run on. Defaults to None (CPU).
         dtype (torch.dtype, optional): Floating point precision. Defaults to torch.float64.
 
@@ -188,16 +207,21 @@ def apply_medium(
     sky = medium.albedo * _per_channel(lighting.sky, n, "sky", **kwargs)
     attenuated_suns = []
 
+    if occlusion is not None and not medium.sun_attenuation:
+        raise ValueError("Shadows can only be cast onto media that attenuate sunlight, see `Medium.sun_attenuation`.")
+
     for sun in lighting.suns:
         towards_sun = torch.as_tensor(sun.direction, **kwargs)
         towards_sun = towards_sun / towards_sun.norm()
-        phase = henyey_greenstein(directions @ towards_sun, medium.anisotropy)[..., None]
         irradiance = _per_channel(sun.irradiance, n, "sun irradiance", **kwargs)
 
         if medium.sun_attenuation:
-            attenuated_suns.append((float(towards_sun[2]), medium.albedo * phase * irradiance))
+            attenuated_suns.append((towards_sun, medium.albedo * irradiance))
         else:
-            source = source + medium.albedo * phase * irradiance
+            source = (
+                source
+                + medium.albedo * henyey_greenstein(directions @ towards_sun, medium.anisotropy)[..., None] * irradiance
+            )
 
     # Skylight comes from the upper hemisphere only, weighted by how much the phase function sends it to the camera
     lit_by_sky = bool((sky != 0).any())
@@ -213,19 +237,40 @@ def apply_medium(
         fog = medium.components[0]
         assert isinstance(fog, HeightFog)
         origin_extinction = beta * fog.density * torch.exp(-(origin[2] - fog.base_height) / fog.falloff)
-        args = (origin_extinction, fog.falloff, directions[..., 2:3], distance[..., None])
-
-        for sun_z, weight in attenuated_suns:
-            inscatter = inscatter + weight * height_fog_sun_inscatter(tau, *args, sun_z)
+        # When extinction doesn't depend on wavelength, as for fog, integrals are the same for every channel, up to
+        # the color of the light
+        channels = slice(0, 1) if bool((beta == beta[0]).all()) else slice(None)
 
         # Light from the sky, the ground and the fog itself reaches the fog from many directions, so that the light
         # scattered towards a ray only depends on its elevation: it is integrated along rays of every elevation once,
-        # and interpolated for each pixel. When extinction doesn't depend on wavelength, as for fog, the integral is
-        # the same for every channel, up to the color of the light
-        channels = slice(0, 1) if bool((beta == beta[0]).all()) else slice(None)
-        if source := elevation_source(medium, lighting, beta[channels], n):
-            table = tabulate_along_rays(source, origin_extinction[channels] * fog.falloff, table_size)
-            inscatter = inscatter + lookup(table, directions[..., 2], tau[..., channels])
+        # and interpolated for each pixel
+        def tabulate(source: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]):
+            return tabulate_along_rays(source, origin_extinction[channels] * fog.falloff, table_size)
+
+        if occlusion is None:
+            args = (origin_extinction, fog.falloff, directions[..., 2:3], distance[..., None])
+            for towards_sun, color in attenuated_suns:
+                phase = henyey_greenstein(directions @ towards_sun, medium.anisotropy)[..., None]
+                inscatter = inscatter + color * phase * height_fog_sun_inscatter(tau, *args, float(towards_sun[2]))
+            if source := elevation_source(medium, lighting, beta[channels], n):
+                inscatter = inscatter + lookup(tabulate(source), directions[..., 2], tau[..., channels])
+        else:
+            sources = elevation_sources(medium, lighting, beta[channels], n)
+            scattered = medium.multiple_scattering and "scattered" in sources
+            shaded = occluded_inscatter(
+                occlusion_to(occlusion, device=device, dtype=dtype),
+                medium,
+                origin,
+                directions.reshape(-1, 3),
+                distance.reshape(-1),
+                beta[channels],
+                suns=attenuated_suns,
+                tables={name: tabulate(source) for name, source in sources.items()},
+                scattering=cached_multiple_scattering(medium, lighting, beta[channels], n) if scattered else None,
+                sun_step=shadow_step,
+                sky_samples=shadow_samples,
+            )
+            inscatter = inscatter + shaded.reshape(*distance.shape, -1)
 
     # Point lights shine with a radiant intensity of a quarter of their power per steradian, as in Cycles
     for light in lighting.points:

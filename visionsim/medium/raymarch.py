@@ -79,6 +79,8 @@ def ray_march_medium(
     in closed form, as generic volume renderers do. Light from the sky and the ground is always attenuated in closed
     form, since marching towards every direction would be prohibitively expensive, light scattered more than once
     is interpolated from the same table, and light from point lights is attenuated in closed form towards them.
+    Objects do not cast shadows onto the medium, unlike with the ``occlusion`` of :func:`apply_medium
+    <visionsim.medium.render.apply_medium>`.
 
     Args:
         radiance (npt.ArrayLike | torch.Tensor): Linear radiance of the scene without the medium, of shape (h, w, c).

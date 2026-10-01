@@ -3,7 +3,7 @@ import logging
 import os
 import socket
 import subprocess
-from collections.abc import Callable, Collection, Generator, Iterable, Iterator
+from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from multiprocessing import Process
 from pathlib import Path
@@ -30,6 +30,12 @@ ITEMS_PER_SUBFOLDER: int
 INDEX_PADDING: int
 FORMATS: dict[str, str]
 COLOR_MODE_CHANNELS: Incomplete
+SKY_ELEVATIONS: tuple[float, ...]
+SKY_CELLS: tuple[int, ...]
+
+def _sky_cell_directions(edges: Sequence[float], counts: Sequence[int]) -> npt.NDArray[np.floating]:
+    """Central direction of each cell of the sky, as in :func:`visionsim.medium.occlusion.sky_cell_directions`, which
+    cannot be imported from within Blender."""
 
 def require_connected_client(func: Callable[..., Any]) -> Callable[..., Any]:
     """Decorator which ensures a client is connected.
@@ -852,6 +858,46 @@ class BlenderService(rpyc.Service):
         """
 
     @require_initialized_service
+    def _shadow_casters(self, exclude: Collection[str]) -> tuple[list[bpy.types.Object], npt.NDArray[np.floating]]:
+        """Objects that cast shadows onto a participating medium, and the corners of the box that contains them."""
+
+    @require_initialized_service
+    def exposed_save_occlusion(
+        self,
+        path: str | os.PathLike | None = None,
+        exclude: Collection[str] = (),
+        sky_elevations: Sequence[float] = ...,
+        sky_cells: Sequence[int] = ...,
+        sun_resolution: int = 2048,
+        sky_resolution: int = 512,
+    ) -> None:
+        """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
+
+        Orthographic depth maps of the objects that cast shadows are rendered with Cycles along the direction of each
+        sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
+        split into equal ranges of azimuth. Maps span the box that contains these objects, and are saved to a ``.npz``
+        file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current frame, so
+        objects should be static. Render settings, the camera and the compositor are restored afterwards.
+
+        Args:
+            path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
+                root directory of the renders.
+            exclude (Collection[str], optional): Names of objects that should not cast shadows, typically a large ground
+                plane, which would otherwise make the maps span all of it. Light from below the horizon is ignored
+                anyway. Defaults to none.
+            sky_elevations (Sequence[float], optional): Elevations, in degrees, at the edges of the bands of the sky,
+                from the horizon up. Defaults to :data:`SKY_ELEVATIONS`.
+            sky_cells (Sequence[int], optional): Number of cells of each band. Defaults to :data:`SKY_CELLS`.
+            sun_resolution (int, optional): Number of texels along the longest side of the maps of suns.
+                Defaults to 2048.
+            sky_resolution (int, optional): Number of texels along the longest side of the maps of the sky.
+                Defaults to 512.
+
+        Raises:
+            ValueError: raised if the number of bands of the sky and of their edges do not match.
+        """
+
+    @require_initialized_service
     @validate_camera_moved
     def exposed_position_camera(
         self,
@@ -1633,6 +1679,42 @@ class BlenderClient:
         Args:
             path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
                 root directory of the renders.
+        """
+
+    @type_check_only
+    def save_occlusion(
+        self,
+        path: str | os.PathLike | None = None,
+        exclude: Collection[str] = (),
+        sky_elevations: Sequence[float] = ...,
+        sky_cells: Sequence[int] = ...,
+        sun_resolution: int = 2048,
+        sky_resolution: int = 512,
+    ) -> None:
+        """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
+
+        Orthographic depth maps of the objects that cast shadows are rendered with Cycles along the direction of each
+        sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
+        split into equal ranges of azimuth. Maps span the box that contains these objects, and are saved to a ``.npz``
+        file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current frame, so
+        objects should be static. Render settings, the camera and the compositor are restored afterwards.
+
+        Args:
+            path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
+                root directory of the renders.
+            exclude (Collection[str], optional): Names of objects that should not cast shadows, typically a large ground
+                plane, which would otherwise make the maps span all of it. Light from below the horizon is ignored
+                anyway. Defaults to none.
+            sky_elevations (Sequence[float], optional): Elevations, in degrees, at the edges of the bands of the sky,
+                from the horizon up. Defaults to :data:`SKY_ELEVATIONS`.
+            sky_cells (Sequence[int], optional): Number of cells of each band. Defaults to :data:`SKY_CELLS`.
+            sun_resolution (int, optional): Number of texels along the longest side of the maps of suns.
+                Defaults to 2048.
+            sky_resolution (int, optional): Number of texels along the longest side of the maps of the sky.
+                Defaults to 512.
+
+        Raises:
+            ValueError: raised if the number of bands of the sky and of their edges do not match.
         """
 
     @type_check_only
@@ -2490,6 +2572,42 @@ class BlenderClients(tuple):
         Args:
             path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
                 root directory of the renders.
+        """
+
+    @type_check_only
+    def save_occlusion(
+        self,
+        path: str | os.PathLike | None = None,
+        exclude: Collection[str] = (),
+        sky_elevations: Sequence[float] = ...,
+        sky_cells: Sequence[int] = ...,
+        sun_resolution: int = 2048,
+        sky_resolution: int = 512,
+    ) -> None:
+        """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
+
+        Orthographic depth maps of the objects that cast shadows are rendered with Cycles along the direction of each
+        sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
+        split into equal ranges of azimuth. Maps span the box that contains these objects, and are saved to a ``.npz``
+        file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current frame, so
+        objects should be static. Render settings, the camera and the compositor are restored afterwards.
+
+        Args:
+            path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
+                root directory of the renders.
+            exclude (Collection[str], optional): Names of objects that should not cast shadows, typically a large ground
+                plane, which would otherwise make the maps span all of it. Light from below the horizon is ignored
+                anyway. Defaults to none.
+            sky_elevations (Sequence[float], optional): Elevations, in degrees, at the edges of the bands of the sky,
+                from the horizon up. Defaults to :data:`SKY_ELEVATIONS`.
+            sky_cells (Sequence[int], optional): Number of cells of each band. Defaults to :data:`SKY_CELLS`.
+            sun_resolution (int, optional): Number of texels along the longest side of the maps of suns.
+                Defaults to 2048.
+            sky_resolution (int, optional): Number of texels along the longest side of the maps of the sky.
+                Defaults to 512.
+
+        Raises:
+            ValueError: raised if the number of bands of the sky and of their edges do not match.
         """
 
     @type_check_only

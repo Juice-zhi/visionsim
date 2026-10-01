@@ -39,6 +39,11 @@ as ground truth, in ``renders-fog/transmittance``, ``renders-fog/optical-depth``
 as well as the medium and lighting that were used. The same can be done using the API, with
 :func:`apply_medium <visionsim.medium.render.apply_medium>`.
 
+For objects to cast shadows onto the medium (light shafts) and hide part of the sky from it, also render shadow maps
+of the scene by adding ``--config.include-occlusion`` when rendering, and exclude any large ground plane, which would
+otherwise make the maps span all of it, with ``--config.occlusion.exclude Plane``. ``medium.apply`` then uses the
+``occlusion.npz`` it finds in the renders.
+
 |
 
 Describing a medium
@@ -114,6 +119,16 @@ Gauss-Legendre quadrature, which cancels the singularity near the light, see :fu
 <visionsim.medium.optics.point_light_inscatter>`. Their radiant intensity is their power divided by :math:`4\pi`, as in
 Cycles.
 
+Objects block sunlight from the medium behind them, which casts light shafts, and hide part of the sky from the medium
+around them, such as the fog in front of a wall. Both are modeled with shadow maps, i.e. orthographic depth maps of the
+scene rendered by Cycles along the direction of each sun, and along the central direction of each of the cells into
+which the sky is split. Visibility is sampled along each ray where objects can cast shadows, and the closed-form
+integral of each source between consecutive samples is weighted by the visibility in between, so the result stays
+deterministic, and exact wherever nothing is occluded. Sunlight is sampled every few texels of its map, as its shadows
+are sharp, whereas skylight and light scattered more than once are sampled more coarsely, as each point is lit by many
+cells, each weighted by how much light it scatters towards the camera. See :mod:`visionsim.medium.occlusion` for
+details.
+
 |
 
 Validation
@@ -127,7 +142,11 @@ within 0.3%. The remaining differences are Monte Carlo noise, and object edges.
 
 In the same scene without objects, the light scattered by the fog towards the camera, including multiple scattering
 and light reflected by the ground, is within 2% of Cycles with 32 volume bounces overall, and within 8% at any
-elevation. Light scattered by a point light is within 1% of Cycles' single scattering.
+elevation but looking down at the ground, where it is 12% brighter. Light scattered by a point light is within 1% of
+Cycles' single scattering.
+
+With objects casting shadows, the sun's light scattered by the fog is within 1.3% of Cycles' over surfaces and within
+0.8% over the sky, against 17% and 3% without shadows, and the sky's is within 1% over both, against 25% and 3%.
 ``examples/medium/experiment`` compares every method as seen by the sensor emulators.
 
 |
@@ -137,7 +156,8 @@ Limitations
 
 The following are not yet modeled:
 
-- Shadows cast onto the medium, i.e. light shafts, and the occlusion of the sky by nearby objects.
+- Shadows of moving objects, as shadow maps are rendered once per scene, and shadows on the light reflected by the
+  ground or emitted by point lights.
 - Spot and area lights, as well as emissive surfaces, lighting the medium. Light from point lights is only
   scattered once, which misses about 30% of their glow in the dense fog of ``examples/medium``.
 - Multiple scattering in media other than a single height fog, and skies whose radiance varies with direction.

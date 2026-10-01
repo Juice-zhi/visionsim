@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import NamedTuple
 
 import numpy as np
@@ -323,6 +323,11 @@ class ScatteringTable(NamedTuple):
     """optical depth of the fog above the ground, of shape (c,) or (1,)"""
     height_scale: float
     """heights are spread uniformly between the ground and ``height_scale`` falloffs above it"""
+    gathered: torch.Tensor
+    """radiance scattered once that reaches each height from each gathering direction, averaged over azimuths, of
+    shape (heights, directions, c)"""
+    directions: torch.Tensor
+    """vertical component of the gathering directions, in increasing order, of shape (directions,)"""
 
 
 def _gather_nodes(n: int, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
@@ -432,9 +437,9 @@ def multiple_scattering(
     kernel = azimuthal_phase(omega[None, :].double(), elevations[:, None].double(), g).to(beta.dtype)  # (e, d)
     second = albedo * torch.einsum("ed,hdc,d->ehc", kernel, once, omega_weights)
     again = albedo * ((1 - escape) * omega_weights[None, :, None]).sum(dim=1) / 2  # (heights, c)
-    if not higher_orders:
-        return ScatteringTable(second, depth_ground, height_scale)
-    return ScatteringTable(second / (1 - again[None]).clamp_min(1e-3), depth_ground, height_scale)
+    if higher_orders:
+        second = second / (1 - again[None]).clamp_min(1e-3)
+    return ScatteringTable(second, depth_ground, height_scale, once, omega)
 
 
 def scattered_source(table: ScatteringTable, elevations: torch.Tensor, depth_above: torch.Tensor) -> torch.Tensor:
@@ -467,11 +472,60 @@ def scattered_source(table: ScatteringTable, elevations: torch.Tensor, depth_abo
     return below + we * (at(1) - below)
 
 
+def elevation_sources(
+    medium: Medium, lighting: Lighting, beta: torch.Tensor, channels: int
+) -> dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]:
+    """Light scattered towards rays by sources whose light only depends on the rays' elevation: the sky, the ground,
+    and, if enabled, light scattered more than once.
+
+    Args:
+        medium (Medium): Participating medium, made of a single height fog, with ``sun_attenuation`` enabled.
+        lighting (Lighting): Lighting of the medium.
+        beta (torch.Tensor): Extinction coefficient per channel, of shape (c,), or (1,) for all channels.
+        channels (int): Number of channels of the lighting.
+
+    Returns:
+        dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]: Radiance scattered from the "sky", the
+        "ground" and light already "scattered", for those that shine, as functions of the rays' elevations, of shape
+        (n,), and of the optical depth above points along them, of shape (n, m, c), including the medium's albedo,
+        of shape (n, m, channels).
+    """
+    kwargs = {"dtype": beta.dtype, "device": beta.device}
+    g = medium.anisotropy
+    sky = medium.albedo * _per_channel(lighting.sky, channels, "sky", **kwargs)
+    ground = medium.albedo * ground_radiance(medium, lighting, beta, channels)
+    depth_ground = depth_above_ground(medium, lighting, beta)
+    sources: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {}
+
+    def quadrature(below: bool) -> Callable[[torch.Tensor], Hemisphere]:
+        # Quadratures only depend on the rays' elevations, which are the same at every step when ray marching
+        last: dict = {"elevations": None}
+
+        def cached(elevations: torch.Tensor) -> Hemisphere:
+            if elevations is not last["elevations"]:
+                last["elevations"], last["quadrature"] = elevations, hemisphere(elevations, g, below=below)
+            return last["quadrature"]
+
+        return cached
+
+    if bool((sky != 0).any()):
+        above = quadrature(below=False)
+        sources["sky"] = lambda elevations, depth: sky * sky_source(elevations, depth, g, quadrature=above(elevations))
+    if bool((ground != 0).any()):
+        beneath = quadrature(below=True)
+        sources["ground"] = lambda elevations, depth: (
+            ground * ground_source(elevations, depth, depth_ground, g, quadrature=beneath(elevations))
+        )
+    if medium.multiple_scattering:
+        table = cached_multiple_scattering(medium, lighting, beta, channels)
+        sources["scattered"] = partial(scattered_source, table)
+    return sources
+
+
 def elevation_source(
     medium: Medium, lighting: Lighting, beta: torch.Tensor, channels: int
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None:
-    """Light scattered towards rays by sources whose light only depends on the rays' elevation: the sky, the ground,
-    and, if enabled, light scattered more than once.
+    """Sum of the sources of :func:`elevation_sources`.
 
     Args:
         medium (Medium): Participating medium, made of a single height fog, with ``sun_attenuation`` enabled.
@@ -484,33 +538,14 @@ def elevation_source(
         elevations, of shape (n,), and of the optical depth above points along them, of shape (n, m, c), including
         the medium's albedo, of shape (n, m, channels). None when there is no such light.
     """
-    kwargs = {"dtype": beta.dtype, "device": beta.device}
-    g = medium.anisotropy
-    sky = medium.albedo * _per_channel(lighting.sky, channels, "sky", **kwargs)
-    ground = medium.albedo * ground_radiance(medium, lighting, beta, channels)
-    depth_ground = depth_above_ground(medium, lighting, beta)
-    lit_by_sky, lit_by_ground = bool((sky != 0).any()), bool((ground != 0).any())
-    table = cached_multiple_scattering(medium, lighting, beta, channels) if medium.multiple_scattering else None
-    if not (lit_by_sky or lit_by_ground or table):
+    sources = list(elevation_sources(medium, lighting, beta, channels).values())
+    if not sources:
         return None
 
-    # Quadratures only depend on the rays' elevations, which are the same at every step when ray marching
-    last: dict = {"elevations": None}
-
     def source(elevations: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
-        if elevations is not last["elevations"]:
-            last["elevations"] = elevations
-            if lit_by_sky:
-                last["sky"] = hemisphere(elevations, g)
-            if lit_by_ground:
-                last["ground"] = hemisphere(elevations, g, below=True)
-        total = torch.zeros(1, **kwargs)
-        if lit_by_sky:
-            total = total + sky * sky_source(elevations, depth, g, quadrature=last["sky"])
-        if lit_by_ground:
-            total = total + ground * ground_source(elevations, depth, depth_ground, g, quadrature=last["ground"])
-        if table is not None:
-            total = total + scattered_source(table, elevations, depth)
+        total = sources[0](elevations, depth)
+        for other in sources[1:]:
+            total = total + other(elevations, depth)
         return total
 
     return source

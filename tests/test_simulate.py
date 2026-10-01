@@ -7,10 +7,12 @@ from pathlib import Path
 import numpy as np
 import OpenEXR
 import pytest
+import torch
 from peewee import SqliteDatabase
 
 from visionsim.dataset import Dataset, Metadata
 from visionsim.medium import Lighting
+from visionsim.medium.occlusion import load_occlusion, visibility
 from visionsim.simulate.blender import INDEX_PADDING, ITEMS_PER_SUBFOLDER, BlenderClients
 from visionsim.simulate.schema import _MODELS, _Data
 
@@ -177,6 +179,29 @@ def _run_blender_script(executable, name, *args):
 def test_camera_intrinsics(executable):
     # Checks intrinsics against Blender's own projection
     _run_blender_script(executable, "camera_intrinsics.py")
+
+
+def test_save_occlusion(executable, tmp_path):
+    # Shadow maps are rendered from within Blender, which checks that the scene is left as it was, then the maps of
+    # the test scene's cube, lit by a sun that leans towards -y, are checked here
+    _run_blender_script(executable, "occlusion.py", tmp_path / "occlusion.npz")
+    occlusion = load_occlusion(tmp_path / "occlusion.npz", dtype=torch.float64)
+    assert occlusion.sky_counts == (4, 2) and len(occlusion.sky_maps.texels) == 6 and len(occlusion.sun_maps.texels) == 1
+    low, high = occlusion.bounds.numpy()
+    assert np.allclose(low, -1, atol=0.05) and np.allclose(high, 1, atol=0.05)  # only the cube casts shadows
+
+    # Points right below the cube, along the sun's direction, are in its shadow, unlike points beside it
+    towards = occlusion.sun_directions[0]
+    center = torch.as_tensor((low + high) / 2, dtype=torch.float64)
+    below = center - towards * float(np.linalg.norm(high - low))
+    beside = below + torch.as_tensor([float(high[0] - low[0]) * 2, 0.0, 0.0], dtype=torch.float64)
+    origin = center + torch.as_tensor([0.0, 0.0, 50.0], dtype=torch.float64)
+    points = torch.stack([below, beside])
+    offset = points - origin
+    lit = visibility(
+        occlusion.sun_maps, origin, offset / offset.norm(dim=-1, keepdim=True), offset.norm(dim=-1)[:, None]
+    )
+    assert lit[:, 0, 0].tolist() == [0.0, 1.0]
 
 
 def test_lighting_info(executable, tmp_path):

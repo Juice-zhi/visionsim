@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import ExitStack, contextmanager, nullcontext
 from multiprocessing import Process
@@ -25,7 +26,7 @@ from visionsim.types import FILE
 # Import only when type checking as to not introduce
 # dependency for blender. Block module typechecking.
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Generator, Iterable, Iterator
+    from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Sequence
     from types import TracebackType
 
     import multiprocess  # type: ignore
@@ -106,6 +107,24 @@ FORMATS: dict[str, str] = {
     "WEBP": ".webp",
 }
 COLOR_MODE_CHANNELS = {"BW": 1, "RGB": 3, "RGBA": 4}
+
+SKY_ELEVATIONS: tuple[float, ...] = (0.0, 4.0, 9.0, 16.0, 26.0, 40.0, 60.0, 90.0)
+"""Elevations, in degrees, at the edges of the bands into which the sky is split for shadow maps, which are narrower
+near the horizon, where fog scatters most skylight towards the camera"""
+SKY_CELLS: tuple[int, ...] = (24, 24, 20, 16, 12, 8, 3)
+"""Number of cells into which each band of the sky is split, evenly in azimuth"""
+
+
+def _sky_cell_directions(edges: Sequence[float], counts: Sequence[int]) -> npt.NDArray[np.floating]:
+    """Central direction of each cell of the sky, as in :func:`visionsim.medium.occlusion.sky_cell_directions`, which
+    cannot be imported from within Blender."""
+    directions = []
+    for low, high, count in zip(edges[:-1], edges[1:], counts):
+        mu = (low + high) / 2
+        for j in range(count):
+            phi = 2 * np.pi * (j + 0.5) / count
+            directions.append((np.sqrt(1 - mu * mu) * np.cos(phi), np.sqrt(1 - mu * mu) * np.sin(phi), mu))
+    return np.asarray(directions, dtype=float).reshape(-1, 3)
 
 
 def require_connected_client(
@@ -1855,6 +1874,200 @@ class BlenderService(rpyc.Service):
 
         with open(path, "w") as f:
             json.dump(self.exposed_lighting_info(), f, indent=2)
+
+    @require_initialized_service
+    def _shadow_casters(self, exclude: Collection[str]) -> tuple[list[bpy.types.Object], npt.NDArray[np.floating]]:
+        """Objects that cast shadows onto a participating medium, and the corners of the box that contains them."""
+
+        def volume_only(obj: bpy.types.Object) -> bool:
+            # Volumes, such as the medium itself when rendered by Cycles, are left out of depth maps anyway
+            materials = [slot.material for slot in getattr(obj, "material_slots", []) if slot.material]
+            outputs = [
+                next((n for n in m.node_tree.nodes if n.bl_idname == "ShaderNodeOutputMaterial"), None)
+                for m in materials
+                if m.use_nodes and m.node_tree
+            ]
+            return bool(outputs) and all(
+                o is not None and not o.inputs["Surface"].is_linked and o.inputs["Volume"].is_linked for o in outputs
+            )
+
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        casters, corners = set(), []
+        for instance in depsgraph.object_instances:
+            obj = instance.object.original
+            owner = instance.parent.original if instance.is_instance and instance.parent else obj
+            if (
+                instance.object.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT", "CURVES", "POINTCLOUD"}
+                or obj.name in exclude
+                or owner.name in exclude
+                or owner.hide_render
+                or not getattr(owner, "visible_shadow", True)
+                or volume_only(obj)
+            ):
+                continue
+            casters.add(owner)
+            corners.extend(instance.matrix_world @ mathutils.Vector(corner) for corner in instance.object.bound_box)
+
+        if not corners:
+            return [], np.zeros((2, 3))
+        points = np.asarray([tuple(corner) for corner in corners], dtype=float)
+        return list(casters), np.stack([points.min(axis=0), points.max(axis=0)])
+
+    @require_initialized_service
+    def exposed_save_occlusion(
+        self,
+        path: str | os.PathLike | None = None,
+        exclude: Collection[str] = (),
+        sky_elevations: Sequence[float] = SKY_ELEVATIONS,
+        sky_cells: Sequence[int] = SKY_CELLS,
+        sun_resolution: int = 2048,
+        sky_resolution: int = 512,
+    ) -> None:
+        """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
+
+        Orthographic depth maps of the objects that cast shadows are rendered with Cycles along the direction of each
+        sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
+        split into equal ranges of azimuth. Maps span the box that contains these objects, and are saved to a ``.npz``
+        file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current frame, so
+        objects should be static. Render settings, the camera and the compositor are restored afterwards.
+
+        Args:
+            path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
+                root directory of the renders.
+            exclude (Collection[str], optional): Names of objects that should not cast shadows, typically a large ground
+                plane, which would otherwise make the maps span all of it. Light from below the horizon is ignored
+                anyway. Defaults to none.
+            sky_elevations (Sequence[float], optional): Elevations, in degrees, at the edges of the bands of the sky,
+                from the horizon up. Defaults to :data:`SKY_ELEVATIONS`.
+            sky_cells (Sequence[int], optional): Number of cells of each band. Defaults to :data:`SKY_CELLS`.
+            sun_resolution (int, optional): Number of texels along the longest side of the maps of suns.
+                Defaults to 2048.
+            sky_resolution (int, optional): Number of texels along the longest side of the maps of the sky.
+                Defaults to 512.
+
+        Raises:
+            ValueError: raised if the number of bands of the sky and of their edges do not match.
+        """
+        if len(sky_elevations) != len(sky_cells) + 1:
+            raise ValueError(f"Expected {len(sky_cells) + 1} elevations for {len(sky_cells)} bands of the sky.")
+
+        path = Path(str(path)) if path else self.root_path / "occlusion.npz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        edges = np.sin(np.radians(np.asarray(sky_elevations, dtype=float)))
+        suns = [np.asarray(sun["direction"], dtype=float) for sun in self.exposed_lighting_info()["suns"]]
+        suns = [sun / np.linalg.norm(sun) for sun in suns]
+        jobs = [("sun", sun, sun_resolution) for sun in suns]
+        jobs += [("sky", direction, sky_resolution) for direction in _sky_cell_directions(edges, sky_cells)]
+
+        casters, bounds = self._shadow_casters(exclude)
+        if not casters:
+            self.log.warning("No object casts shadows, saving empty shadow maps.")
+            jobs = []
+        center = bounds.mean(axis=0)
+        corners = np.asarray(list(itertools.product(*bounds.T)), dtype=float)
+        radius = float(np.linalg.norm(corners - center, axis=1).max())
+        maps: dict[str, list] = {"sun": [], "sky": []}
+
+        # Render depth only, with a single sample at the center of each texel, and save it instead of the frame
+        scene, render, cycles = self.scene, self.scene.render, self.scene.cycles
+        settings = [
+            (render, "engine", "CYCLES"),
+            (render, "resolution_percentage", 100),
+            (render, "use_motion_blur", False),
+            (render, "use_border", False),
+            (render.image_settings, "file_format", "OPEN_EXR"),
+            (render.image_settings, "color_depth", "32"),
+            (render.image_settings, "color_mode", "RGB"),
+            (render.image_settings, "exr_codec", "ZIP"),
+            (cycles, "samples", 1),
+            (cycles, "use_adaptive_sampling", False),
+            (cycles, "use_denoising", False),
+            (cycles, "pixel_filter_type", "BOX"),
+            (cycles, "filter_width", 0.01),
+            (cycles, "max_bounces", 0),
+            (self.view_layer, "use_pass_z", True),
+        ]
+        restore = [(owner, name, getattr(owner, name)) for owner, name, _ in settings]
+        restore += [(render, "resolution_x", render.resolution_x), (render, "resolution_y", render.resolution_y)]
+        restore += [(render, "filepath", render.filepath), (scene, "camera", scene.camera)]
+        restore += [
+            (node, "mute", node.mute) for node in self.tree.nodes if node.bl_idname == "CompositorNodeOutputFile"
+        ]
+        hidden = [obj for obj in scene.objects if obj.name in exclude or not getattr(obj, "visible_shadow", True)]
+        restore += [(obj, "hide_render", obj.hide_render) for obj in hidden]
+        restore += [(obj, "visible_camera", obj.visible_camera) for obj in casters]
+        output = next(n for n in self.tree.nodes if n.bl_idname in ("NodeGroupOutput", "CompositorNodeComposite"))
+        linked = [link.from_socket for link in output.inputs[0].links]
+        camera = bpy.data.objects.new("Occlusion", bpy.data.cameras.new("Occlusion"))
+
+        try:
+            for owner, name, value in settings:
+                setattr(owner, name, value)
+            for node in self.tree.nodes:
+                if node.bl_idname == "CompositorNodeOutputFile":
+                    node.mute = True
+            for obj in hidden:
+                obj.hide_render = True
+            for obj in casters:
+                obj.visible_camera = True
+            self.tree.links.new(self.render_layers.outputs["Depth"], output.inputs[0])
+            scene.collection.objects.link(camera)
+            scene.camera = camera
+            camera.data.type, camera.data.sensor_fit = "ORTHO", "AUTO"
+            camera.data.clip_start, camera.data.clip_end = 0.01, 2 * radius + 2
+
+            with tempfile.TemporaryDirectory() as root:
+                for index, (kind, direction, resolution) in enumerate(jobs):
+                    rotation = mathutils.Vector(direction.tolist()).to_track_quat("Z", "Y").to_matrix()
+                    axes = np.asarray(rotation, dtype=float).T  # rows: right, up, and towards the light
+                    extent = np.abs((corners - center) @ axes[:2].T).max(axis=0)
+                    texel = 2 * float(extent.max()) / resolution
+                    width, height = (max(1, int(np.ceil(2 * e / texel - 1e-6))) for e in extent)
+                    origin = center + axes[2] * (radius + 1)
+                    camera.matrix_world = mathutils.Matrix.Translation(origin.tolist()) @ rotation.to_4x4()
+                    camera.data.ortho_scale = max(width, height) * texel
+                    render.resolution_x, render.resolution_y = width, height
+                    render.filepath = str(Path(root) / f"{index}.exr")
+                    bpy.ops.render.render(write_still=True)
+
+                    image = bpy.data.images.load(render.filepath)
+                    pixels = np.empty(image.size[0] * image.size[1] * image.channels, dtype=np.float32)
+                    image.pixels.foreach_get(pixels)
+                    depth = pixels.reshape(image.size[1], image.size[0], image.channels)[..., 0].copy()
+                    bpy.data.images.remove(image)
+                    maps[kind].append((depth, origin, axes, texel))
+        finally:
+            for link in list(output.inputs[0].links):
+                self.tree.links.remove(link)
+            for socket in linked:
+                self.tree.links.new(socket, output.inputs[0])
+            for owner, name, value in restore:
+                setattr(owner, name, value)
+            camera_data = camera.data
+            bpy.data.objects.remove(camera, do_unlink=True)
+            bpy.data.cameras.remove(camera_data)
+
+        def arrays(kind: str) -> dict[str, npt.NDArray]:
+            depths = [depth for depth, *_ in maps[kind]]
+            return {
+                f"{kind}_depths": np.concatenate([d.reshape(-1) for d in depths] or [np.zeros(0)]).astype(np.float32),
+                f"{kind}_offsets": np.cumsum([0] + [d.size for d in depths[:-1]]) if depths else np.zeros(0, int),
+                f"{kind}_shapes": np.asarray([d.shape for d in depths], dtype=int).reshape(-1, 2),
+                f"{kind}_origins": np.asarray([o for _, o, _, _ in maps[kind]], dtype=float).reshape(-1, 3),
+                f"{kind}_axes": np.asarray([a for _, _, a, _ in maps[kind]], dtype=float).reshape(-1, 3, 3),
+                f"{kind}_texels": np.asarray([t for *_, t in maps[kind]], dtype=float),
+            }
+
+        np.savez_compressed(
+            path,
+            **arrays("sun"),
+            **arrays("sky"),
+            sun_directions=np.asarray(suns if jobs else [], dtype=float).reshape(-1, 3),
+            sky_edges=edges,
+            sky_counts=np.asarray(sky_cells if jobs else [0] * len(sky_cells), dtype=int),
+            bounds=bounds,
+            frame=scene.frame_current,
+        )
 
     @require_initialized_service
     @validate_camera_moved
