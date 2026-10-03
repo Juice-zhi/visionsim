@@ -402,10 +402,10 @@ def test_snapping_to_a_grid():
 
 def test_ragged_layout():
     counts = torch.as_tensor([2, 0, 3, 1])
-    ray, index = _ragged(counts)
+    ray, index = _ragged(counts, 6)
     assert ray.tolist() == [0, 0, 2, 2, 2, 3] and index.tolist() == [0, 1, 0, 1, 2, 0]
-    assert list(_ragged_chunks(counts, 3)) == [slice(0, 2), slice(2, 3), slice(3, 4)]
-    assert list(_ragged_chunks(torch.as_tensor([5, 1]), 2)) == [slice(0, 1), slice(1, 2)]
+    assert list(_ragged_chunks(counts, 3)) == [(slice(0, 2), 2), (slice(2, 3), 3), (slice(3, 4), 1)]
+    assert list(_ragged_chunks(torch.as_tensor([5, 1]), 2)) == [(slice(0, 1), 5), (slice(1, 2), 1)]
 
 
 def sky_table(beta):

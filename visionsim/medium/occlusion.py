@@ -396,24 +396,24 @@ def _chunks(count: int, size: int) -> Iterator[slice]:
     return (slice(start, start + size) for start in range(0, count, max(1, size)))
 
 
-def _ragged_chunks(counts: torch.Tensor, size: int) -> Iterator[slice]:
+def _ragged_chunks(counts: torch.Tensor, size: int) -> Iterator[tuple[slice, int]]:
     """Slices of consecutive rays with at most ``size`` samples in all, given the number of samples of each ray, or
-    single rays with more samples."""
+    single rays with more samples, along with their number of samples."""
     total = torch.cumsum(counts, dim=0).cpu()
     start = 0
     while start < len(total):
         before = int(total[start - 1]) if start else 0
         stop = max(int(torch.searchsorted(total, before + max(1, size), right=True)), start + 1)
-        yield slice(start, stop)
+        yield slice(start, stop), int(total[stop - 1]) - before
         start = stop
 
 
-def _ragged(counts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _ragged(counts: torch.Tensor, total: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Index of the ray of each sample, and of each sample along its ray, of shape (s,), when rays have given numbers
-    of samples, laid out one ray after another."""
-    ray = torch.repeat_interleave(torch.arange(len(counts), device=counts.device), counts)
+    of samples, laid out one ray after another, given their total."""
+    ray = torch.repeat_interleave(torch.arange(len(counts), device=counts.device), counts, output_size=total)
     first = torch.cumsum(counts, dim=0) - counts
-    return ray, torch.arange(len(ray), device=counts.device) - first[ray]
+    return ray, torch.arange(total, device=counts.device) - first[ray]
 
 
 def _pack(bits: torch.Tensor) -> torch.Tensor:
@@ -665,8 +665,8 @@ def trace(
         windows = _depth_windows(maps, window)
         empty = [torch.zeros(0, dtype=torch.long, device=directions.device)] + [torch.zeros(0, **kwargs)] * 3
         segments = [empty]
-        for rays in _ragged_chunks(counts, int(memory // 512)):
-            ray, j = _ragged(counts[rays])
+        for rays, count in _ragged_chunks(counts, int(memory // 256)):
+            ray, j = _ragged(counts[rays], count)
             ray = ray + (rays.start or 0)
             total = counts[ray]
             starts = torch.addcmul(start[ray], length[ray], j / total)
@@ -675,13 +675,13 @@ def trace(
             segments.append(list(_hidden_segments((sure == 0).to(start), ray, j == 0, j == total - 1, starts, ends)))
             unsure = (sure < 0).nonzero()[:, 0]
             steps = torch.ceil((ends - starts)[unsure] / texel).clamp_min(1).long()
-            for part in _ragged_chunks(steps, int(memory // 256)):
-                which, i = _ragged(steps[part])
-                interval, count = unsure[part][which], steps[part][which]
-                below = torch.addcmul(starts[interval], (ends - starts)[interval], i / count)
-                above = torch.addcmul(starts[interval], (ends - starts)[interval], (i + 1) / count)
+            for part, count in _ragged_chunks(steps, int(memory // 256)):
+                which, i = _ragged(steps[part], count)
+                interval, parts = unsure[part][which], steps[part][which]
+                below = torch.addcmul(starts[interval], (ends - starts)[interval], i / parts)
+                above = torch.addcmul(starts[interval], (ends - starts)[interval], (i + 1) / parts)
                 lit = visibility(maps, origin, directions[ray[interval]], ((below + above) / 2)[:, None], bias)
-                refined = _hidden_segments(1 - lit[:, 0, 0], ray[interval], i == 0, i == count - 1, below, above)
+                refined = _hidden_segments(1 - lit[:, 0, 0], ray[interval], i == 0, i == parts - 1, below, above)
                 segments.append(list(refined))
         hidden_suns.append(SunShadows(towards, *(torch.cat(columns) for columns in zip(*segments))))
 
