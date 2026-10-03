@@ -255,8 +255,15 @@ def build_prose(
     maps: dict,
     reuse: dict,
     cycles_ms_seconds: dict[str, float],
+    sources: dict,
 ) -> dict[str, str]:
     """Text of the report, which quotes the measured numbers."""
+    # Where the closed form with multiple scattering and shadows differs from Cycles, from error_sources.py
+    near = [regions["surfaces_near"] for regions in sources.values()]
+    mid = [regions["surfaces_mid"] for regions in sources.values()]
+    dimmed = float(np.mean([r["surface_attenuated"] for r in near + mid]))
+    clear_surfaces = [r["surface_clear"] for r in near + mid]
+    before_occlusion_below = ROOT / "results_ms" / "regions_before_below_horizon.json"
     r = rows
     cf, cd, nd, cl = (r[k] for k in ("closed_form", "cycles_default", "cycles_nodenoise", "clear"))
     cf_occ = r["closed_form_occ"]
@@ -314,7 +321,7 @@ def build_prose(
 <li><strong>加上光柱和天空遮挡之后，以物理上完整的多次散射为真值，闭式解的渲染帧误差从 {pct(ms_ms["frames_rel_l1"])} 降到 {pct(occ_ms["frames_rel_l1"])}；只算单次散射时是 {pct(cf_ms["frames_rel_l1"])}，Cycles 默认设置（打开多次散射）是 {pct(cd_ms["frames_rel_l1"])}{floor_text}。</strong>四种传感器上：RGB PSNR {occ_ms["rgb_psnr"]:.1f} dB（不加阴影 {ms_ms["rgb_psnr"]:.1f} dB，Cycles {cd_ms["rgb_psnr"]:.1f} dB），SPAD 检测概率 MAE {1000 * occ_ms["spad_mae"]:.0f}×10⁻³（不加阴影 {1000 * ms_ms["spad_mae"]:.0f}，Cycles {1000 * cd_ms["spad_mae"]:.1f}），DVS 事件 F1 {occ_ms["dvs_f1_pooled"]:.3f}（不加阴影 {ms_ms["dvs_f1_pooled"]:.3f}，Cycles {cd_ms["dvs_f1_pooled"]:.3f}）。</li>
 <li><strong>阴影本身和 Cycles 吻合：</strong>第 255 帧只开太阳时，雾散射进相机的光与 Cycles 之比在表面像素上从 {sun_without["surfaces"]:.3f} 变为 {sun_with["surfaces"]:.3f}，天空像素上从 {sun_without["sky"]:.3f} 变为 {sun_with["sky"]:.3f}；只开天光时，表面像素上从 {sky_without["surfaces"]:.3f} 变为 {sky_with["surfaces"]:.3f}，天空像素上从 {sky_without["sky"]:.3f} 变为 {sky_with["sky"]:.3f}。阴影图每个场景只需渲染一次（{maps["count"]} 张正交深度图，{maps["seconds"]:.1f} s），与相机、分辨率和雾参数都无关。</li>
 <li><strong>时间：阴影与雾参数无关，每帧只需沿视线追踪一次，之后每组雾参数都复用。只改雾参数时，闭式解（多次散射）+ 阴影比打开多次散射的 Cycles 快 {shadowed_speedups}。</strong>追踪阴影要查阴影图，开销随像素数增加，三种分辨率下每帧分别要 {traced_text}，算上它也分别快 {traced_speedups} 倍；复用的误差只占雾散射光的 {fmt(min(of_inscatter), "pct2")}～{fmt(max(of_inscatter), "pct2")}。不加阴影时快 {speedup_text}，每帧只要 {fmt(ms_ms["update"], "sec")}、{fmt(scale["closed_form_ms"]["update"], "sec")} 和 {fmt(hd_ms, "sec")}。天光、地面反射和多次散射都是每帧一张查找表，多次散射表与相机无关，每组雾参数只算一次（{fmt(timings["multiple_scattering_table"], "sec")}）。</li>
-<li><strong>多次散射近似本身在去掉物体的场景里和 Cycles 吻合：雾散射进相机的光整体是 Cycles 32 次弹射的 {free["all"]:.3f} 倍，各仰角在 {min(elevations.values()):.2f}～{max(elevations.values()):.2f} 倍之间。</strong>加上阴影后，完整场景里剩下的误差主要来自表面透过雾被照亮（表面在 Cycles 里暗约 {pct(1 - bd["surface_dimming"]["median"])}），以及多次散射近似本身。</li>
+<li><strong>多次散射近似本身在去掉物体的场景里和 Cycles 吻合：雾散射进相机的光整体是 Cycles 32 次弹射的 {free["all"]:.3f} 倍，各仰角在 {min(elevations.values()):.2f}～{max(elevations.values()):.2f} 倍之间。</strong>加上阴影后，完整场景里剩下的误差集中在物体附近，而且主要不在表面上：第 255、345 帧里，5 m 以内的表面像素上雾散射进相机的光多了 {pct(near[0]["fog_light"] - 1)}、{pct(near[1]["fog_light"] - 1)}，其中直接来自太阳和天空的部分只差 {pct(near[0]["fog_direct"] - 1)}、{pct(near[1]["fog_direct"] - 1)}，多出来的是多次散射和地面反射的光（见“剩下的误差在哪里”）。表面透过雾被照亮在多次散射下基本抵消：雾把照到表面的光削弱约 {pct(1 - dimmed)}，雾自己的散射光又把它补了回来。</li>
 <li><strong>Blender 默认的 0 次体积弹射只算单次散射：</strong>用 Cycles 默认设置渲染这团雾，误差是 {pct(ss_ms["frames_rel_l1"])}，比完全不加雾（{pct(cl_ms["frames_rel_l1"])}）还差。雾散射进相机的光里有 {pct(most["indirect_share"])} 散射过不止一次，画面整体亮 {pct(most["brightness"] - 1)}。在 Cycles 里打开多次散射（8 次弹射已收敛），每帧只从 {renders["cycles_default"]:.2f} s 增加到 {renders["ms_cycles_default"]:.2f} s，用 Cycles 渲染雾时应该把体积弹射次数设到 8 以上。</li>
 <li><strong>点光源：</strong>单次散射和 Cycles 吻合（雾光比值 {point["ratio"]:.3f}），但点光源的多次散射还没有建模，在这团雾里要少约 {pct(1 - validation["point_vs_32_bounces"]["ratio"])} 的光晕。</li>
 <li><strong>以单次散射为真值时，闭式解的实现是对的：</strong>加阴影后误差从 {pct(cf["frames_rel_l1"])} 降到 {pct(cf_occ["frames_rel_l1"])}，剩下的主要是表面透过雾被照亮；ray marching 与（不加阴影的）闭式解只差 {sci(steps[16]["error_vs_closed_form"])}，耗时是它的 {steps[16]["seconds"] / cf_seconds:.1f} 倍。{temporal_text}ToF 只能由闭式解或 ray marching 生成（Cycles 不能渲染瞬态），激光在雾中的多次散射这次无法评估。</li>
@@ -363,7 +370,8 @@ def build_prose(
         "整段都在周围所有表面之上（或之下）的小段直接判为照亮（或遮挡），只有阴影边缘可能穿过的小段才每个纹素采样一次。"
         "天光来自许多单元格，变化平缓，每条视线只取 8 个采样点（按每段对相机的贡献均匀分布），每个单元格按相函数在格内的积分乘以天光在这个仰角范围的衰减加权；"
         "相邻视线的采样点在空间里挨得很近，所以先把它们对齐到比天空阴影图纹素更细的网格上，每个网格单元只查一次。"
-        "多次散射的光也来自各个方向，用同样的方式遮挡，单元格改按到达这个仰角的单次散射光加权，地平线以下的部分不遮挡。"
+        "多次散射的光也来自各个方向，用同样的方式遮挡，单元格改按到达这个仰角的单次散射光加权；"
+        "地平线以下的光（地面反射的光和下方雾的光）按镜像的单元格遮挡：立在地面上的物体也挡住它，除非物体比这束光在地面上的起点还远。"
         f"整套阴影图每个场景只需渲染一次（{maps['count']} 张，Cycles 每像素 1 个样本，CPU 上共 {maps['seconds']:.1f} s），与相机、分辨率和雾参数都无关。"
         "下表把第 255 帧 Cycles 的 Volume Direct pass（单次散射）分别和不加阴影、加阴影的闭式解对比，比值为 1 表示完全一致："
     )
@@ -394,6 +402,38 @@ def build_prose(
         f"复用阴影后加一组雾只要 {fmt(min(reused), 'sec')}～{fmt(max(reused), 'sec')}，多次散射 + 阴影仍比打开多次散射的 Cycles 快 {min(reused_speedups):.0f}～{max(reused_speedups):.0f} 倍。"
         "它比不加阴影慢，是因为每条视线都要按保存的可见性逐段重新积分，开销随像素数增加，而不加阴影时的开销主要是与分辨率无关的查找表。"
         f"每帧的阴影在 800×800 时占 {size(reuse['bytes']['800x800'])} 显存，存盘并不划算，所以生成多组雾参数时应在同一遍里处理完每帧的所有雾参数。"
+    )
+    sources_intro = (
+        "为了找出加阴影之后剩下的误差来自哪里，把第 255 和 345 帧的 Cycles 多次散射渲染（32 次体积弹射，1024 spp）拆成两部分："
+        "表面透过雾送到相机的光（整幅画面减去体积 pass，再除以视线的透射率），和雾散射进相机的光（体积 pass）；"
+        "后者又分成直接来自太阳和天空、只散射一次的光（Volume Direct），和其余的多次散射与地面反射的光。"
+        "下表是闭式解（多次散射 + 阴影）和 Cycles 的比值，按像素看到的表面距离分组。"
+        "“只算衰减”一列把无雾渲染里来自太阳和来自天空的光（Blender 的 Light Groups）分别乘以表面点处朝太阳的透射率和天光透射率，不算雾自己的散射光："
+    )
+    fixed = ""
+    if before_occlusion_below.exists():
+        previous = json.loads(before_occlusion_below.read_text())["closed_form_ms_occ"]
+        fixed = (
+            f"地平线以下的光改为按镜像的单元格遮挡之前，5 m 以内的表面整体偏亮 {signed(previous['surfaces_near'])}，"
+            f"5–15 m 偏亮 {signed(previous['surfaces_mid'])}，现在分别是 {signed(regions['closed_form_ms_occ']['surfaces_near'])} 和 "
+            f"{signed(regions['closed_form_ms_occ']['surfaces_mid'])}，整体偏差从 {signed(previous['all'])} 变为 {signed(regions['closed_form_ms_occ']['all'])}。"
+        )
+    indirect_near = [r["fog_indirect"] - 1 for r in near]
+    indirect_mid = [r["fog_indirect"] - 1 for r in mid]
+    direct_all = [abs(r["fog_direct"] - 1) for regions_ in sources.values() for r in regions_.values()]
+    sources_text = (
+        f"直接来自太阳和天空的雾光与 Cycles 相差 {pct(min(direct_all))}～{pct(max(direct_all))}，最大的是相机贴着方块经过的第 345 帧近处，"
+        "比多次散射部分的误差小得多，说明光柱和天空遮挡基本是对的。"
+        f"剩下的误差几乎都在多次散射和地面反射的光上：5 m 以内多了 {pct(min(indirect_near))}～{pct(max(indirect_near))}，"
+        f"5–15 m 多了 {pct(min(indirect_mid))}～{pct(max(indirect_mid))}，远处和天空基本吻合，而这部分光在近处占雾光的 "
+        f"{pct(min(r['indirect_share'] for r in near))}～{pct(max(r['indirect_share'] for r in near))}。"
+        "多次散射的近似假设雾点周围是开阔的雾，只扣除被物体挡住的单元格；但物体附近的雾本身就处在物体的阴影里，比开阔处暗，"
+        "再散射到雾点的光也更少，而被挡住的单元格方向上，物体和雾点之间那段雾其实仍在发光，这两点都还没有建模。"
+        f"{fixed}"
+        f"表面的光在多次散射下反而几乎不需要修正：雾把照到表面的阳光和天光削弱了约 {pct(1 - dimmed)}（“只算衰减”），"
+        f"但雾自己的散射光又把它补了回来，无雾渲染的表面在 15 m 以内和 Cycles 只差 {pct(max(abs(c - 1) for c in clear_surfaces))} 以内。"
+        "15 m 以外视线的透射率很小，除以它会放大体积 pass 的噪声，这一行的表面比值不可靠。"
+        f"单次散射时则没有这么多雾光来补偿，表面会暗约 {pct(1 - bd['surface_dimming']['median'])}（见“闭式解和单次散射真值的差距从哪来”）。"
     )
     clear_800 = scale["clear"]
     # Time to trace shadows before tracing skipped repeated lookups, if it was kept when rerunning shadow_reuse.py
@@ -460,6 +500,8 @@ def build_prose(
         "reuse_intro": reuse_intro,
         "reuse_text": reuse_text,
         "reuse_time_text": reuse_time_text,
+        "sources_intro": sources_intro,
+        "sources_text": sources_text,
         "scale_intro": scale_intro,
         "scale_text": scale_text,
         "overview_ms_caption": overview_ms_caption,
@@ -502,9 +544,10 @@ def build_prose(
         f"①和②现在已经用阴影图建模，加阴影后两项的比值分别回到 {sun_with['surfaces']:.3f} 和 {sky_with['surfaces']:.3f}（见上文“光柱和天空遮挡”），③还没有建模。"
         f"修正前的模型让下半球也向雾里照射天光，并且天光不衰减，结果表面像素上的散射光是 Cycles 的 {bd['full_before_fix']['surfaces']:.1f} 倍。",
         "next_steps": f"""<ul>
-<li><strong>表面透过雾被照亮（现在最大的误差来源）</strong>：用 Blender 的 Light Groups 把表面上的太阳贡献和天光贡献分开，分别乘以表面点处的阳光透射率和天光透射率（高度雾都有闭式解，阴影图也能直接用）；雾光对表面的照明可以用多次散射表里已经算好的、散射过一次的光场来近似。</li>
+<li><strong>物体附近的多次散射光（现在最大的误差来源）</strong>：被挡住的单元格整格当作全暗，其实物体和雾点之间那段雾仍在发光，可以按到遮挡物的距离（阴影图已经给出）用透射率给它加权；物体附近的雾本身也在物体的阴影里，比开阔处暗，可以在物体周围用较粗的体素网格估计一次散射的光场，再从它收集多次散射的光。</li>
+<li><strong>表面透过雾被照亮</strong>：多次散射下衰减和雾光基本抵消，单次散射下表面则暗约 {pct(1 - bd["surface_dimming"]["median"])}。<code>render_passes.py --light-groups</code> 已经能把无雾渲染里来自太阳和天空的光分开，再加上法线和漫反射颜色，就能分别算衰减和雾光；原型里雾光对地面吻合，对墙面还偏亮，原因还要再查。</li>
 <li><strong>阴影的速度</strong>：多组雾参数共用每帧的阴影，追踪阴影本身也已经去掉了大部分重复查询，800×800 时每帧 {fmt(scale["trace"], "sec")}{traced_before}，是无雾渲染的 {pct(scale["trace"] / clear_800)}。天空在每个网格单元上的可见性与相机和雾都无关，还可以跨帧缓存；查阴影图的部分用自定义 GPU 核函数合并后还能再快几倍。</li>
-<li><strong>阴影的精度</strong>：天空单元格较粗，遮挡物边缘正好落在前向散射波瓣上时会整格误判，可以每个单元格渲染几张子方向的阴影图，沿视线交替使用；运动的物体需要逐帧渲染阴影图；地面反射到雾里的光和点光源也还没有阴影。</li>
+<li><strong>阴影的精度</strong>：天空单元格较粗，遮挡物边缘正好落在前向散射波瓣上时会整格误判，可以每个单元格渲染几张子方向的阴影图，沿视线交替使用；运动的物体需要逐帧渲染阴影图；点光源也还没有阴影。</li>
 <li><strong>点光源的多次散射、聚光灯和面光源</strong>：点光源的多次散射可以用大气点扩散函数（Narasimhan 和 Nayar 2003）一类的解析近似；聚光灯只是带角度衰减的点光源，面光源可以用若干个点光源近似。</li>
 <li><strong>多次散射近似的改进</strong>：地平线附近少约 7%，俯视地面时多约 12%。可以用 Cycles 的无物体参考标定级数因子，或者把收集过程迭代两三次代替几何级数；地面也可以换成更接近 Principled BSDF 的反射模型。</li>
 <li><strong>ToF</strong>：HG 相函数会低估雾滴在 180° 附近的后向散射（真实雾有 glory 峰），可以改用 lidar ratio 参数化；激光在雾中的多次散射可以用支持瞬态渲染的 mitransient（Mitsuba 3）生成参考。</li>
@@ -700,6 +743,33 @@ def reuse_tables(reuse: dict, timings: dict, cycles: dict[str, float]) -> tuple[
     return error_table, time_table
 
 
+def sources_table(sources: dict) -> str:
+    """Ratio of the closed form's light to Cycles' on frames 255 and 345, by distance, from ``error_sources.py``."""
+    names = {"surfaces_near": "表面 < 5 m", "surfaces_mid": "表面 5–15 m", "surfaces_far": "表面 > 15 m", "sky": "天空"}
+    columns = [
+        ("pixels", "像素占比", "pct"),
+        ("surface_clear", "表面光：无雾渲染", "f3"),
+        ("surface_attenuated", "表面光：只算衰减", "f3"),
+        ("fog_light", "雾光：全部", "f3"),
+        ("fog_direct", "雾光：直接", "f3"),
+        ("fog_indirect", "雾光：多次散射和地面反射", "f3"),
+        ("indirect_share", "后者在 Cycles 雾光中的占比", "pct"),
+        ("frame", "画面", "f3"),
+    ]
+    head = "".join(f'<th scope="col">{label}</th>' for _, label, _ in columns)
+    body = "".join(
+        f'<tr><th scope="row">第 {frame} 帧，{html.escape(names[name])}</th>'
+        + "".join(f"<td>{fmt(entry[key], kind) if key in entry else '—'}</td>" for key, _, kind in columns)
+        + "</tr>"
+        for frame, regions in sources.items()
+        for name, entry in regions.items()
+    )
+    return (
+        f'<div class="table-wrap"><table><thead><tr><th scope="col">闭式解 / Cycles</th>{head}</tr></thead>'
+        f"<tbody>{body}</tbody></table></div>"
+    )
+
+
 VISIONSIM50_FRAMES = 59_950
 """Frames of VisionSIM-50: 50 scenes animated for 12 s, rendered at 100 fps and 800x800"""
 
@@ -831,6 +901,7 @@ def main():
         "1920x1080": cycles_seconds("fog_default_ms", "1920x1080"),
     }
     reuse_error_table, reuse_time_table = reuse_tables(reuse, timings, cycles_ms)
+    sources = json.loads((ROOT / "results_ms" / "error_sources.json").read_text())
     seconds_ss = seconds | {
         "cycles_default": (renders["cycles_default"],) * 2,
         "cycles_nodenoise": (renders["cycles_nodenoise"],) * 2,
@@ -879,6 +950,7 @@ def main():
         occlusion_table=occlusion_table(occlusion),
         reuse_error_table=reuse_error_table,
         reuse_time_table=reuse_time_table,
+        sources_table=sources_table(sources),
         scale_table=scale_html,
         summary_table=table(
             [*passive, "reference"],
@@ -963,6 +1035,7 @@ def main():
             maps,
             reuse,
             cycles_ms,
+            sources,
         ),
     )
     (RESULTS / "index.html").write_text(body, encoding="utf-8")

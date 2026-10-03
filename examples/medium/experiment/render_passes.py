@@ -5,6 +5,9 @@ camera, without denoising or adaptive sampling so that the result is an unbiased
 within Blender, e.g.::
 
     blender -b fog.blend --python render_passes.py -- output/ --samples 4096 [--frame 255]
+
+With ``--light-groups``, the light of suns and of the sky (the world) are also saved separately, along with world-space
+normals and the diffuse albedo, e.g. to model how surfaces are lit through the fog from a render without fog.
 """
 
 import argparse
@@ -30,6 +33,25 @@ def main(args):
         service.scene.cycles.max_bounces = max(service.scene.cycles.max_bounces, args.volume_bounces + 12)
 
     service.exposed_include_frames(file_format="OPEN_EXR", bit_depth=32, exr_codec="ZIP")
+    if args.light_groups:
+        # Light from each sun and from the world (the sky) in separate passes, and world-space normals
+        groups = {"sky": [service.scene.world]}
+        for obj in service.scene.objects:
+            if obj.type == "LIGHT":
+                groups.setdefault("sun" if obj.data.type == "SUN" else "lamps", []).append(obj)
+        for name, members in groups.items():
+            if name not in service.view_layer.lightgroups:
+                service.view_layer.lightgroups.add(name=name)
+            for member in members:
+                member.lightgroup = name
+        service.view_layer.use_pass_normal = True
+        service.view_layer.use_pass_diffuse_color = True
+        for name in groups:
+            socket = service.render_layers.outputs[f"Combined_{name}"]
+            service._include_output(f"lights/{name}", socket, file_format="OPEN_EXR", exr_codec="ZIP", bit_depth=32)
+        for name, subpath in (("Normal", "normals"), ("Diffuse Color", "albedo")):
+            socket = service.render_layers.outputs[name]
+            service._include_output(subpath, socket, file_format="OPEN_EXR", exr_codec="ZIP", bit_depth=32)
     if args.volume_passes:
         service.view_layer.cycles.use_pass_volume_direct = True
         service.view_layer.cycles.use_pass_volume_indirect = True
@@ -65,4 +87,7 @@ if __name__ == "__main__":
         help="maximum number of volume scattering events, i.e. 0 for single scattering, defaults to the scene's",
     )
     parser.add_argument("--no-volume-passes", dest="volume_passes", action="store_false", help="only save frames")
+    parser.add_argument(
+        "--light-groups", action="store_true", help="also save the light of suns and of the sky, normals and albedo"
+    )
     main(parser.parse_args(sys.argv[sys.argv.index("--") + 1 :]))

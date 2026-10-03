@@ -43,6 +43,10 @@
   <p>{reuse_text}</p>
   {reuse_time_table}
   <p>{reuse_time_text}</p>
+  <h3>剩下的误差在哪里</h3>
+  <p>{sources_intro}</p>
+  {sources_table}
+  <p>{sources_text}</p>
   <h3>画面与传感器输出（以多次散射为真值）</h3>
   <figure><a href="images/overview_ms.png" target="_blank" rel="noopener"><img src="images/overview_ms.png" alt="以多次散射为真值时，各方法在第 250 帧的渲染帧、误差图和传感器输出" loading="lazy"></a>
   <figcaption>{overview_ms_caption}</figcaption></figure>
@@ -181,6 +185,8 @@ blender -b runs/fog-comparison/demo.blend --python examples/medium/experiment/ex
 $env:PYTHONPATH = "examples/medium/experiment"; python examples/medium/experiment/run_experiment.py
 python examples/medium/experiment/run_experiment.py --truth multiple   # 结果在 results_ms
 python examples/medium/experiment/error_regions.py    # 多次散射真值下误差按区域和方向拆分
+blender -b runs/fog-comparison/demo.blend --python examples/medium/experiment/render_passes.py -- runs/fog-comparison/lightgroups --samples 1024 --frame 255 345 --no-volume-passes --light-groups
+python examples/medium/experiment/error_sources.py     # 第 255、345 帧的误差来自哪部分光，需要先渲染下文的 32 次弹射
 python examples/medium/experiment/temporal.py         # DVS 一节的对数亮度误差
 pwsh examples/medium/experiment/timing_1080p.ps1      # 1080p：渲染 10 帧
 pwsh examples/medium/experiment/timing_resolution.ps1 -Width 800 -Height 800   # 800×800：渲染 10 帧和参考
