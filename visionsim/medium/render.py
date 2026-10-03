@@ -266,7 +266,15 @@ def apply_medium(
                 towards = [towards_sun for towards_sun, _ in attenuated_suns]
                 occlusion = occlusion_to(occlusion, device=device, dtype=dtype)
                 shadows = trace(
-                    occlusion, medium, origin, rays, lengths, towards, sun_step=shadow_step, sky_samples=shadow_samples
+                    occlusion,
+                    medium,
+                    origin,
+                    rays,
+                    lengths,
+                    towards,
+                    sun_step=shadow_step,
+                    sky_samples=shadow_samples,
+                    ground_height=lighting.ground_height,
                 )
             sources = elevation_sources(medium, lighting, beta[channels], n)
             scattered = medium.multiple_scattering and "scattered" in sources
@@ -374,4 +382,5 @@ def trace_shadows(
         [t / t.norm() for t in towards],
         sun_step=shadow_step,
         sky_samples=shadow_samples,
+        ground_height=lighting.ground_height,
     )

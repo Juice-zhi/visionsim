@@ -26,6 +26,7 @@ from visionsim.medium.occlusion import (
     load_occlusion,
     occluded_inscatter,
     sky_cell_directions,
+    trace,
     visibility,
 )
 from visionsim.medium.optics import height_fog_optical_depth, henyey_greenstein, sky_quadrature
@@ -445,6 +446,39 @@ def test_sky_hidden_by_a_wall():
     unoccluded = brute_force(origin, directions, distance, sky_source_at, steps=400)
     assert (expected < 0.9 * unoccluded).sum() >= 3  # the wall hides part of the sky
     assert np.allclose(result[:, 0].numpy(), expected, rtol=0.01)
+
+
+def test_objects_on_the_ground_hide_light_from_below_the_horizon():
+    """A wall standing on the ground hides light from just below the horizon at points close to it, but not at points
+    so far that this light starts on the ground before the wall, and a roof hides none of it."""
+    origin = T([0.0, 0.0, 1.0])
+    # Rays along the wall at x = 2, 2 m from it, and away from it, ending 59 m from it
+    directions = T([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]])
+    distance = T([10.0, 57.0])
+
+    def below_horizon(occluder, bounds):
+        occlusion = occlusion_of(
+            render_maps([], bounds, occluder),
+            [],
+            render_maps(sky_cell_directions(EDGES, CELLS), bounds, occluder, 512),
+            bounds,
+        )
+        shadows = trace(occlusion, FOG, origin, directions, distance, [], sky_samples=32)
+        lit = _unpack(shadows.visible[:, -1], sum(CELLS)).bool()
+        lit_below = _unpack(shadows.visible_below[:, -1], sum(CELLS)).bool()
+        return lit, lit_below
+
+    lowest = torch.arange(sum(CELLS)) < CELLS[0]  # cells of the band just above the horizon
+    lit, lit_below = below_horizon(wall(2.0, (-40, 80), (0, 20)), [[2.0, -40.0, 0.0], [2.0, 80.0, 20.0]])
+    assert (lit_below | ~lit).all()  # what is visible above the horizon is visible below it
+    # Close to the wall, it hides the same cells just below the horizon as above it
+    assert not lit[0, lowest].all() and torch.equal(lit_below[0, lowest], lit[0, lowest])
+    # Far from it, light from below the horizon starts on the ground before the wall
+    assert not lit[1, lowest].all() and lit_below[1].all()
+    lit, lit_below = below_horizon(
+        rectangle(6.0, (-100, 100), (-100, 400)), [[-100.0, -100.0, 6.0], [100.0, 400.0, 6.0]]
+    )
+    assert not lit[0].all() and lit_below.all()
 
 
 def sky_source_at(points, v):

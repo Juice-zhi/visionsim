@@ -37,7 +37,16 @@ from visionsim.medium.scattering import ElevationTable, ScatteringTable, lookup
 
 _TABLE_SIZE = (129, 129)
 """Number of elevations and azimuths of view directions at which the phase function is integrated over each cell"""
-_SHADOW_TENSORS = ("bounds", "middles", "visible", "visible_weights", "weights", "weights_below")
+_SHADOW_TENSORS = (
+    "bounds",
+    "middles",
+    "visible",
+    "visible_below",
+    "visible_weights",
+    "weights",
+    "visible_weights_below",
+    "weights_below",
+)
 """Fields of :class:`Shadows` which hold one value per ray"""
 
 
@@ -246,6 +255,19 @@ def visibility(
     bottom = torch.lerp(lit_at(x0, y0).to(x.dtype), lit_at(x0 + 1, y0).to(x.dtype), fx)
     upper = torch.lerp(lit_at(x0, y0 + 1).to(x.dtype), lit_at(x0 + 1, y0 + 1).to(x.dtype), fx)
     return torch.lerp(bottom, upper, fy)
+
+
+def _blocker_distances(maps: ShadowMaps, points: torch.Tensor, bias: float) -> torch.Tensor:
+    """Distance from points towards the light of each shadow map to the surface recorded by its nearest texel, where
+    that surface hides the light, or infinity otherwise, of shape (u, k)."""
+    ones = torch.ones_like(points[:, :1])
+    x, y, depth = (c[:, 0] for c in _texel_coordinates(maps, torch.zeros_like(points[0]), points, ones, bias))
+    width, height, offsets = maps.shapes[:, 1].int(), maps.shapes[:, 0].int(), maps.offsets.int()
+    xi = torch.minimum(x.round().clamp_min(-2), width.to(x.dtype)).int()
+    yi = torch.minimum(y.round().clamp_min(-2), height.to(x.dtype)).int()
+    inside = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
+    recorded = maps.depths[torch.where(inside, offsets + yi * width + xi, offsets)]
+    return torch.where(inside & (depth > recorded), depth - recorded, torch.full_like(depth, torch.inf))
 
 
 @lru_cache(maxsize=8)
@@ -546,7 +568,11 @@ class Shadows(NamedTuple):
 
     Cells of the sky are weighted by the phase function integrated over them, which only depends on the medium's
     anisotropy: their weights are kept for the anisotropy of the medium the shadows were traced with, and recomputed
-    from the visibility of each cell for media of other anisotropies."""
+    from the visibility of each cell for media of other anisotropies.
+
+    Cells mirrored below the horizon, from which the ground and the medium beneath light the medium, are hidden by
+    objects that hide the cell above the horizon, as objects stand on the ground, unless they stand further than where
+    light from below the horizon starts, on the ground."""
 
     rays: int
     """number of rays"""
@@ -559,6 +585,8 @@ class Shadows(NamedTuple):
     visible: torch.Tensor
     """whether each cell of the sky is visible from the middle of each sample, packed as one bit per cell, of shape
     (n, m, ceil(k / 8))"""
+    visible_below: torch.Tensor
+    """same as ``visible`` for the cells mirrored below the horizon"""
     sky_edges: tuple[float, ...]
     """sine of the elevation at the edges of the sky's bands, from the horizon up"""
     sky_counts: tuple[int, ...]
@@ -570,6 +598,8 @@ class Shadows(NamedTuple):
     sample, of shape (n, m, b), which is the same as ``weights`` for bands that are entirely visible"""
     weights: torch.Tensor
     """sum over the cells of each band of the phase function integrated over them, of shape (n, b)"""
+    visible_weights_below: torch.Tensor
+    """same as ``visible_weights`` for the cells mirrored below the horizon"""
     weights_below: torch.Tensor
     """same as ``weights`` for the cells mirrored below the horizon, of shape (n, b)"""
 
@@ -585,6 +615,7 @@ def trace(
     max_sun_samples: int = 1024,
     sky_samples: int = 8,
     sky_grid: float = 1.0,
+    ground_height: float = 0.0,
     bias: float = 0.5,
     max_depth: float = 12.0,
     memory: float = 2**30,
@@ -615,6 +646,8 @@ def trace(
         sky_samples (int, optional): Number of samples of the sky's visibility along a ray. Defaults to 8.
         sky_grid (float, optional): Size of the cells of the grid to which samples of the sky's visibility are
             snapped, in texels of the finest map of the sky. Defaults to 1.
+        ground_height (float, optional): Height of the ground, where light from below the horizon starts.
+            Defaults to 0.
         bias (float, optional): Depth bias of shadow maps, in texels, see :func:`visibility`. Defaults to 0.5.
         max_depth (float, optional): Optical depth beyond which rays are no longer sampled, as hardly any light
             scattered further reaches the camera. Defaults to 12.
@@ -691,18 +724,20 @@ def trace(
     edges, counts = occlusion.sky_edges, occlusion.sky_counts
     cells, bands = len(occlusion.sky_maps.texels), len(counts)
     if not cells:
-        empty = torch.zeros(n, 0, **kwargs)
+        empty, bits = torch.zeros(n, 0, **kwargs), torch.zeros(n, 0, 0, dtype=torch.uint8, device=directions.device)
         return Shadows(
             n,
             tuple(hidden_suns),
             bounds=empty,
             middles=empty,
-            visible=torch.zeros(n, 0, 0, dtype=torch.uint8, device=directions.device),
+            visible=bits,
+            visible_below=bits,
             sky_edges=edges,
             sky_counts=counts,
             anisotropy=medium.anisotropy,
             visible_weights=torch.zeros(n, 0, bands, **kwargs),
             weights=torch.zeros(n, bands, **kwargs),
+            visible_weights_below=torch.zeros(n, 0, bands, **kwargs),
             weights_below=torch.zeros(n, bands, **kwargs),
         )
     low_mu = (edges[0] + edges[1]) / 2
@@ -720,7 +755,7 @@ def trace(
     mean = torch.nn.functional.normalize(mean, dim=-1)
     one_hot = _band_one_hot(counts, **kwargs)
     phases = cell_phases(edges, counts, medium.anisotropy, mean)  # (d, k)
-    weights_below = (cell_phases(edges, counts, medium.anisotropy, mean, below=True) @ one_hot)[ray_bin]
+    phases_below = cell_phases(edges, counts, medium.anisotropy, mean, below=True)
 
     # Rays close to each other also sample places close to each other, so that points are snapped to a grid finer than
     # the maps' texels, and the sky's visibility is only looked up once per cell of the grid
@@ -729,33 +764,41 @@ def trace(
     box = (torch.cat([low[:2], low.new_full((1,), lowest)]) - pad, high + pad)
     grid = [_snap(origin + directions[rays, None] * middles[rays, ..., None], *box, size) for rays in _chunks(n, 2**20)]
     used, grid_cell = torch.unique(torch.cat(grid), return_inverse=True)  # (v,), (n, m)
-    zero, chunk = torch.zeros_like(origin), int(memory // (cells * 64))
-    packed = []
+    # Light from below the horizon, mirrored from each cell, starts on the ground at most this far horizontally
+    towards = occlusion.sky_maps.axes[:, 2]  # (k, 3)
+    across = towards[:, :2].norm(dim=-1)
+    chunk = int(memory // (cells * 64))
+    packed: dict[bool, list[torch.Tensor]] = {False: [], True: []}
     for part in _chunks(len(used), chunk):
         centers = _cell_centers(used[part], *box, size)
-        lit = visibility(occlusion.sky_maps, zero, centers, torch.ones_like(centers[:, :1]), bias, filtered=False)
-        packed.append(_pack(lit[:, 0] > 0.5))
-    visible = torch.cat(packed)
+        blocker = _blocker_distances(occlusion.sky_maps, centers, bias)  # (u, k)
+        reach = (centers[:, 2:3] - ground_height).clamp_min(0) * across / towards[:, 2]
+        packed[False].append(_pack(torch.isinf(blocker)))
+        packed[True].append(_pack(blocker * across >= reach))
+    visible, visible_below = torch.cat(packed[False]), torch.cat(packed[True])
 
     # Samples in the same cell of the grid, along rays of similar directions, see the same fraction of each band
     groups, group = torch.unique(grid_cell * len(bins) + ray_bin[:, None], return_inverse=True)  # (u,), (n, m)
-    fractions = []
+    fractions: dict[bool, list[torch.Tensor]] = {False: [], True: []}
     for part in _chunks(len(groups), chunk):
-        lit = _unpack(visible[groups[part] // len(bins)], cells).to(directions.dtype)
-        weighted = phases[groups[part] % len(bins)]
-        fractions.append(_ratio((lit * weighted) @ one_hot, weighted @ one_hot))
-    weights = (phases @ one_hot)[ray_bin]
+        cell, direction = groups[part] // len(bins), groups[part] % len(bins)
+        for below, bits, weighted in ((False, visible, phases), (True, visible_below, phases_below)):
+            lit = _unpack(bits[cell], cells).to(directions.dtype)
+            fractions[below].append(_ratio((lit * weighted[direction]) @ one_hot, weighted[direction] @ one_hot))
+    weights, weights_below = (phases @ one_hot)[ray_bin], (phases_below @ one_hot)[ray_bin]
     return Shadows(
         n,
         tuple(hidden_suns),
         bounds=bounds,
         middles=middles,
         visible=visible[grid_cell],
+        visible_below=visible_below[grid_cell],
         sky_edges=edges,
         sky_counts=counts,
         anisotropy=medium.anisotropy,
-        visible_weights=torch.cat(fractions)[group] * weights[:, None],
+        visible_weights=torch.cat(fractions[False])[group] * weights[:, None],
         weights=weights,
+        visible_weights_below=torch.cat(fractions[True])[group] * weights_below[:, None],
         weights_below=weights_below,
     )
 
@@ -767,25 +810,37 @@ def _band_one_hot(counts: Sequence[int], dtype: torch.dtype, device: torch.devic
 
 
 def _band_weights(
-    edges: Sequence[float], counts: Sequence[int], g: float, directions: torch.Tensor, lit: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    edges: Sequence[float],
+    counts: Sequence[int],
+    g: float,
+    directions: torch.Tensor,
+    lit: torch.Tensor,
+    lit_below: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Phase function integrated over the visible cells of each band from points along rays, given the visibility of
-    each cell, of shape (r, m, k), over all the cells of each band, and over the cells mirrored below the horizon."""
+    each cell, of shape (r, m, k), and over all the cells of each band, above and below the horizon, as the fields of
+    :class:`Shadows` of the same names."""
     one_hot = _band_one_hot(counts, directions.dtype, directions.device)  # (k, b)
     phases = cell_phases(edges, counts, g, directions)  # (r, k)
-    below = cell_phases(edges, counts, g, directions, below=True) @ one_hot
-    return torch.bmm(lit, phases[:, :, None] * one_hot), phases @ one_hot, below
+    below = cell_phases(edges, counts, g, directions, below=True)
+    return (
+        torch.bmm(lit, phases[:, :, None] * one_hot),
+        phases @ one_hot,
+        torch.bmm(lit_below, below[:, :, None] * one_hot),
+        below @ one_hot,
+    )
 
 
 def _arriving(
-    radiance: torch.Tensor, heights: torch.Tensor, visible: torch.Tensor, weights: torch.Tensor, below: torch.Tensor
+    radiance: torch.Tensor, heights: torch.Tensor, weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Light scattered more than once arriving at samples along rays from the visible cells of the sky, and from all
     of them, given the radiance arriving from each band at each height, of shape (h, 2, b), the index of the height of
     each sample, of shape (r, m), and the weights of the cells of each band, see :func:`_band_weights`."""
     up, down = radiance[heights, 0], radiance[heights, 1]  # (r, m, b)
-    from_below = (down * below[:, None]).sum(dim=-1)
-    return (up * visible).sum(dim=-1) + from_below, (up * weights[:, None]).sum(dim=-1) + from_below
+    visible, total, visible_below, total_below = weights
+    seen = up * visible + down * visible_below
+    return seen.sum(dim=-1), (up * total[:, None] + down * total_below[:, None]).sum(dim=-1)
 
 
 def shade(
@@ -807,8 +862,9 @@ def shade(
     the sun that is hidden, and between consecutive samples of the sky's visibility, by the visible fraction of the
     light arriving from all cells of the sky. Each cell contributes in proportion to the phase function integrated
     over the cell, times the mean attenuation of skylight over its elevations. Light scattered more than once is
-    occluded in the same way, with cells weighted by the radiance arriving from their elevations, assuming that light
-    from below the horizon is not occluded. Light reflected by the ground into the medium is not occluded.
+    occluded in the same way, with cells weighted by the radiance arriving from their elevations, above and below the
+    horizon, and so is light reflected by the ground into the medium, which arrives from below the horizon, see
+    :class:`Shadows`.
 
     Args:
         shadows (Shadows): Where objects hide suns and the sky along the rays, see :func:`trace`.
@@ -872,7 +928,11 @@ def shade(
     total = total + sum(whole[1:], whole[0]) if whole else total
     edges, counts = shadows.sky_edges, shadows.sky_counts
     cells, samples = sum(counts), shadows.middles.shape[1]
-    occluded = {name: table for name, table in tables.items() if name == "sky" or (name == "scattered" and scattering)}
+    occluded = {
+        name: table
+        for name, table in tables.items()
+        if name in ("sky", "ground") or (name == "scattered" and scattering)
+    }
     if not occluded or not shadows.middles.numel():
         return total
 
@@ -880,13 +940,19 @@ def shade(
     reweight = abs(medium.anisotropy - shadows.anisotropy) > 1e-12
     radiance = band_radiance(scattering, edges).sum(dim=-1) if "scattered" in occluded and scattering else None
 
-    for rays in _chunks(n, int(memory // (samples * (cells * 24 if reweight else len(counts) * 64)))):
+    for rays in _chunks(n, int(memory // (samples * (cells * 48 if reweight else len(counts) * 128)))):
         bounds, middle = shadows.bounds[rays], shadows.middles[rays]
         if reweight:
-            lit = _unpack(shadows.visible[rays], cells).to(directions.dtype)  # (r, m, k)
-            visible, weights, below = _band_weights(edges, counts, medium.anisotropy, directions[rays], lit)
+            lit, lit_below = (
+                _unpack(bits[rays], cells).to(directions.dtype) for bits in (shadows.visible, shadows.visible_below)
+            )
+            weights = _band_weights(edges, counts, medium.anisotropy, directions[rays], lit, lit_below)
         else:
-            visible, weights, below = (shadows.visible_weights[rays], shadows.weights[rays], shadows.weights_below[rays])
+            weights = tuple(
+                getattr(shadows, name)[rays]
+                for name in ("visible_weights", "weights", "visible_weights_below", "weights_below")
+            )
+        visible, whole_band, visible_below, whole_below = weights
         # Optical depth of the fog above each sample, per channel
         above = fog.density * torch.exp(-(origin_z + middle * v_z[rays] - fog.base_height) / fog.falloff)
         above = (above * fog.falloff)[..., None] * beta  # (r, m, c)
@@ -895,7 +961,10 @@ def shade(
         if "sky" in occluded:
             attenuation = band_attenuation(edges, above)  # (r, m, c, b)
             visible_sky = (attenuation * visible[:, :, None]).sum(dim=-1)
-            ratios["sky"] = _ratio(visible_sky, (attenuation * weights[:, None, None]).sum(dim=-1))
+            ratios["sky"] = _ratio(visible_sky, (attenuation * whole_band[:, None, None]).sum(dim=-1))
+        if "ground" in occluded:
+            # Light reflected by the ground arrives from below the horizon, which objects standing nearby hide
+            ratios["ground"] = _ratio(visible_below.sum(dim=-1), whole_below.sum(dim=-1)[:, None])[..., None]
         if radiance is not None and scattering is not None:
             # The cells are weighted by the radiance arriving from them summed over channels, as their visibility is
             # the same for all channels, which is much cheaper than a ratio per channel and hardly differs from it
@@ -904,7 +973,7 @@ def shade(
             fh = heights.clamp(0, scattering.height_scale) / scattering.height_scale * (n_heights - 1)
             h = fh.floor().clamp(0, n_heights - 2).long()
             (low_visible, low_total), (high_visible, high_total) = (
-                _arriving(radiance, index, visible, weights, below) for index in (h, h + 1)
+                _arriving(radiance, index, weights) for index in (h, h + 1)
             )
             weight = fh - h
             visible_light = torch.lerp(low_visible, high_visible, weight)
@@ -931,6 +1000,7 @@ def occluded_inscatter(
     max_sun_samples: int = 1024,
     sky_samples: int = 8,
     sky_grid: float = 1.0,
+    ground_height: float = 0.0,
     bias: float = 0.5,
     max_depth: float = 12.0,
     memory: float = 2**30,
@@ -959,6 +1029,8 @@ def occluded_inscatter(
         sky_samples (int, optional): Number of samples of the sky's visibility along a ray. Defaults to 8.
         sky_grid (float, optional): Size of the cells of the grid to which samples of the sky's visibility are
             snapped, in texels of the finest map of the sky. Defaults to 1.
+        ground_height (float, optional): Height of the ground, where light from below the horizon starts.
+            Defaults to 0.
         bias (float, optional): Depth bias of shadow maps, in texels, see :func:`visibility`. Defaults to 0.5.
         max_depth (float, optional): Optical depth beyond which rays are no longer sampled, as hardly any light
             scattered further reaches the camera. Defaults to 12.
@@ -979,6 +1051,7 @@ def occluded_inscatter(
         max_sun_samples=max_sun_samples,
         sky_samples=sky_samples,
         sky_grid=sky_grid,
+        ground_height=ground_height,
         bias=bias,
         max_depth=max_depth,
         memory=memory,

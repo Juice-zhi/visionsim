@@ -137,8 +137,10 @@ a few texels of the sun's map, intervals that lie entirely above or below the su
 hidden as a whole, and the others, which the edge of a shadow may cross, are sampled every texel. Skylight and light
 scattered more than once are sampled more coarsely, as each point is lit by many cells, each weighted by how much
 light it scatters towards the camera. As rays close to each other sample places close to each other, these places are
-snapped to a grid finer than the texels of the sky's maps, whose cells are each looked up once. See
-:mod:`visionsim.medium.occlusion` for details.
+snapped to a grid finer than the texels of the sky's maps, whose cells are each looked up once. Light that reaches
+the medium from below the horizon, reflected by the ground or scattered by the medium beneath, is hidden by objects
+standing on the ground as the mirrored cells above the horizon are, unless they stand further than where this light
+starts on the ground. See :mod:`visionsim.medium.occlusion` for details.
 
 |
 
@@ -167,11 +169,15 @@ Limitations
 
 The following are not yet modeled:
 
-- Shadows of moving objects, as shadow maps are rendered once per scene, and shadows on the light reflected by the
-  ground or emitted by point lights.
+- Shadows of moving objects, as shadow maps are rendered once per scene, and shadows on the light emitted by point
+  lights.
 - Spot and area lights, as well as emissive surfaces, lighting the medium. Light from point lights is only
   scattered once, which misses about 30% of their glow in the dense fog of ``examples/medium``.
 - Multiple scattering in media other than a single height fog, and skies whose radiance varies with direction.
-- The dimming of surfaces lit through the medium, and their lighting by the fog's glow.
+- Multiple scattering near objects, which is overestimated, by about 30% to 60% within 5 m of the objects of
+  ``examples/medium``: the medium around objects is itself in their shadow, and so darker than the open medium that
+  the approximation assumes.
+- The dimming of surfaces lit through the medium, and their lighting by the fog's glow. With multiple scattering, the
+  two nearly cancel out in ``examples/medium``, whereas with single scattering surfaces are about 12% darker.
 - Anti-aliasing: depth maps are not anti-aliased, so edges between near and far objects can show halos in dense
   media. Rendering at a higher resolution and downsampling the results reduces these.
