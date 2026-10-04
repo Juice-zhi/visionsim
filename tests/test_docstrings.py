@@ -10,7 +10,7 @@ from docstring_parser import parse_from_object
 from visionsim.cli import _cli_modules
 from visionsim.dataset import dataset, models
 from visionsim.interpolate import pose
-from visionsim.medium import model, occlusion, optics, raymarch, render, scattering, transient
+from visionsim.medium import lights, model, occlusion, optics, raymarch, render, scattering, surfaces, transient
 from visionsim.simulate import blender, config, install, job, schema
 
 
@@ -44,6 +44,7 @@ def get_public_members(obj, module=None):
         (blender.BlenderService.exposed_include_diffuse_pass, config.DiffusePassConfig),
         (blender.BlenderService.exposed_include_specular_pass, config.SpecularPassConfig),
         (blender.BlenderService.exposed_include_points, config.PointsConfig),
+        (blender.BlenderService.exposed_include_emission, config.EmissionConfig),
     ],
 )
 def test_output_configs(func, conf):
@@ -67,12 +68,14 @@ def test_output_configs(func, conf):
             dataset,
             models,
             pose,
+            lights,
             model,
             occlusion,
             optics,
             render,
             raymarch,
             scattering,
+            surfaces,
             transient,
         ]
         for m in get_public_members(mod)

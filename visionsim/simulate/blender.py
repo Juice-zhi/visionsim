@@ -1413,6 +1413,30 @@ class BlenderService(rpyc.Service):
             )
 
     @require_initialized_service
+    def exposed_include_emission(self, exr_codec: EXR_CODECS = "DWAA", bit_depth: Literal[16, 32] = 32) -> None:
+        """Sets up Blender compositor to include the light that surfaces seen by the camera emit.
+
+        Emitted light doesn't depend on the light that reaches surfaces, so it is left as rendered when a participating
+        medium dims the light reaching surfaces, e.g. the light of screens or of lamps seen directly, see
+        :mod:`visionsim.medium.surfaces`.
+
+        Args:
+            exr_codec (str, optional): Codec used to compress exr file. Defaults to "DWAA".
+            bit_depth (int, optional): Bit depth per channel, either 16 or 32 bits. Defaults to 32 bits.
+        """
+        self.view_layer.use_pass_emit = True
+        name = "Emission" if "Emission" in self.render_layers.outputs else "Emit"
+        self._include_output(
+            "emission",
+            self.render_layers.outputs[name],
+            label="Emission Output",
+            file_format="OPEN_EXR",
+            color_mode="RGB",
+            exr_codec=exr_codec,
+            bit_depth=bit_depth,
+        )
+
+    @require_initialized_service
     def exposed_include_specular_pass(
         self,
         file_format: FILE_FORMATS = "OPEN_EXR",

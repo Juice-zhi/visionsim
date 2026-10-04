@@ -6,8 +6,9 @@ depth and linear radiance of the scene. The medium is described by a small set o
 computed in closed form, which yields a unique, noise-free solution that all sensor emulators can share, including
 active sensors whose time-resolved measurements are given by :func:`flash_transient`. Objects can cast shadows onto
 the medium, through shadow maps of the scene loaded with :func:`load_occlusion`, and the shadows traced along the
-rays of a frame can be reused for several media (:func:`trace_shadows`). The same model can also be integrated by
-ray marching (:func:`ray_march_medium`), which serves as a baseline.
+rays of a frame can be reused for several media (:func:`trace_shadows`). Given the normals of surfaces, surfaces are
+lit through the medium too (:mod:`visionsim.medium.surfaces`). The same model can also be integrated by ray marching
+(:func:`ray_march_medium`), which serves as a baseline.
 """
 
 from visionsim.medium.model import (

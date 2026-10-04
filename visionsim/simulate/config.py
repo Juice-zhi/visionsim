@@ -154,6 +154,16 @@ class PointsConfig:
 
 
 @dataclass
+class EmissionConfig:
+    """For more information see :meth:`include_emission <visionsim.simulate.blender.BlenderService.exposed_include_emission>`."""
+
+    exr_codec: EXR_CODECS = "DWAA"
+    """Encoding used to compress EXRs"""
+    bit_depth: Literal[16, 32] = 32
+    """Bit depth used for saving emitted light"""
+
+
+@dataclass
 class OcclusionConfig:
     """For more information see :meth:`save_occlusion <visionsim.simulate.blender.BlenderService.exposed_save_occlusion>`."""
 
@@ -163,6 +173,8 @@ class OcclusionConfig:
     """Number of texels along the longest side of the shadow maps of suns"""
     sky_resolution: int = 512
     """Number of texels along the longest side of the shadow maps of the sky"""
+    lamp_resolution: int = 1024
+    """Number of texels along the width of the maps of lamps, which span all directions around them"""
 
 
 @dataclass
@@ -215,6 +227,10 @@ class RenderConfig:
     """If true, enable world-space point map outputs"""
     points: PointsConfig = field(default_factory=PointsConfig)
     """Point maps configuration options"""
+    include_emission: bool = False
+    """If true, save the light that surfaces emit, which participating media added with ``medium.apply`` don't dim"""
+    emission: EmissionConfig = field(default_factory=EmissionConfig)
+    """Emitted light configuration options"""
     include_lighting: bool = False
     """If true, save the scene's lighting to ``lighting.json``, as needed to add participating media with ``medium.apply``"""
     include_occlusion: bool = False
@@ -278,6 +294,7 @@ class RenderConfig:
             self.include_diffuse_pass = True
             self.include_specular_pass = True
             self.include_points = True
+            self.include_emission = True
             self.include_lighting = True
 
         self.depths.preview &= self.previews

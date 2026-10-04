@@ -43,6 +43,7 @@ from visionsim.simulate.schema import _MODELS, _Data
         # "specular/light",
         "points",
         "previews/points",
+        "emission",
     ],
 )
 def test_render_layout(cube_dataset, gt_type):
@@ -77,6 +78,7 @@ def test_render_layout(cube_dataset, gt_type):
         ("specular/indirect", ["RGB"]),
         # ("specular/light", ["RGB"]),
         ("points", ["RGB"]),
+        ("emission", ["RGB"]),
     ],
 )
 def test_groundtruth_exrs(cube_dataset, subdir, channels):
@@ -113,6 +115,7 @@ def test_groundtruth_exrs(cube_dataset, subdir, channels):
         ("specular/indirect", (50, 50, 3), False),
         # ("specular/light", (50, 50, 3)),
         ("points", (50, 50, 3), False),
+        ("emission", (50, 50, 3), False),
     ],
 )
 def test_load_exrs(cube_dataset, subdir, shape, auto_collapse):
@@ -219,8 +222,8 @@ def test_save_occlusion(executable, tmp_path):
     end = center + 3 * away + 6 * side / side.norm()
     direction = (end - origin) / (end - origin).norm()
     length = (end - origin).norm()[None]
-    average = lamp_shadow(occlusion.lamp_maps, 0, origin, direction[None], length, samples=1024)
-    mean = average(torch.stack([torch.zeros_like(length), length], dim=-1))
+    shadow = lamp_shadow(occlusion.lamp_maps, 0, origin, direction[None], length, samples=1024)
+    mean = shadow.average(torch.stack([torch.zeros_like(length), length], dim=-1))
     along = float(direction @ (lamp - origin))
     closest = float((origin + along * direction - lamp).norm())
     angles = torch.linspace(math.atan2(-along, closest), math.atan2(length.item() - along, closest), 20001)

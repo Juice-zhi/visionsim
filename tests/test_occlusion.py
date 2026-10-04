@@ -573,7 +573,9 @@ def test_lamp_shadows_skip_hidden_rays():
     ours = lamp_inscatter(FOG, origin, directions, distance, beta, lamp, maps=maps)[:, 0]
     # The same quadrature, weighted by the visibility of every ray, including those entirely in the shadow
     shadow = lamp_shadow(maps, 0, origin, directions, distance)
-    expected = point_light_inscatter(FOG, origin, directions, distance, maps.origins[0], beta, shadow=shadow)[:, 0]
+    expected = point_light_inscatter(FOG, origin, directions, distance, maps.origins[0], beta, shadow=shadow.average)[
+        :, 0
+    ]
     assert 0 < int((~shadow.lit).sum()) < len(directions) and torch.all(ours[~shadow.lit] == 0)
     assert torch.allclose(ours, expected, rtol=1e-12)
     # Light only comes out of the window, around +x

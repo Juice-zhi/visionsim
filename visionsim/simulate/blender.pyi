@@ -37,6 +37,14 @@ def _sky_cell_directions(edges: Sequence[float], counts: Sequence[int]) -> npt.N
     """Central direction of each cell of the sky, as in :func:`visionsim.medium.occlusion.sky_cell_directions`, which
     cannot be imported from within Blender."""
 
+_BLACKBODY_BOUNDS: Incomplete
+_BLACKBODY_R: Incomplete
+_BLACKBODY_G: Incomplete
+_BLACKBODY_B: Incomplete
+
+def _blackbody(temperature: float) -> list[float]:
+    """Linear Rec.709 color of a black body at a temperature in Kelvin, as computed by Cycles' Blackbody node."""
+
 def require_connected_client(func: Callable[..., Any]) -> Callable[..., Any]:
     """Decorator which ensures a client is connected.
 
@@ -650,6 +658,19 @@ class BlenderService(rpyc.Service):
         """
 
     @require_initialized_service
+    def exposed_include_emission(self, exr_codec: EXR_CODECS = "DWAA", bit_depth: Literal[16, 32] = 32) -> None:
+        """Sets up Blender compositor to include the light that surfaces seen by the camera emit.
+
+        Emitted light doesn't depend on the light that reaches surfaces, so it is left as rendered when a participating
+        medium dims the light reaching surfaces, e.g. the light of screens or of lamps seen directly, see
+        :mod:`visionsim.medium.surfaces`.
+
+        Args:
+            exr_codec (str, optional): Codec used to compress exr file. Defaults to "DWAA".
+            bit_depth (int, optional): Bit depth per channel, either 16 or 32 bits. Defaults to 32 bits.
+        """
+
+    @require_initialized_service
     def exposed_include_specular_pass(
         self,
         file_format: FILE_FORMATS = "OPEN_EXR",
@@ -834,15 +855,31 @@ class BlenderService(rpyc.Service):
     def _world_radiance(self) -> list[float]:
         """Average radiance of the world background above the horizon."""
 
+    def _light_emission(self, obj: bpy.types.Object) -> tuple[list[float], dict[str, Any]]:
+        """Color by which the node tree of a light scales its emission, and how its emission falls off with distance.
+
+        Only the node trees that commonly set a light's emission are evaluated, as Cycles does: an Emission node, whose
+        color can come from a Blackbody node, and whose strength can come from a Light Falloff node, or from an IES
+        Texture node, whose angular profile is not supported. Other nodes are ignored, with a warning.
+
+        Args:
+            obj (bpy.types.Object): Light object.
+
+        Returns:
+            tuple[list[float], dict[str, Any]]: Scale of the light's RGB color, and the ``falloff`` and ``smooth`` of
+            the light, if its strength is set by a Light Falloff node, see :class:`PointLight
+            <visionsim.medium.model.PointLight>`.
+        """
+
     @require_initialized_service
     def exposed_lighting_info(self) -> dict[str, Any]:
         """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
 
-        This includes sun and point lights, whose intensities account for their exposure and volume factor, as well
-        as the average radiance of the world background above the horizon, i.e. the sky (either a constant color or
-        an environment texture). Light temperatures, spot and area lights, and other world shaders are not supported
-        and are ignored, with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for
-        its usage.
+        This includes sun, point, spot and area lights, whose intensities account for their exposure, temperature,
+        volume factor and common node trees (see :meth:`_light_emission`), as well as the average radiance of the world
+        background above the horizon, i.e. the sky (either a constant color or an environment texture). Other world
+        shaders, square spots, and the elliptical cones of spots scaled unevenly are not supported, and approximated
+        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
 
         Returns:
             dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
@@ -857,6 +894,10 @@ class BlenderService(rpyc.Service):
                 root directory of the renders.
         """
 
+    @staticmethod
+    def _volume_only(obj: bpy.types.Object) -> bool:
+        """Whether an object is only a volume, such as the medium itself when rendered by Cycles."""
+
     @require_initialized_service
     def _shadow_casters(self, exclude: Collection[str]) -> tuple[list[bpy.types.Object], npt.NDArray[np.floating]]:
         """Objects that cast shadows onto a participating medium, and the corners of the box that contains them."""
@@ -870,14 +911,17 @@ class BlenderService(rpyc.Service):
         sky_cells: Sequence[int] = ...,
         sun_resolution: int = 2048,
         sky_resolution: int = 512,
+        lamp_resolution: int = 1024,
     ) -> None:
         """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
 
         Orthographic depth maps of the objects that cast shadows are rendered with Cycles along the direction of each
         sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
-        split into equal ranges of azimuth. Maps span the box that contains these objects, and are saved to a ``.npz``
-        file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current frame, so
-        objects should be static. Render settings, the camera and the compositor are restored afterwards.
+        split into equal ranges of azimuth. Maps span the box that contains these objects. The distance to the first
+        object in every direction around each lamp (point, spot and area lights) is also rendered, in equirectangular
+        maps. All maps are saved to a ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They
+        are captured at the current frame, so objects should be static. Render settings, the camera and the compositor
+        are restored afterwards.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
@@ -892,6 +936,8 @@ class BlenderService(rpyc.Service):
                 Defaults to 2048.
             sky_resolution (int, optional): Number of texels along the longest side of the maps of the sky.
                 Defaults to 512.
+            lamp_resolution (int, optional): Number of texels along the width of the maps of lamps, which span all
+                azimuths, and half as many along their height, which spans all elevations. Defaults to 1024.
 
         Raises:
             ValueError: raised if the number of bands of the sky and of their edges do not match.
@@ -1489,6 +1535,19 @@ class BlenderClient:
         """
 
     @type_check_only
+    def include_emission(self, exr_codec: EXR_CODECS = "DWAA", bit_depth: Literal[16, 32] = 32) -> None:
+        """Sets up Blender compositor to include the light that surfaces seen by the camera emit.
+
+        Emitted light doesn't depend on the light that reaches surfaces, so it is left as rendered when a participating
+        medium dims the light reaching surfaces, e.g. the light of screens or of lamps seen directly, see
+        :mod:`visionsim.medium.surfaces`.
+
+        Args:
+            exr_codec (str, optional): Codec used to compress exr file. Defaults to "DWAA".
+            bit_depth (int, optional): Bit depth per channel, either 16 or 32 bits. Defaults to 32 bits.
+        """
+
+    @type_check_only
     def include_specular_pass(
         self,
         file_format: FILE_FORMATS = "OPEN_EXR",
@@ -1662,11 +1721,11 @@ class BlenderClient:
     def lighting_info(self) -> dict[str, Any]:
         """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
 
-        This includes sun and point lights, whose intensities account for their exposure and volume factor, as well
-        as the average radiance of the world background above the horizon, i.e. the sky (either a constant color or
-        an environment texture). Light temperatures, spot and area lights, and other world shaders are not supported
-        and are ignored, with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for
-        its usage.
+        This includes sun, point, spot and area lights, whose intensities account for their exposure, temperature,
+        volume factor and common node trees (see :meth:`_light_emission`), as well as the average radiance of the world
+        background above the horizon, i.e. the sky (either a constant color or an environment texture). Other world
+        shaders, square spots, and the elliptical cones of spots scaled unevenly are not supported, and approximated
+        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
 
         Returns:
             dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
@@ -1690,14 +1749,17 @@ class BlenderClient:
         sky_cells: Sequence[int] = ...,
         sun_resolution: int = 2048,
         sky_resolution: int = 512,
+        lamp_resolution: int = 1024,
     ) -> None:
         """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
 
         Orthographic depth maps of the objects that cast shadows are rendered with Cycles along the direction of each
         sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
-        split into equal ranges of azimuth. Maps span the box that contains these objects, and are saved to a ``.npz``
-        file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current frame, so
-        objects should be static. Render settings, the camera and the compositor are restored afterwards.
+        split into equal ranges of azimuth. Maps span the box that contains these objects. The distance to the first
+        object in every direction around each lamp (point, spot and area lights) is also rendered, in equirectangular
+        maps. All maps are saved to a ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They
+        are captured at the current frame, so objects should be static. Render settings, the camera and the compositor
+        are restored afterwards.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
@@ -1712,6 +1774,8 @@ class BlenderClient:
                 Defaults to 2048.
             sky_resolution (int, optional): Number of texels along the longest side of the maps of the sky.
                 Defaults to 512.
+            lamp_resolution (int, optional): Number of texels along the width of the maps of lamps, which span all
+                azimuths, and half as many along their height, which spans all elevations. Defaults to 1024.
 
         Raises:
             ValueError: raised if the number of bands of the sky and of their edges do not match.
@@ -2382,6 +2446,19 @@ class BlenderClients(tuple):
         """
 
     @type_check_only
+    def include_emission(self, exr_codec: EXR_CODECS = "DWAA", bit_depth: Literal[16, 32] = 32) -> None:
+        """Sets up Blender compositor to include the light that surfaces seen by the camera emit.
+
+        Emitted light doesn't depend on the light that reaches surfaces, so it is left as rendered when a participating
+        medium dims the light reaching surfaces, e.g. the light of screens or of lamps seen directly, see
+        :mod:`visionsim.medium.surfaces`.
+
+        Args:
+            exr_codec (str, optional): Codec used to compress exr file. Defaults to "DWAA".
+            bit_depth (int, optional): Bit depth per channel, either 16 or 32 bits. Defaults to 32 bits.
+        """
+
+    @type_check_only
     def include_specular_pass(
         self,
         file_format: FILE_FORMATS = "OPEN_EXR",
@@ -2555,11 +2632,11 @@ class BlenderClients(tuple):
     def lighting_info(self) -> tuple[dict[str, Any],]:
         """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
 
-        This includes sun and point lights, whose intensities account for their exposure and volume factor, as well
-        as the average radiance of the world background above the horizon, i.e. the sky (either a constant color or
-        an environment texture). Light temperatures, spot and area lights, and other world shaders are not supported
-        and are ignored, with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for
-        its usage.
+        This includes sun, point, spot and area lights, whose intensities account for their exposure, temperature,
+        volume factor and common node trees (see :meth:`_light_emission`), as well as the average radiance of the world
+        background above the horizon, i.e. the sky (either a constant color or an environment texture). Other world
+        shaders, square spots, and the elliptical cones of spots scaled unevenly are not supported, and approximated
+        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
 
         Returns:
             dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
@@ -2583,14 +2660,17 @@ class BlenderClients(tuple):
         sky_cells: Sequence[int] = ...,
         sun_resolution: int = 2048,
         sky_resolution: int = 512,
+        lamp_resolution: int = 1024,
     ) -> None:
         """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
 
         Orthographic depth maps of the objects that cast shadows are rendered with Cycles along the direction of each
         sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
-        split into equal ranges of azimuth. Maps span the box that contains these objects, and are saved to a ``.npz``
-        file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current frame, so
-        objects should be static. Render settings, the camera and the compositor are restored afterwards.
+        split into equal ranges of azimuth. Maps span the box that contains these objects. The distance to the first
+        object in every direction around each lamp (point, spot and area lights) is also rendered, in equirectangular
+        maps. All maps are saved to a ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They
+        are captured at the current frame, so objects should be static. Render settings, the camera and the compositor
+        are restored afterwards.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
@@ -2605,6 +2685,8 @@ class BlenderClients(tuple):
                 Defaults to 2048.
             sky_resolution (int, optional): Number of texels along the longest side of the maps of the sky.
                 Defaults to 512.
+            lamp_resolution (int, optional): Number of texels along the width of the maps of lamps, which span all
+                azimuths, and half as many along their height, which spans all elevations. Defaults to 1024.
 
         Raises:
             ValueError: raised if the number of bands of the sky and of their edges do not match.

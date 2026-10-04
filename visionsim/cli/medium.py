@@ -28,6 +28,9 @@ def apply(
     occlusion: Path | None = None,
     frames: str = "frames",
     depths: str = "depths",
+    normals: str = "normals",
+    emission: str = "emission",
+    surfaces: bool = True,
     wavelengths: tuple[float, ...] | None = None,
     fps: float | None = None,
     device: str | None = None,
@@ -36,8 +39,10 @@ def apply(
     """Add a participating medium, such as fog or haze, to rendered frames
 
     The medium is computed in closed form from the linear frames and depth maps of a render (see :mod:`visionsim.medium`),
-    and the resulting frames can be used as the input of any sensor emulator. Ground truth transmittance, optical depth
-    and in-scattered radiance are saved alongside them, as well as the medium and lighting that were used.
+    and the resulting frames can be used as the input of any sensor emulator. When the render includes normal maps,
+    surfaces are also lit through the medium (see :mod:`visionsim.medium.surfaces`). Ground truth transmittance, optical
+    depth, in-scattered radiance and the illumination of surfaces are saved alongside them, as well as the medium and
+    lighting that were used.
 
     Args:
         input_dir: directory containing rendered frames and depth maps, such as the output of ``blender.render-animation``
@@ -51,6 +56,12 @@ def apply(
         frames: name of the directory containing frames within ``input_dir``, these should be linear (EXR/HDR)
             as tonemapped frames have clipped highlights
         depths: name of the directory containing depth maps within ``input_dir``
+        normals: name of the directory containing normal maps within ``input_dir``, saved in the camera's space as
+            with ``--include-normals``, through which surfaces are lit through the medium. Without them, surfaces keep
+            the light they were rendered with
+        emission: name of the directory containing the light emitted by surfaces within ``input_dir``, as saved with
+            ``--include-emission``, which the medium doesn't dim. Without it, surfaces are assumed not to emit light
+        surfaces: if false, surfaces keep the light they were rendered with, even with normal maps
         wavelengths: effective wavelength, in nm, of each color channel. Defaults to 550 for grayscale frames,
             and to (610, 550, 465) otherwise
         fps: frame rate of the sequence, only needed for moving media. Inferred from the dataset if possible,
@@ -92,9 +103,16 @@ def apply(
 
     ds_frames = Dataset.from_path(input_dir / frames)
     ds_depths = Dataset.from_path(input_dir / depths)
+    ds_normals = Dataset.from_path(input_dir / normals) if surfaces and (input_dir / normals).exists() else None
+    ds_emission = Dataset.from_path(input_dir / emission) if ds_normals and (input_dir / emission).exists() else None
+    if surfaces and ds_normals is None:
+        _log.info("No normal maps found, surfaces keep the light they were rendered with.")
 
     if len(ds_frames) != len(ds_depths):
         raise ValueError(f"Found {len(ds_frames)} frames but {len(ds_depths)} depth maps.")
+    for name, ds in (("normal maps", ds_normals), ("emission maps", ds_emission)):
+        if ds is not None and len(ds) != len(ds_frames):
+            raise ValueError(f"Found {len(ds_frames)} frames but {len(ds)} {name}.")
     if fps is None and ds_frames.cameras:
         # A keyframe multiplier slows the animation down, so consecutive frames are closer in time
         framerates = {cam.fps * (getattr(cam, "keyframe_scale", None) or 1) for cam in ds_frames.cameras if cam.fps}
@@ -103,6 +121,8 @@ def apply(
         raise ValueError("The medium moves but the frame rate is unknown, please specify it with `--fps`.")
 
     outputs: dict[str, list[dict]] = {"frames": [], "transmittance": [], "optical-depth": [], "inscatter": []}
+    if ds_normals is not None:
+        outputs["illumination"] = []
 
     with ElapsedProgress() as progress:
         task = progress.add_task("Adding medium", total=len(ds_frames))
@@ -119,6 +139,7 @@ def apply(
             if radiance.shape[-1] == 1 and (c := transform.get("c") or 1) > 1:
                 # EXRs whose channels are all identical, as in gray scenes, are collapsed when loaded
                 radiance = np.repeat(radiance, c, axis=-1)
+            emitted = np.asarray(ds_emission[i][0], dtype=float) if ds_emission is not None else None
 
             result = apply_medium(
                 radiance,
@@ -130,12 +151,16 @@ def apply(
                 wavelengths=wavelengths,
                 time=i / fps if fps else 0.0,
                 occlusion=shadows,
+                normals=np.asarray(ds_normals[i][0], dtype=float) if ds_normals is not None else None,
+                normals_space="camera",
+                emission=emitted,
                 device=device,
             )
             relative = path.relative_to(ds_frames.root or "").with_suffix(".exr")
             pose = np.asarray(transform["transform_matrix"]).tolist()
 
             for (name, transforms), data in zip(outputs.items(), result):
+                assert data is not None
                 _write_exr(output_dir / name / relative, data.cpu().numpy())
                 transforms.append(transform | {"file_path": relative, "c": data.shape[-1], "transform_matrix": pose})
             progress.update(task, advance=1)

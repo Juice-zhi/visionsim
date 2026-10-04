@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 import numpy as np
 import numpy.typing as npt
@@ -39,6 +39,7 @@ from visionsim.medium.scattering import (
     lookup,
     tabulate_along_rays,
 )
+from visionsim.medium.surfaces import surface_attenuation, surface_irradiance
 
 RGB_WAVELENGTHS: tuple[float, float, float] = (610.0, 550.0, 465.0)
 """Approximate effective wavelengths, in nm, of the red, green and blue channels of linear sRGB images"""
@@ -59,14 +60,17 @@ class MediumResult(NamedTuple):
     """Radiance seen through a participating medium, alongside ground truth quantities, all of shape (h, w, c)."""
 
     radiance: torch.Tensor
-    """radiance reaching the camera, i.e. ``transmittance * surface_radiance + inscatter``, where any channels
-    beyond the modeled wavelengths (such as alpha) are passed through unchanged"""
+    """radiance reaching the camera, i.e. ``transmittance * illumination * surface_radiance + inscatter``, where any
+    channels beyond the modeled wavelengths (such as alpha) are passed through unchanged"""
     transmittance: torch.Tensor
     """fraction of the surface radiance that reaches the camera"""
     optical_depth: torch.Tensor
     """optical depth between the camera and the surface, i.e. ``-ln(transmittance)``"""
     inscatter: torch.Tensor
     """radiance scattered towards the camera by the medium"""
+    illumination: torch.Tensor | None = None
+    """ratio by which the medium scales the light of surfaces lit through it, see :mod:`visionsim.medium.surfaces`,
+    or None if surfaces are left as they were rendered without the medium"""
 
 
 def camera_rays(
@@ -194,7 +198,7 @@ def lamp_inscatter(
                     cone=emitter.cone,
                     profile=emitter.profile,
                     falloff=emitter.falloff,
-                    shadow=shadow,
+                    shadow=shadow.average if shadow is not None else None,
                 )
                 total = total + emitter.intensity * light
             if seen is not None:
@@ -243,6 +247,9 @@ def apply_medium(
     shadows: Shadows | None = None,
     shadow_step: float = 8.0,
     shadow_samples: int = 8,
+    normals: npt.ArrayLike | torch.Tensor | None = None,
+    normals_space: Literal["world", "camera"] = "world",
+    emission: npt.ArrayLike | torch.Tensor | None = None,
     device: torch.device | str | None = None,
     dtype: torch.dtype = torch.float64,
 ) -> MediumResult:
@@ -254,14 +261,14 @@ def apply_medium(
     more than once) is integrated once per frame along rays of every elevation and interpolated, see
     :mod:`visionsim.medium.scattering`, and light from point, spot and area lights is integrated with a quadrature that
     removes its singularity, see :func:`lamp_inscatter`. When shadow maps of the scene are given, objects cast shadows
-    onto the medium (light shafts) and hide part of the sky from it, see :mod:`visionsim.medium.occlusion`. The result
-    is deterministic and noise-free for the given model, which makes it suitable as the common input of all sensor
-    emulators, which then only add their own noise.
+    onto the medium (light shafts) and hide part of the sky from it, see :mod:`visionsim.medium.occlusion`. Given the
+    normals of surfaces, surfaces are also lit through the medium, which dims their light on its way to them while its
+    glow lights them, see :mod:`visionsim.medium.surfaces`. The result is deterministic and noise-free for the given
+    model, which makes it suitable as the common input of all sensor emulators, which then only add their own noise.
 
     Note:
-        The dimming of surfaces lit through the medium is not yet modeled, light from lamps is only scattered
-        once and isn't occluded, and neither is light reflected by the ground into the medium. The sky is assumed to
-        have a uniform radiance above the horizon, and to be occluded by the ground below it.
+        Light from lamps is only scattered once, and light reflected by the ground into the medium isn't occluded.
+        The sky is assumed to have a uniform radiance above the horizon, and to be occluded by the ground below it.
 
     Args:
         radiance (npt.ArrayLike | torch.Tensor): Linear radiance of the scene without the medium, of shape (h, w, c).
@@ -291,6 +298,16 @@ def apply_medium(
             Defaults to 8.
         shadow_samples (int, optional): Number of samples of the visibility of the sky along each ray.
             Defaults to 8.
+        normals (npt.ArrayLike | torch.Tensor | None, optional): Normals of the surfaces seen by each pixel, of shape
+            (h, w, 3), through which surfaces are lit through the medium, see :mod:`visionsim.medium.surfaces`.
+            Defaults to None, i.e. surfaces keep the light they were rendered with.
+        normals_space (Literal["world", "camera"], optional): Whether normals are in world space, as Blender's normal
+            pass, or in the space of the camera (x towards the right, y up and z towards the back), as saved by
+            :meth:`include_normals <visionsim.simulate.blender.BlenderService.exposed_include_normals>`.
+            Defaults to "world".
+        emission (npt.ArrayLike | torch.Tensor | None, optional): Light that surfaces emit, of the same shape as
+            ``radiance``, e.g. Blender's emission pass, which isn't affected by the light reaching them. Defaults to
+            None, i.e. surfaces don't emit light.
         device (torch.device | str | None, optional): Device to run on. Defaults to None (CPU).
         dtype (torch.dtype, optional): Floating point precision. Defaults to torch.float64.
 
@@ -298,7 +315,8 @@ def apply_medium(
         ValueError: raised if the shapes of the inputs, wavelengths and lighting do not match.
 
     Returns:
-        MediumResult: Radiance seen through the medium, alongside its transmittance, optical depth and in-scattering.
+        MediumResult: Radiance seen through the medium, alongside its transmittance, optical depth, in-scattering, and
+        the ratio by which it scales the light of surfaces.
     """
     kwargs: dict[str, Any] = {"dtype": dtype, "device": device}
     radiance = radiance.to(**kwargs) if torch.is_tensor(radiance) else torch.tensor(np.asarray(radiance), **kwargs)
@@ -423,12 +441,71 @@ def apply_medium(
         )
         inscatter = inscatter + medium.albedo * light.reshape(*distance.shape, n)
 
+    # Surfaces are lit through the medium, which dims the light they reflect, but not the light they emit
+    surfaces, illumination = radiance[..., :n], None
+    if normals is not None:
+        illumination = _illumination(
+            normals,
+            normals_space,
+            transform_matrix,
+            origin,
+            directions,
+            distance,
+            medium,
+            lighting,
+            beta,
+            occlusion,
+            time,
+        )
+        emitted = 0.0 if emission is None else torch.as_tensor(np.asarray(emission), **kwargs)[..., :n]
+        surfaces = illumination * (surfaces - emitted) + emitted
+
     return MediumResult(
-        radiance=torch.cat([transmittance * radiance[..., :n] + inscatter, radiance[..., n:]], dim=-1),
+        radiance=torch.cat([transmittance * surfaces + inscatter, radiance[..., n:]], dim=-1),
         transmittance=transmittance,
         optical_depth=tau,
         inscatter=inscatter,
+        illumination=illumination,
     )
+
+
+def _illumination(
+    normals: npt.ArrayLike | torch.Tensor,
+    normals_space: str,
+    transform_matrix: npt.ArrayLike,
+    origin: torch.Tensor,
+    directions: torch.Tensor,
+    distance: torch.Tensor,
+    medium: Medium,
+    lighting: Lighting,
+    beta: torch.Tensor,
+    occlusion: Occlusion | None,
+    time: float,
+) -> torch.Tensor:
+    """Ratio by which a medium scales the light of the surfaces seen by each pixel, see
+    :func:`surface_attenuation <visionsim.medium.surfaces.surface_attenuation>`, of shape (h, w, c)."""
+    kwargs: dict[str, Any] = {"dtype": directions.dtype, "device": directions.device}
+    normals = normals.to(**kwargs) if torch.is_tensor(normals) else torch.tensor(np.asarray(normals), **kwargs)
+    normals = normals[..., :3]
+    if normals.shape[:2] != directions.shape[:2]:
+        raise ValueError(f"Normals {tuple(normals.shape)} do not match the camera's resolution.")
+    if normals_space == "camera":
+        rotation = torch.as_tensor(np.asarray(transform_matrix, dtype=float), **kwargs)[:3, :3]
+        normals = normals @ (rotation / rotation.norm(dim=0)).T
+    normals = normals / normals.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    # Surfaces are lit on the side the camera sees
+    normals = torch.where(((normals * directions).sum(dim=-1) > 0)[..., None], -normals, normals)
+
+    seen = torch.isfinite(distance)
+    illumination = torch.ones(*distance.shape, len(beta), **kwargs)
+    if bool(seen.any()):
+        points = origin + directions[seen] * distance[seen][:, None]
+        rays = (origin, directions[seen], distance[seen])
+        clear, through = surface_irradiance(
+            medium, lighting, beta, points, normals[seen], rays=rays, occlusion=occlusion, time=time
+        )
+        illumination[seen] = surface_attenuation(clear, through)
+    return illumination
 
 
 def trace_shadows(

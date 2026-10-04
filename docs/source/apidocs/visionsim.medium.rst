@@ -4,6 +4,14 @@ visionsim.medium package
 Submodules
 ----------
 
+visionsim.medium.lights module
+------------------------------
+
+.. automodule:: visionsim.medium.lights
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 visionsim.medium.model module
 -----------------------------
 
@@ -48,6 +56,14 @@ visionsim.medium.scattering module
 ----------------------------------
 
 .. automodule:: visionsim.medium.scattering
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+visionsim.medium.surfaces module
+--------------------------------
+
+.. automodule:: visionsim.medium.surfaces
    :members:
    :show-inheritance:
    :undoc-members:

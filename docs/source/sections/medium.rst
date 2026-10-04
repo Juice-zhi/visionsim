@@ -146,6 +146,19 @@ weight of each node of the quadrature is scaled by the visibility averaged betwe
 node, so that the edges of shadows don't spoil the quadrature, see :func:`lamp_shadow
 <visionsim.medium.occlusion.lamp_shadow>`. Area lights cast the shadows of their center.
 
+Surfaces are lit through the medium too: their light is attenuated on its way to them, while the medium's glow lights
+them. Given the normals of surfaces (``normals`` of :func:`apply_medium <visionsim.medium.render.apply_medium>`, which
+``medium.apply`` reads from renders that include them), the radiance of each surface is scaled by the ratio of the
+irradiance it receives with and without the medium, see :mod:`visionsim.medium.surfaces`. Sunlight, skylight and light
+reflected by the ground are attenuated in closed form, and the glow arrives from every direction: the light of suns
+scattered once, with the phase function towards each direction, so that surfaces facing the sun receive much more of
+it than those facing away, the light of the sky and the ground scattered once, and, with ``multiple_scattering``, light
+scattered more times. As the glow only depends on the height of surfaces and on the orientation of their normal, it is
+tabulated once per frame. Light from lamps is attenuated with the share of the extinction that isn't scattered within
+the forward peak of the phase function, ``1 - albedo · g²`` (delta-Eddington), as light scattered forward keeps going
+towards surfaces. Light that bounces off other surfaces first is assumed to be dimmed as the frame's direct light is on
+average, and the light that surfaces emit, given by an emission pass (``--include-emission``), isn't dimmed at all.
+
 Objects block sunlight from the medium behind them, which casts light shafts, and hide part of the sky from the medium
 around them, such as the fog in front of a wall. Both are modeled with shadow maps, i.e. orthographic depth maps of the
 scene rendered by Cycles along the direction of each sun, and along the central direction of each of the cells into
@@ -181,6 +194,13 @@ is blurred out, the largest right next to the lamps. With a point light right be
 camera, objects casting its shadows bring the light scattered by the fog within 0.3% of Cycles', with per-pixel
 differences of 0.9% once blurred, against eleven times too much light without shadows.
 
+Surfaces lit through the fog (``validate_surfaces.py``) are within 1% of Cycles' overall, both with single and multiple
+scattering, against 13% too bright in the render without fog for single scattering, with per-pixel differences of 3.5%
+and 4.6%, against 14% and 5%. Walls, which only see the glow of the fog around them, are within about 3%, against 26% too
+bright. Surfaces lit by a point, spot or area light are within 1% to 2.4%, against 8% to 11%. Note that Cycles' renders
+with no volume bounces include light scattered once on its way to surfaces too, as the light is sampled from where it
+scatters.
+
 With objects casting shadows, the sun's light scattered by the fog is within 1.3% of Cycles' over surfaces and within
 0.8% over the sky, against 17% and 3% without shadows, and the sky's is within 1% over both, against 25% and 3%.
 ``examples/medium/experiment`` compares every method as seen by the sensor emulators.
@@ -201,7 +221,9 @@ The following are not yet modeled:
 - Multiple scattering near objects, which is overestimated, by about 30% to 60% within 5 m of the objects of
   ``examples/medium``: the medium around objects is itself in their shadow, and so darker than the open medium that
   the approximation assumes.
-- The dimming of surfaces lit through the medium, and their lighting by the fog's glow. With multiple scattering, the
-  two nearly cancel out in ``examples/medium``, whereas with single scattering surfaces are about 12% darker.
+- The shadows of objects on the glow that lights surfaces, which assumes that surfaces stand in the open, unless shadow
+  maps show that they don't see the sky, and the glow of lamps on surfaces beyond what the reduced extinction of
+  delta-Eddington accounts for. Surfaces are assumed to be diffuse, and light that bounces off other surfaces to be
+  dimmed as the frame's direct light is on average.
 - Anti-aliasing: depth maps are not anti-aliased, so edges between near and far objects can show halos in dense
   media. Rendering at a higher resolution and downsampling the results reduces these.

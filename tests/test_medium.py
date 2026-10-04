@@ -337,7 +337,8 @@ def test_chunks_of_pixels_give_the_same_result(medium, monkeypatch):
     chunked = [apply_medium(*args, lighting), ray_march_medium(*args, lighting, steps=8)]
     for expected, result in zip(whole, chunked):
         for a, b in zip(expected, result):
-            assert torch.allclose(a, b, rtol=1e-12, atol=0)
+            # Surfaces aren't lit through the medium without their normals
+            assert (a is None and b is None) or torch.allclose(a, b, rtol=1e-12, atol=0)
 
 
 def test_apply_medium_background_and_extra_channels():
@@ -422,6 +423,48 @@ def test_cli_apply(tmp_path, keyframe_scale):
     spad(tmp_path / "fog" / "frames", tmp_path / "spad", seed=1)
     binary, _ = Dataset.from_path(tmp_path / "spad")[0]
     assert binary.shape == (5, 7, 3) and set(np.unique(binary)) <= {0, 1}
+
+
+def test_cli_apply_lights_surfaces_through_the_medium(tmp_path):
+    lighting = make_render(tmp_path / "render", n=2)
+    rng = np.random.default_rng(4)
+    frames = Dataset.from_path(tmp_path / "render" / "frames")
+    for name in ("normals", "emission"):
+        transforms = []
+        for i, (_, transform) in enumerate(frames):
+            path = Path("0000") / f"{i:03}.exr"
+            data = rng.normal(size=(5, 7, 3)) if name == "normals" else rng.uniform(0, 0.3, size=(5, 7, 3))
+            _write_exr(tmp_path / "render" / name / path, data)
+            transforms.append(transform | {"file_path": path, "c": 3})
+        Metadata.from_dense_transforms(transforms).save(tmp_path / "render" / name / "transforms.json")
+    medium = Medium(extinction=0.1, components=[HeightFog(falloff=3.0)], sun_attenuation=True)
+    (tmp_path / "medium.json").write_text(medium.model_dump_json())
+    apply(tmp_path / "render", tmp_path / "fog", tmp_path / "medium.json", device="cpu")
+
+    normals, emission = (Dataset.from_path(tmp_path / "render" / name) for name in ("normals", "emission"))
+    for i, (radiance, transform) in enumerate(frames):
+        depth = Dataset.from_path(tmp_path / "render" / "depths")[i][0]
+        # Normals are saved in the camera's space, and emitted light isn't dimmed
+        expected = apply_medium(
+            radiance,
+            depth,
+            transform,
+            transform["transform_matrix"],
+            medium,
+            lighting,
+            normals=normals[i][0],
+            normals_space="camera",
+            emission=emission[i][0],
+        )
+        saved = Dataset.from_path(tmp_path / "fog" / "frames")[i][0]
+        illumination = Dataset.from_path(tmp_path / "fog" / "illumination")[i][0]
+        assert np.allclose(saved, expected.radiance.numpy(), rtol=1e-6, atol=1e-6)
+        assert np.allclose(illumination, expected.illumination.numpy(), rtol=1e-6)
+        assert not np.allclose(illumination, 1)
+
+    # Without normals, or when asked not to, surfaces keep their light
+    apply(tmp_path / "render", tmp_path / "plain", tmp_path / "medium.json", device="cpu", surfaces=False)
+    assert not (tmp_path / "plain" / "illumination").exists()
 
 
 def test_cli_apply_requires_lighting(tmp_path):

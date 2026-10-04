@@ -29,7 +29,6 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, fields
 from functools import lru_cache, partial
 from typing import NamedTuple
 
@@ -321,8 +320,7 @@ def lamp_map_index(maps: ShadowMaps | None, position: torch.Tensor, tolerance: f
     return index if float(distances[index]) <= tolerance else None
 
 
-@dataclass(frozen=True)
-class LampShadow:
+class LampShadow(NamedTuple):
     """Visibility of a lamp sampled along rays, which can be averaged over any interval of the rays.
 
     Visibility is sampled at angles evenly spread between the ends of each ray, as seen from the lamp, which matches
@@ -349,7 +347,7 @@ class LampShadow:
         """Whether some part of each ray is lit by the lamp, of shape (r,)."""
         return self.cumulative[:, -1] > 0
 
-    def __call__(self, bounds: torch.Tensor) -> torch.Tensor:
+    def average(self, bounds: torch.Tensor) -> torch.Tensor:
         """Visibility averaged over intervals of the rays.
 
         Args:
@@ -371,7 +369,7 @@ class LampShadow:
 
     def select(self, rays: torch.Tensor) -> LampShadow:
         """Visibility along a subset of the rays, given their indices."""
-        return LampShadow(*(getattr(self, field.name)[rays] for field in fields(self)))
+        return LampShadow(*(tensor[rays] for tensor in self))
 
 
 def lamp_shadow(
