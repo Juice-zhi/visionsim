@@ -171,11 +171,15 @@ def lamp_inscatter(
         parts = []
         for i in range(0, len(directions), size):
             rays, lengths = directions[i : i + size], distance[i : i + size]
-            shadow = None
+            shadow, seen = None, None
             if maps is not None and index is not None:
                 shadow = lamp_shadow(maps, index, origin, rays, lengths, samples=_LAMP_SHADOW_SAMPLES)
+                # Rays entirely in the lamp's shadow, such as those of other rooms, receive none of its light
+                if not bool(shadow.lit.all()):
+                    seen = shadow.lit.nonzero().squeeze(-1)
+                    shadow, rays, lengths = shadow.select(seen), rays[seen], lengths[seen]
             total = rays.new_zeros(len(rays), n)
-            for emitter in group:
+            for emitter in group if len(rays) else []:
                 light = point_light_inscatter(
                     medium,
                     origin,
@@ -193,6 +197,8 @@ def lamp_inscatter(
                     shadow=shadow,
                 )
                 total = total + emitter.intensity * light
+            if seen is not None:
+                total = total.new_zeros(len(directions[i : i + size]), n).index_copy(0, seen, total)
             parts.append(total)
         return torch.cat(parts)
 

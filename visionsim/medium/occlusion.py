@@ -28,7 +28,8 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, fields
 from functools import lru_cache, partial
 from typing import NamedTuple
 
@@ -320,6 +321,59 @@ def lamp_map_index(maps: ShadowMaps | None, position: torch.Tensor, tolerance: f
     return index if float(distances[index]) <= tolerance else None
 
 
+@dataclass(frozen=True)
+class LampShadow:
+    """Visibility of a lamp sampled along rays, which can be averaged over any interval of the rays.
+
+    Visibility is sampled at angles evenly spread between the ends of each ray, as seen from the lamp, which matches
+    the angular resolution of its map whatever the distance, see :func:`lamp_shadow`. It is constant around each
+    sample, so its integral along the ray is piecewise linear, and its average over an interval is exact for this
+    piecewise-constant visibility. This weights the quadrature of :func:`point_light_inscatter
+    <visionsim.medium.optics.point_light_inscatter>` by the visibility around each of its nodes, rather than at the
+    nodes, so that the edges of shadows don't spoil the quadrature.
+    """
+
+    along: torch.Tensor
+    """distance along each ray to its point of closest approach to the lamp, of shape (r,)"""
+    closest: torch.Tensor
+    """distance between the lamp and each ray, of shape (r,)"""
+    start: torch.Tensor
+    """angle at which the lamp sees the start of each ray, from its point of closest approach, of shape (r,)"""
+    span: torch.Tensor
+    """angle between the ends of each ray as seen from the lamp, of shape (r,)"""
+    cumulative: torch.Tensor
+    """sum of the visibility of the samples before each sample along each ray, and of all of them, of shape (r, m + 1)"""
+
+    @property
+    def lit(self) -> torch.Tensor:
+        """Whether some part of each ray is lit by the lamp, of shape (r,)."""
+        return self.cumulative[:, -1] > 0
+
+    def __call__(self, bounds: torch.Tensor) -> torch.Tensor:
+        """Visibility averaged over intervals of the rays.
+
+        Args:
+            bounds (torch.Tensor): Increasing distances along each ray at the bounds of consecutive intervals, of shape
+                (r, k + 1).
+
+        Returns:
+            torch.Tensor: Visibility averaged over each interval, of shape (r, k).
+        """
+        samples = self.cumulative.shape[-1] - 1
+        angles = torch.atan2(bounds.to(self.along) - self.along[:, None], self.closest[:, None])
+        x = ((angles - self.start[:, None]) / self.span.clamp_min(1e-12)[:, None] * samples).clamp(0, samples)
+        i = x.floor().long().clamp(max=samples - 1)
+        low, high = self.cumulative.gather(-1, i), self.cumulative.gather(-1, i + 1)
+        width = x.diff(dim=-1)
+        # Intervals too short to average over take the visibility where they are
+        mean = (low + (x - i) * (high - low)).diff(dim=-1) / width.clamp_min(1e-9)
+        return torch.where(width > 1e-4, mean, (high - low)[:, :-1]).clamp(0, 1).to(bounds.dtype)
+
+    def select(self, rays: torch.Tensor) -> LampShadow:
+        """Visibility along a subset of the rays, given their indices."""
+        return LampShadow(*(getattr(self, field.name)[rays] for field in fields(self)))
+
+
 def lamp_shadow(
     maps: ShadowMaps,
     index: int,
@@ -328,15 +382,8 @@ def lamp_shadow(
     distance: torch.Tensor,
     samples: int = 256,
     bias: float = 1.0,
-) -> Callable[[torch.Tensor], torch.Tensor]:
-    """Visibility of a lamp along rays, which can be averaged over any interval of the rays.
-
-    Visibility is sampled at angles evenly spread between the ends of each ray, as seen from the lamp, which matches
-    the angular resolution of its map whatever the distance, see :func:`lamp_visibility`. It is constant around each
-    sample, so its integral along the ray is piecewise linear, and its average over an interval is exact for this
-    piecewise-constant visibility. This weights the quadrature of :func:`point_light_inscatter
-    <visionsim.medium.optics.point_light_inscatter>` by the visibility around each of its nodes, rather than at the
-    nodes, so that the edges of shadows don't spoil the quadrature.
+) -> LampShadow:
+    """Sample the visibility of a lamp along rays, at angles evenly spread between their ends as seen from the lamp.
 
     Args:
         maps (ShadowMaps): Maps of lamps.
@@ -349,9 +396,7 @@ def lamp_shadow(
             and still be lit. Defaults to 1.0.
 
     Returns:
-        Callable[[torch.Tensor], torch.Tensor]: Function of the distances along each ray at the bounds of consecutive
-        intervals, increasing, of shape (r, k + 1), which returns the visibility averaged over each interval, of shape
-        (r, k).
+        LampShadow: Visibility along the rays, which can be averaged over any of their intervals.
     """
     # Visibility is computed with the precision of the maps, typically single precision which is enough for it
     dtype = maps.depths.dtype
@@ -368,19 +413,7 @@ def lamp_shadow(
     points = origin + (along[:, None] + closest[:, None] * torch.tan(theta))[..., None] * directions[:, None, :]
     visible = lamp_visibility(maps, index, points, bias)
     cumulative = torch.cat([torch.zeros_like(visible[:, :1]), visible.cumsum(dim=-1)], dim=-1)
-    span = (end - start).clamp_min(1e-12)[:, None]
-
-    def average(bounds: torch.Tensor) -> torch.Tensor:
-        angles = torch.atan2(bounds.to(dtype) - along[:, None], closest[:, None])
-        x = ((angles - start[:, None]) / span * samples).clamp(0, samples)
-        i = x.floor().long().clamp(max=samples - 1)
-        integral = cumulative.gather(-1, i) + (x - i) * visible.gather(-1, i)
-        width = x.diff(dim=-1)
-        # Intervals too short to average over take the visibility where they are
-        mean = integral.diff(dim=-1) / width.clamp_min(1e-9)
-        return torch.where(width > 1e-4, mean, visible.gather(-1, i[:, :-1])).clamp(0, 1).to(bounds.dtype)
-
-    return average
+    return LampShadow(along, closest, start, end - start, cumulative)
 
 
 def _blocker_distances(maps: ShadowMaps, points: torch.Tensor, bias: float) -> torch.Tensor:

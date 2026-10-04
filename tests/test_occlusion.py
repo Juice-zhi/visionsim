@@ -23,13 +23,21 @@ from visionsim.medium.occlusion import (
     _unpack,
     band_attenuation,
     cell_phases,
+    lamp_shadow,
+    lamp_visibility,
     load_occlusion,
     occluded_inscatter,
     sky_cell_directions,
     trace,
     visibility,
 )
-from visionsim.medium.optics import height_fog_optical_depth, henyey_greenstein, sky_quadrature
+from visionsim.medium.optics import (
+    height_fog_optical_depth,
+    henyey_greenstein,
+    point_light_inscatter,
+    sky_quadrature,
+)
+from visionsim.medium.render import lamp_inscatter
 from visionsim.medium.scattering import elevation_sources, tabulate_along_rays
 
 FOG = Medium(extinction=0.08, anisotropy=0.8, components=[HeightFog(density=1.0, falloff=2.5)], sun_attenuation=True)
@@ -521,3 +529,53 @@ def test_sky_hidden_by_a_roof():
     assert (expected < 0.5 * unoccluded).sum() >= 3  # the roof hides most of the sky from rays under it
     # Under the roof, only directions close to the horizon escape, through cells that are partly hidden
     assert np.allclose(unoccluded - result[:, 0].numpy(), unoccluded - expected, rtol=0.01)
+
+
+def window_map(height=64, width=128, radius=2.0):
+    """Map of a lamp at the origin, enclosed by a sphere with a window around +x, through which it shines."""
+    v, u = torch.meshgrid(
+        (torch.arange(height, dtype=torch.float64) + 0.5) / height,
+        (torch.arange(width, dtype=torch.float64) + 0.5) / width,
+        indexing="ij",
+    )
+    # Inverse of the equirectangular mapping of `lamp_visibility`
+    theta, phi = math.pi * (1 - v), math.pi - 2 * math.pi * u
+    x = torch.sin(theta) * torch.cos(phi)
+    depths = torch.where(x > 0.9, torch.full_like(x, 1e10), torch.full_like(x, radius))
+    return ShadowMaps(
+        depths=depths.reshape(-1),
+        offsets=torch.zeros(1, dtype=torch.long),
+        shapes=torch.tensor([[height, width]]),
+        origins=torch.zeros(1, 3, dtype=torch.float64),
+        axes=torch.eye(3, dtype=torch.float64)[None],
+        texels=torch.tensor([2 * math.pi / width], dtype=torch.float64),
+    )
+
+
+def test_lamp_visibility():
+    maps = window_map()
+    points = torch.tensor([[3.0, 0.0, 0.0], [-3.0, 0.0, 0.0], [0.0, 3.0, 0.2], [1.0, 0.5, -0.5], [0.0, 0.0, 5.0]])
+    # Through the window, behind the sphere, and inside of it
+    assert lamp_visibility(maps, 0, points.double()).tolist() == [1.0, 0.0, 0.0, 1.0, 0.0]
+
+
+def test_lamp_shadows_skip_hidden_rays():
+    from visionsim.medium.model import PointLight
+
+    maps = window_map()
+    origin = torch.tensor([6.0, -6.0, 0.0], dtype=torch.float64)
+    rng = np.random.default_rng(3)
+    directions = torch.as_tensor(rng.normal(size=(300, 3)) * [0.6, 0.6, 0.3] + [-0.7, 0.7, 0.0])
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+    distance = torch.as_tensor(rng.uniform(3, 20, size=300))
+    beta = torch.tensor([FOG.extinction], dtype=torch.float64)
+    lamp = PointLight(position=(0.0, 0.0, 0.0), power=(4 * math.pi,))
+    ours = lamp_inscatter(FOG, origin, directions, distance, beta, lamp, maps=maps)[:, 0]
+    # The same quadrature, weighted by the visibility of every ray, including those entirely in the shadow
+    shadow = lamp_shadow(maps, 0, origin, directions, distance)
+    expected = point_light_inscatter(FOG, origin, directions, distance, maps.origins[0], beta, shadow=shadow)[:, 0]
+    assert 0 < int((~shadow.lit).sum()) < len(directions) and torch.all(ours[~shadow.lit] == 0)
+    assert torch.allclose(ours, expected, rtol=1e-12)
+    # Light only comes out of the window, around +x
+    unshadowed = point_light_inscatter(FOG, origin, directions, distance, maps.origins[0], beta)[:, 0]
+    assert 0 < ours.sum() < 0.5 * unshadowed.sum()
