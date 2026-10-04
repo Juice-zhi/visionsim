@@ -1,4 +1,5 @@
 import itertools
+import math
 import os
 import shlex
 import subprocess
@@ -12,7 +13,7 @@ from peewee import SqliteDatabase
 
 from visionsim.dataset import Dataset, Metadata
 from visionsim.medium import Lighting
-from visionsim.medium.occlusion import load_occlusion, visibility
+from visionsim.medium.occlusion import lamp_shadow, lamp_visibility, load_occlusion, visibility
 from visionsim.simulate.blender import INDEX_PADDING, ITEMS_PER_SUBFOLDER, BlenderClients
 from visionsim.simulate.schema import _MODELS, _Data
 
@@ -202,6 +203,30 @@ def test_save_occlusion(executable, tmp_path):
         occlusion.sun_maps, origin, offset / offset.norm(dim=-1, keepdim=True), offset.norm(dim=-1)[:, None]
     )
     assert lit[:, 0, 0].tolist() == [0.0, 1.0]
+
+    # The scene's point light has a map too, behind the cube from which points are in its shadow, unlike points
+    # in front of the light or beside the cube
+    (lamp,) = occlusion.lamp_maps.origins
+    assert tuple(occlusion.lamp_maps.shapes[0].tolist()) == (128, 256)
+    away = (center - lamp) / (center - lamp).norm()
+    side = torch.linalg.cross(away, torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64))
+    points = torch.stack([center + 3 * away, lamp - 3 * away, center + 3 * away + 4 * side / side.norm()])
+    assert lamp_visibility(occlusion.lamp_maps, 0, points).tolist() == [0.0, 1.0, 1.0]
+
+    # Averaged along a ray that crosses the shadow, the visibility matches the mean of many samples, evenly spread in
+    # the angle at which the lamp sees them
+    origin = center + 3 * away - 6 * side / side.norm()
+    end = center + 3 * away + 6 * side / side.norm()
+    direction = (end - origin) / (end - origin).norm()
+    length = (end - origin).norm()[None]
+    average = lamp_shadow(occlusion.lamp_maps, 0, origin, direction[None], length, samples=1024)
+    mean = average(torch.stack([torch.zeros_like(length), length], dim=-1))
+    along = float(direction @ (lamp - origin))
+    closest = float((origin + along * direction - lamp).norm())
+    angles = torch.linspace(math.atan2(-along, closest), math.atan2(length.item() - along, closest), 20001)
+    samples = origin + (along + closest * torch.tan(angles.double()))[:, None] * direction
+    assert 0.1 < mean.item() < 0.9
+    assert mean.item() == pytest.approx(lamp_visibility(occlusion.lamp_maps, 0, samples).mean().item(), abs=0.01)
 
 
 def test_lighting_info(executable, tmp_path):

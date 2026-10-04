@@ -48,7 +48,13 @@ def main(blend_file: str, output: str) -> None:
         # Only the cube casts shadows, the scene's huge axes and grids would otherwise make the maps span them
         exclude = [obj.name for obj in scene.objects if obj.name != "Cube"]
         service.exposed_save_occlusion(
-            output, exclude=exclude, sky_elevations=(0, 30, 90), sky_cells=(4, 2), sun_resolution=128, sky_resolution=32
+            output,
+            exclude=exclude,
+            sky_elevations=(0, 30, 90),
+            sky_cells=(4, 2),
+            sun_resolution=128,
+            sky_resolution=32,
+            lamp_resolution=256,
         )
         after = {
             "camera": scene.camera,

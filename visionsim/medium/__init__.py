@@ -10,7 +10,18 @@ rays of a frame can be reused for several media (:func:`trace_shadows`). The sam
 ray marching (:func:`ray_march_medium`), which serves as a baseline.
 """
 
-from visionsim.medium.model import Blob, HeightFog, Homogeneous, Lighting, Medium, PointLight, Sun, kim_exponent
+from visionsim.medium.model import (
+    AreaLight,
+    Blob,
+    HeightFog,
+    Homogeneous,
+    Lighting,
+    Medium,
+    PointLight,
+    SpotLight,
+    Sun,
+    kim_exponent,
+)
 from visionsim.medium.occlusion import Occlusion, Shadows, load_occlusion
 from visionsim.medium.raymarch import ray_march_medium
 from visionsim.medium.render import RGB_WAVELENGTHS, MediumResult, apply_medium, camera_rays, trace_shadows
@@ -18,6 +29,7 @@ from visionsim.medium.transient import Flash, Transient, capture_histogram, esti
 
 __all__ = [
     "RGB_WAVELENGTHS",
+    "AreaLight",
     "Blob",
     "Flash",
     "HeightFog",
@@ -28,6 +40,7 @@ __all__ = [
     "Occlusion",
     "PointLight",
     "Shadows",
+    "SpotLight",
     "Sun",
     "Transient",
     "apply_medium",

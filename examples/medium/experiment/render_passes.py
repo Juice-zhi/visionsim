@@ -22,7 +22,11 @@ from visionsim.simulate.blender import BlenderService
 def main(args):
     service = BlenderService()
     service.exposed_initialize(bpy.data.filepath, args.output)
-    service.exposed_cycles_settings(device_type="optix", use_cpu=False, max_samples=args.samples, use_denoising=False)
+    service.exposed_cycles_settings(
+        device_type=args.device, use_cpu=args.device == "cpu", max_samples=args.samples, use_denoising=False
+    )
+    if args.threads:
+        service.scene.render.threads_mode, service.scene.render.threads = "FIXED", args.threads
     service.scene.cycles.use_adaptive_sampling = False
     service.scene.cycles.seed = args.seed
     if args.width or args.height:
@@ -81,6 +85,8 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, help="frame width in pixels, defaults to the scene's")
     parser.add_argument("--height", type=int, help="frame height in pixels, defaults to the scene's")
     parser.add_argument("--seed", type=int, default=0, help="Cycles sampling seed")
+    parser.add_argument("--device", default="optix", help="Cycles device type, e.g. optix, cuda or cpu")
+    parser.add_argument("--threads", type=int, help="number of CPU threads, defaults to all")
     parser.add_argument(
         "--volume-bounces",
         type=int,

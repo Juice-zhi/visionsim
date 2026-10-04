@@ -74,11 +74,15 @@ properties:
   defined in world space, so it is consistent across frames and cameras.
 
 The medium is lit by the same lights as the scene, which are exported from Blender to ``lighting.json`` (see
-:meth:`lighting_info <visionsim.simulate.blender.BlenderService.exposed_lighting_info>`): sun and point lights, and the
-average radiance of the world background above the horizon, i.e. the sky. Light from below the horizon is assumed to
-be blocked by the ground, and, with ``sun_attenuation``, both sunlight and skylight are attenuated by the fog they travel
-through before being scattered. The ground can also reflect light into the fog, given its ``ground_albedo`` and
-``ground_height`` in the lighting, which are not exported from Blender.
+:meth:`lighting_info <visionsim.simulate.blender.BlenderService.exposed_lighting_info>`): sun, point, spot and area
+lights, and the average radiance of the world background above the horizon, i.e. the sky. The export accounts for each
+light's power, color, exposure, temperature, volume factor and object scale, and for the node trees that commonly set
+their emission: an Emission node whose color can come from a Blackbody node, and whose strength can come from a Light
+Falloff node (including its linear and constant outputs, and its smoothing near the light) or an IES Texture node, whose
+angular profile is not supported. Light from below the horizon is assumed to be blocked by the ground, and, with
+``sun_attenuation``, both sunlight and skylight are attenuated by the fog they travel through before being scattered.
+The ground can also reflect light into the fog, given its ``ground_albedo`` and ``ground_height`` in the lighting, which
+are not exported from Blender.
 
 Dense fog absorbs little light, so a large share of the light it scatters towards the camera was already scattered
 before: in the ground fog of ``examples/medium``, whose albedo is one, light scattered more than once makes up 63% of
@@ -122,10 +126,25 @@ noise-free. Light scattered more than once is approximated following Hillaire (E
 fog or the ground, is gathered at a set of heights and scattered again with the phase function, and higher orders are
 summed as a geometric series. See :mod:`visionsim.medium.scattering` for details.
 
-Point lights are integrated along each ray over the angle at which the light sees it (equi-angular sampling), with
-Gauss-Legendre quadrature, which cancels the singularity near the light, see :func:`point_light_inscatter
-<visionsim.medium.optics.point_light_inscatter>`. Their radiant intensity is their power divided by :math:`4\pi`, as in
-Cycles.
+Lamps emit as in Cycles (see :mod:`visionsim.medium.lights`): point lights with a radiant intensity of their power
+divided by :math:`4\pi`, spot lights likewise within a cone towards the edge of which their light fades smoothly, and
+area lights as one-sided Lambertian emitters of radiance :math:`P / (\pi A)`, possibly restricted by their spread.
+Light from each point emitter is integrated along each ray over the angle at which the emitter sees it (equi-angular
+sampling), with Gauss-Legendre quadrature, which cancels the singularity near the emitter, see
+:func:`point_light_inscatter <visionsim.medium.optics.point_light_inscatter>`. Seen from the emitter, a ray sweeps
+a great circle, which crosses a cone of light over a single range of angles: only that range is integrated, so that
+the edge of a spot's cone doesn't spoil the quadrature. Area lights are split into patches, each a point emitter
+whose intensity is proportional to the cosine of the angle to the light's normal: rays that pass within a radius of the
+light see a grid of 16 patches along its longest side, those that pass within 3 radii a grid of 4, those that pass
+within 8 radii a grid of 2, and those further away a single emitter, with smooth transitions in between. This is within
+about 1% of a fine grid over a frame.
+
+Objects also cast the shadows of lamps onto the medium, through an equirectangular map of the distance to the first
+surface around each lamp, rendered by Cycles from the lamp's position. Their visibility is sampled along each ray at
+angles evenly spread as seen from the lamp, which matches the map's angular resolution whatever the distance, and the
+weight of each node of the quadrature is scaled by the visibility averaged between its neighbors, rather than at the
+node, so that the edges of shadows don't spoil the quadrature, see :func:`lamp_shadow
+<visionsim.medium.occlusion.lamp_shadow>`. Area lights cast the shadows of their center.
 
 Objects block sunlight from the medium behind them, which casts light shafts, and hide part of the sky from the medium
 around them, such as the fog in front of a wall. Both are modeled with shadow maps, i.e. orthographic depth maps of the
@@ -155,8 +174,12 @@ within 0.3%. The remaining differences are Monte Carlo noise, and object edges.
 
 In the same scene without objects, the light scattered by the fog towards the camera, including multiple scattering
 and light reflected by the ground, is within 2% of Cycles with 32 volume bounces overall, and within 8% at any
-elevation but looking down at the ground, where it is 12% brighter. Light scattered by a point light is within 1% of
-Cycles' single scattering.
+elevation but looking down at the ground, where it is 12% brighter. Light scattered by lamps is within about 1% of
+Cycles' single scattering overall: 0.6% for a point light, 0.1% for a spot light, 1.2% for an area light, and 0.9% for
+a point light whose light is smoothed by a Light Falloff node, with per-pixel differences of 1% to 2% once Cycles' noise
+is blurred out, the largest right next to the lamps. With a point light right behind a cube, which hides it from the
+camera, objects casting its shadows bring the light scattered by the fog within 0.3% of Cycles', with per-pixel
+differences of 0.9% once blurred, against eleven times too much light without shadows.
 
 With objects casting shadows, the sun's light scattered by the fog is within 1.3% of Cycles' over surfaces and within
 0.8% over the sky, against 17% and 3% without shadows, and the sky's is within 1% over both, against 25% and 3%.
@@ -169,10 +192,11 @@ Limitations
 
 The following are not yet modeled:
 
-- Shadows of moving objects, as shadow maps are rendered once per scene, and shadows on the light emitted by point
-  lights.
-- Spot and area lights, as well as emissive surfaces, lighting the medium. Light from point lights is only
-  scattered once, which misses about 30% of their glow in the dense fog of ``examples/medium``.
+- Shadows of moving objects, as shadow maps are rendered once per scene, and the soft shadows of large lamps, which
+  cast the hard shadows of their center.
+- Emissive surfaces lighting the medium, IES profiles and other node trees of lamps, square spot lights, and the
+  elliptical cones of spot lights scaled unevenly. Light from lamps is only scattered once, which misses about 30% of
+  their glow in the dense fog of ``examples/medium``.
 - Multiple scattering in media other than a single height fog, and skies whose radiance varies with direction.
 - Multiple scattering near objects, which is overestimated, by about 30% to 60% within 5 m of the objects of
   ``examples/medium``: the medium around objects is itself in their shadow, and so darker than the open medium that

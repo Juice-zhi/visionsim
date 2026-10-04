@@ -7,6 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field, NonNegativeFloat, PositiveFlo
 from typing_extensions import Self
 
 Vector3 = tuple[float, float, float]
+_PI = math.pi + 1e-6
+"""Upper bound of angles of up to π, which tolerates their rounding to single precision, e.g. by Blender"""
 
 
 class Homogeneous(BaseModel):
@@ -167,6 +169,12 @@ class Sun(BaseModel):
     """irradiance per color channel, in W/m², received by a surface facing the light"""
 
 
+Falloff = Literal["quadratic", "linear", "constant"]
+"""How the light of a lamp falls off with the distance ``r`` to it: physically, as ``1 / r²`` (quadratic), or as
+``1 / r`` (linear) or not at all (constant), as with the outputs of Blender's Light Falloff node, which scale the
+lamp's intensity by ``r`` or ``r²``"""
+
+
 class PointLight(BaseModel):
     """Point light source, such as a street lamp, whose radiant intensity is its power divided by 4π, as in Cycles."""
 
@@ -178,6 +186,79 @@ class PointLight(BaseModel):
     """radiant power per color channel, in W"""
     radius: NonNegativeFloat = 0.0
     """radius of the light, in meters, below which distances to the light are clamped"""
+    falloff: Falloff = "quadratic"
+    """how the light falls off with the distance to it, see :data:`Falloff`"""
+    smooth: NonNegativeFloat = 0.0
+    """smoothing of the light near it, whose intensity is scaled by ``r² / (smooth + r²)`` at a distance ``r``, as with
+    Blender's Light Falloff node"""
+
+
+class SpotLight(BaseModel):
+    """Point light source that only shines within a cone, such as a ceiling spot or a car's headlight.
+
+    As in Cycles, its radiant intensity within the cone is its power divided by 4π, i.e. as for a point light of the
+    same power, and fades towards the edge of the cone as ``smoothstep((cos φ - cos(angle / 2)) / ((1 - cos(angle / 2))
+    * blend))``, where ``φ`` is the angle between the spot's direction and the direction from the light.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    position: Vector3
+    """world-space position of the light, in meters"""
+    direction: Vector3
+    """world-space direction in which the spot points, which is normalized when used"""
+    power: tuple[float, ...]
+    """radiant power per color channel, in W, of a point light with the same intensity"""
+    angle: float = Field(math.pi / 4, gt=0.0, le=_PI)
+    """angle of the cone, in radians, between its opposite edges"""
+    blend: float = Field(0.15, ge=0.0, le=1.0)
+    """softness of the edge of the cone, as a fraction of ``1 - cos(angle / 2)``"""
+    radius: NonNegativeFloat = 0.0
+    """radius of the light, in meters, below which distances to the light are clamped"""
+    falloff: Falloff = "quadratic"
+    """how the light falls off with the distance to it, see :data:`Falloff`"""
+    smooth: NonNegativeFloat = 0.0
+    """smoothing of the light near it, whose intensity is scaled by ``r² / (smooth + r²)`` at a distance ``r``, as with
+    Blender's Light Falloff node"""
+
+
+class AreaLight(BaseModel):
+    """Planar light source, such as a ceiling panel or a window lit from outside.
+
+    As in Cycles, it is a one-sided Lambertian emitter, whose radiance is its power divided by π times its area, which
+    can be restricted to a narrower cone of directions by its spread (like the grid of a softbox).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    position: Vector3
+    """world-space position of the center of the light, in meters"""
+    direction: Vector3
+    """world-space normal of the light, towards which it shines, which is normalized when used"""
+    axis_u: Vector3
+    """world-space direction, within the light's plane, along which its first size is measured"""
+    size: tuple[PositiveFloat, PositiveFloat]
+    """size of the light, in meters, along ``axis_u`` and along the other axis of its plane"""
+    shape: Literal["rectangle", "ellipse"] = "rectangle"
+    """shape of the light, whose sizes are the lengths of either the sides of a rectangle or the axes of an ellipse"""
+    power: tuple[float, ...]
+    """radiant power per color channel, in W"""
+    spread: float = Field(math.pi, gt=0.0, le=_PI)
+    """angle, in radians, of the cone of directions in which each point of the light shines"""
+    falloff: Falloff = "quadratic"
+    """how the light falls off with the distance to it, see :data:`Falloff`"""
+    smooth: NonNegativeFloat = 0.0
+    """smoothing of the light near it, whose intensity is scaled by ``r² / (smooth + r²)`` at a distance ``r`` to each
+    of its points, as with Blender's Light Falloff node"""
+
+    @property
+    def area(self) -> float:
+        """Area of the light, in m²."""
+        return self.size[0] * self.size[1] * (math.pi / 4 if self.shape == "ellipse" else 1.0)
+
+
+Lamp = Union[PointLight, SpotLight, AreaLight]
+"""Light source at a finite distance, as opposed to suns"""
 
 
 class Lighting(BaseModel):
@@ -200,8 +281,17 @@ class Lighting(BaseModel):
     """distant light sources"""
     points: list[PointLight] = Field(default_factory=list)
     """point light sources, whose light is attenuated by the medium on its way, and scattered once"""
+    spots: list[SpotLight] = Field(default_factory=list)
+    """spot light sources, whose light is attenuated by the medium on its way, and scattered once"""
+    areas: list[AreaLight] = Field(default_factory=list)
+    """area light sources, whose light is attenuated by the medium on its way, and scattered once"""
     ground_albedo: tuple[float, ...] = (0.0, 0.0, 0.0)
     """albedo per color channel of the ground, modeled as a Lambertian plane at ``ground_height`` lit by suns and
     the sky, which reflects light into the medium. This is only used when sunlight is attenuated by the medium"""
     ground_height: float = 0.0
     """height of the ground, in meters"""
+
+    @property
+    def lamps(self) -> list[Lamp]:
+        """Light sources at a finite distance, i.e. point, spot and area lights."""
+        return [*self.points, *self.spots, *self.areas]

@@ -17,15 +17,19 @@ camera, as each point is lit by many cells of the sky, which smooths out its var
 proportion to the phase function integrated over the cell, times the mean attenuation of skylight over its
 elevations. Light scattered more than once reaches the medium from all directions too, and is occluded in the same
 way, with cells weighted by the radiance arriving from their elevations, assuming that light coming from below the
-horizon is not occluded. Light reflected by the ground into the medium and light from point lights are not occluded.
+horizon is not occluded.
+
+Lamps cast shadows through equirectangular maps of the distance between each lamp and the first surface in every
+direction, see :func:`lamp_visibility`, whose visibility is sampled along rays at angles evenly spread as seen from the
+lamp and averaged around each node of the quadrature that integrates the lamp's light, see :func:`lamp_shadow`.
 """
 
 from __future__ import annotations
 
 import math
 import os
-from collections.abc import Iterator, Mapping, Sequence
-from functools import lru_cache
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from functools import lru_cache, partial
 from typing import NamedTuple
 
 import numpy as np
@@ -88,6 +92,9 @@ class Occlusion(NamedTuple):
     """number of cells of each band, which split its azimuths evenly starting from the x axis"""
     bounds: torch.Tensor
     """corners of the box that contains every object casting shadows, of shape (2, 3)"""
+    lamp_maps: ShadowMaps | None = None
+    """one equirectangular map per lamp, which records the distance between the lamp, at the map's origin, and the first
+    surface in every direction, see :func:`lamp_visibility`, and whose texels are in radians"""
 
 
 def select_maps(maps: ShadowMaps, index: int) -> ShadowMaps:
@@ -95,19 +102,24 @@ def select_maps(maps: ShadowMaps, index: int) -> ShadowMaps:
     return maps._replace(**{name: getattr(maps, name)[index : index + 1] for name in maps._fields[1:]})
 
 
+def maps_to(
+    maps: ShadowMaps, device: torch.device | str | None = None, dtype: torch.dtype = torch.float32
+) -> ShadowMaps:
+    """Move shadow maps to a device, and cast their floating point values to a given precision."""
+    return ShadowMaps(*(m.to(device=device, dtype=dtype if m.is_floating_point() else m.dtype) for m in maps))
+
+
 def occlusion_to(
     occlusion: Occlusion, device: torch.device | str | None = None, dtype: torch.dtype = torch.float32
 ) -> Occlusion:
     """Move shadow maps to a device, and cast their floating point values to a given precision."""
-
-    def move(maps: ShadowMaps) -> ShadowMaps:
-        return ShadowMaps(*(m.to(device=device, dtype=dtype if m.is_floating_point() else m.dtype) for m in maps))
-
+    move = partial(maps_to, device=device, dtype=dtype)
     return occlusion._replace(
         sun_maps=move(occlusion.sun_maps),
         sun_directions=occlusion.sun_directions.to(device=device, dtype=dtype),
         sky_maps=move(occlusion.sky_maps),
         bounds=occlusion.bounds.to(device=device, dtype=dtype),
+        lamp_maps=move(occlusion.lamp_maps) if occlusion.lamp_maps is not None else None,
     )
 
 
@@ -183,6 +195,8 @@ def load_occlusion(
             sky_edges=edges,
             sky_counts=counts,
             bounds=torch.as_tensor(data["bounds"], **kwargs).reshape(2, 3),
+            # Maps saved before lamps cast shadows don't have any
+            lamp_maps=maps("lamp") if "lamp_depths" in data else None,
         )
 
     expected = sky_cell_directions(edges, counts)
@@ -255,6 +269,118 @@ def visibility(
     bottom = torch.lerp(lit_at(x0, y0).to(x.dtype), lit_at(x0 + 1, y0).to(x.dtype), fx)
     upper = torch.lerp(lit_at(x0, y0 + 1).to(x.dtype), lit_at(x0 + 1, y0 + 1).to(x.dtype), fx)
     return torch.lerp(bottom, upper, fy)
+
+
+def lamp_visibility(maps: ShadowMaps, index: int, points: torch.Tensor, bias: float = 1.0) -> torch.Tensor:
+    """Fraction of the light of a lamp that reaches points, according to its equirectangular map.
+
+    Maps of lamps are rendered by a camera at the lamp that looks along +x with +z up, such that a direction
+    ``(x, y, z)`` is seen at ``u = (π - atan2(y, x)) / 2π`` along the width of the map and ``v = 1 - acos(z) / π`` along
+    its height, from the bottom, as for environment textures, and record the distance to the first surface. Each point
+    is compared with the four texels around its direction, and the results are interpolated bilinearly
+    (percentage-closer filtering), wrapping around the map horizontally.
+
+    Args:
+        maps (ShadowMaps): Maps of lamps.
+        index (int): Index of the lamp's map.
+        points (torch.Tensor): Points, of shape (..., 3).
+        bias (float, optional): Distance, in texels at the distance of each point, by which points can lie behind the
+            recorded surface and still be lit. Defaults to 1.0.
+
+    Returns:
+        torch.Tensor: Visibility in [0, 1], of shape (...).
+    """
+    offset = points - maps.origins[index]
+    distance = offset.norm(dim=-1)
+    height, width = (int(size) for size in maps.shapes[index])
+    first = int(maps.offsets[index])
+    u = (math.pi - torch.atan2(offset[..., 1], offset[..., 0])) / (2 * math.pi)
+    v = 1 - torch.acos((offset[..., 2] / distance.clamp_min(1e-12)).clamp(-1, 1)) / math.pi
+    x, y = u * width - 0.5, v * height - 0.5
+    x0, y0 = x.floor(), y.floor()
+    fx, fy = x - x0, y - y0
+    columns = [torch.remainder(x0, width).long(), torch.remainder(x0 + 1, width).long()]
+    rows = [y0.clamp(0, height - 1).long(), (y0 + 1).clamp(0, height - 1).long()]
+    behind = distance * (1 - bias * float(maps.texels[index]))
+
+    def lit(row: torch.Tensor, column: torch.Tensor) -> torch.Tensor:
+        return (behind <= maps.depths[first + row * width + column]).to(points.dtype)
+
+    bottom = torch.lerp(lit(rows[0], columns[0]), lit(rows[0], columns[1]), fx)
+    upper = torch.lerp(lit(rows[1], columns[0]), lit(rows[1], columns[1]), fx)
+    return torch.lerp(bottom, upper, fy)
+
+
+def lamp_map_index(maps: ShadowMaps | None, position: torch.Tensor, tolerance: float = 0.01) -> int | None:
+    """Index of the map of the lamp at a position, or None if there is none within ``tolerance`` meters."""
+    if maps is None or not len(maps.origins):
+        return None
+    distances = (maps.origins - position.to(maps.origins)).norm(dim=-1)
+    index = int(distances.argmin())
+    return index if float(distances[index]) <= tolerance else None
+
+
+def lamp_shadow(
+    maps: ShadowMaps,
+    index: int,
+    origin: torch.Tensor,
+    directions: torch.Tensor,
+    distance: torch.Tensor,
+    samples: int = 256,
+    bias: float = 1.0,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Visibility of a lamp along rays, which can be averaged over any interval of the rays.
+
+    Visibility is sampled at angles evenly spread between the ends of each ray, as seen from the lamp, which matches
+    the angular resolution of its map whatever the distance, see :func:`lamp_visibility`. It is constant around each
+    sample, so its integral along the ray is piecewise linear, and its average over an interval is exact for this
+    piecewise-constant visibility. This weights the quadrature of :func:`point_light_inscatter
+    <visionsim.medium.optics.point_light_inscatter>` by the visibility around each of its nodes, rather than at the
+    nodes, so that the edges of shadows don't spoil the quadrature.
+
+    Args:
+        maps (ShadowMaps): Maps of lamps.
+        index (int): Index of the lamp's map, whose origin is the lamp's position.
+        origin (torch.Tensor): Ray origin, of shape (3,).
+        directions (torch.Tensor): Unit ray directions, of shape (r, 3).
+        distance (torch.Tensor): Ray lengths in meters, of shape (r,), can be infinite.
+        samples (int, optional): Number of samples of the visibility along each ray. Defaults to 256.
+        bias (float, optional): Distance, in texels, by which points can lie behind the surfaces recorded by the map
+            and still be lit. Defaults to 1.0.
+
+    Returns:
+        Callable[[torch.Tensor], torch.Tensor]: Function of the distances along each ray at the bounds of consecutive
+        intervals, increasing, of shape (r, k + 1), which returns the visibility averaged over each interval, of shape
+        (r, k).
+    """
+    # Visibility is computed with the precision of the maps, typically single precision which is enough for it
+    dtype = maps.depths.dtype
+    origin, directions, distance = origin.to(dtype), directions.to(dtype), distance.to(dtype)
+    offset = maps.origins[index] - origin
+    along = directions @ offset
+    closest = ((offset * offset).sum() - along * along).clamp_min(0).sqrt().clamp_min(1e-4)
+    # Angles stay within ±π/2, which single precision would otherwise round beyond for infinite rays
+    limit = math.pi / 2 - 1e-6
+    start = torch.atan2(-along, closest).clamp(-limit, limit)
+    end = torch.atan2(distance - along, closest).clamp(-limit, limit)
+    fractions = (torch.arange(samples, dtype=dtype, device=directions.device) + 0.5) / samples
+    theta = start[:, None] + (end - start)[:, None] * fractions
+    points = origin + (along[:, None] + closest[:, None] * torch.tan(theta))[..., None] * directions[:, None, :]
+    visible = lamp_visibility(maps, index, points, bias)
+    cumulative = torch.cat([torch.zeros_like(visible[:, :1]), visible.cumsum(dim=-1)], dim=-1)
+    span = (end - start).clamp_min(1e-12)[:, None]
+
+    def average(bounds: torch.Tensor) -> torch.Tensor:
+        angles = torch.atan2(bounds.to(dtype) - along[:, None], closest[:, None])
+        x = ((angles - start[:, None]) / span * samples).clamp(0, samples)
+        i = x.floor().long().clamp(max=samples - 1)
+        integral = cumulative.gather(-1, i) + (x - i) * visible.gather(-1, i)
+        width = x.diff(dim=-1)
+        # Intervals too short to average over take the visibility where they are
+        mean = integral.diff(dim=-1) / width.clamp_min(1e-9)
+        return torch.where(width > 1e-4, mean, visible.gather(-1, i[:, :-1])).clamp(0, 1).to(bounds.dtype)
+
+    return average
 
 
 def _blocker_distances(maps: ShadowMaps, points: torch.Tensor, bias: float) -> torch.Tensor:

@@ -127,6 +127,52 @@ def _sky_cell_directions(edges: Sequence[float], counts: Sequence[int]) -> npt.N
     return np.asarray(directions, dtype=float).reshape(-1, 3)
 
 
+# Piecewise fit of the linear Rec.709 color of a black body, of unit luminance, used by Cycles' Blackbody node
+# (`svm_math_blackbody_color_rec709` and the tables of `kernel/tables.h` in Cycles' sources)
+_BLACKBODY_BOUNDS = (965.0, 1167.0, 1449.0, 1902.0, 3315.0, 6365.0)
+_BLACKBODY_R = (
+    (1.61919106e03, -2.05010916e-03, 5.02995757e00),
+    (2.48845471e03, -1.11330907e-03, 3.22621544e00),
+    (3.34143193e03, -4.86551192e-04, 1.76486769e00),
+    (4.09461742e03, -1.27446582e-04, 7.25731635e-01),
+    (4.67028036e03, 2.91258199e-05, 1.26703442e-01),
+    (4.59509185e03, 2.87495649e-05, 1.50345020e-01),
+    (3.78717450e03, 9.35907826e-06, 3.99075871e-01),
+)
+_BLACKBODY_G = (
+    (-4.88999748e02, 6.04330754e-04, -7.55807526e-02),
+    (-7.55994277e02, 3.16730098e-04, 4.78306139e-01),
+    (-1.02363977e03, 1.20223470e-04, 9.36662319e-01),
+    (-1.26571316e03, 4.87340896e-06, 1.27054498e00),
+    (-1.42529332e03, -4.01150431e-05, 1.43972784e00),
+    (-1.17554822e03, -2.16378048e-05, 1.30408023e00),
+    (-5.00799571e02, -4.59832026e-06, 1.09098763e00),
+)
+_BLACKBODY_B = (
+    (5.96945309e-11, -4.85742887e-08, -9.70622247e-05, -4.07936148e-03),
+    (2.40430366e-11, 5.55021075e-08, -1.98503712e-04, 2.89312858e-02),
+    (-1.40949732e-11, 1.89878968e-07, -3.56632824e-04, 9.10767778e-02),
+    (-3.61460868e-11, 2.84822009e-07, -4.93211319e-04, 1.56723440e-01),
+    (-1.97075738e-11, 1.75359352e-07, -2.50542825e-04, -2.22783266e-02),
+    (-1.61997957e-13, -1.64216008e-08, 3.86216271e-04, -7.38077418e-01),
+    (6.72650283e-13, -2.73078809e-08, 4.24098264e-04, -7.52335691e-01),
+)
+
+
+def _blackbody(temperature: float) -> list[float]:
+    """Linear Rec.709 color of a black body at a temperature in Kelvin, as computed by Cycles' Blackbody node."""
+    if temperature >= 12000.0:
+        rgb = [0.8262954810464208, 0.9945080501520986, 1.566307710274283]
+    elif temperature < 800.0:
+        rgb = [5.413294490189271, -0.20319390035873933, -0.0822535242887164]
+    else:
+        i = sum(temperature >= bound for bound in _BLACKBODY_BOUNDS)
+        (r0, r1, r2), (g0, g1, g2), (b0, b1, b2, b3) = _BLACKBODY_R[i], _BLACKBODY_G[i], _BLACKBODY_B[i]
+        t = temperature
+        rgb = [r0 / t + r1 * t + r2, g0 / t + g1 * t + g2, ((b0 * t + b1) * t + b2) * t + b3]
+    return [max(c, 0.0) for c in rgb]
+
+
 def require_connected_client(
     func: Callable[..., Any],
 ) -> Callable[..., Any]:
@@ -1819,47 +1865,139 @@ class BlenderService(rpyc.Service):
             self.log.warning(f"Unsupported world color node {source.bl_idname}, falling back to its default value.")
         return [c * strength.default_value for c in color.default_value[:3]]
 
+    def _light_emission(self, obj: bpy.types.Object) -> tuple[list[float], dict[str, Any]]:
+        """Color by which the node tree of a light scales its emission, and how its emission falls off with distance.
+
+        Only the node trees that commonly set a light's emission are evaluated, as Cycles does: an Emission node, whose
+        color can come from a Blackbody node, and whose strength can come from a Light Falloff node, or from an IES
+        Texture node, whose angular profile is not supported. Other nodes are ignored, with a warning.
+
+        Args:
+            obj (bpy.types.Object): Light object.
+
+        Returns:
+            tuple[list[float], dict[str, Any]]: Scale of the light's RGB color, and the ``falloff`` and ``smooth`` of
+            the light, if its strength is set by a Light Falloff node, see :class:`PointLight
+            <visionsim.medium.model.PointLight>`.
+        """
+        light, white = obj.data, [1.0, 1.0, 1.0]
+        tree = light.node_tree if getattr(light, "use_nodes", False) else None
+        outputs = [n for n in tree.nodes if n.bl_idname == "ShaderNodeOutputLight"] if tree else []
+        output = next((n for n in outputs if n.is_active_output), outputs[0] if outputs else None)
+        if output is None or not output.inputs["Surface"].is_linked:
+            return white, {}
+
+        emission = output.inputs["Surface"].links[0].from_node
+        if emission.bl_idname != "ShaderNodeEmission":
+            self.log.warning(f"Unsupported shader {emission.bl_idname} of light '{obj.name}', its nodes are ignored.")
+            return white, {}
+
+        color_input, strength_input, falloff = emission.inputs["Color"], emission.inputs["Strength"], {}
+        color = list(color_input.default_value[:3])
+        if color_input.is_linked:
+            source = color_input.links[0].from_node
+            if source.bl_idname == "ShaderNodeBlackbody" and not source.inputs["Temperature"].is_linked:
+                color = _blackbody(source.inputs["Temperature"].default_value)
+            else:
+                self.log.warning(f"Unsupported color node {source.bl_idname} of light '{obj.name}', using white.")
+                color = white
+
+        strength = strength_input.default_value
+        if strength_input.is_linked:
+            link = strength_input.links[0]
+            source = link.from_node
+            if source.bl_idname == "ShaderNodeLightFalloff" and not any(i.is_linked for i in source.inputs):
+                # Suns ignore the falloff, as in Cycles
+                strength = source.inputs["Strength"].default_value
+                if light.type != "SUN":
+                    falloff = {
+                        "falloff": link.from_socket.identifier.lower(),
+                        "smooth": source.inputs["Smooth"].default_value,
+                    }
+            elif source.bl_idname == "ShaderNodeTexIES" and not source.inputs["Strength"].is_linked:
+                # Cycles' IES lookup returns 100 for files it can't read, i.e. uniformly
+                strength = source.inputs["Strength"].default_value * 100
+                self.log.warning(f"The IES profile of light '{obj.name}' is not supported, its light is uniform.")
+            else:
+                self.log.warning(f"Unsupported strength node {source.bl_idname} of light '{obj.name}', using 1.")
+                strength = 1.0
+        return [c * strength for c in color], falloff
+
     @require_initialized_service
     def exposed_lighting_info(self) -> dict[str, Any]:
         """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
 
-        This includes sun and point lights, whose intensities account for their exposure and volume factor, as well
-        as the average radiance of the world background above the horizon, i.e. the sky (either a constant color or
-        an environment texture). Light temperatures, spot and area lights, and other world shaders are not supported
-        and are ignored, with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for
-        its usage.
+        This includes sun, point, spot and area lights, whose intensities account for their exposure, temperature,
+        volume factor and common node trees (see :meth:`_light_emission`), as well as the average radiance of the world
+        background above the horizon, i.e. the sky (either a constant color or an environment texture). Other world
+        shaders, square spots, and the elliptical cones of spots scaled unevenly are not supported, and approximated
+        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
 
         Returns:
             dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
         """
         suns: list[dict[str, Any]] = []
         points: list[dict[str, Any]] = []
+        spots: list[dict[str, Any]] = []
+        areas: list[dict[str, Any]] = []
 
         for obj in self.scene.objects:
             if obj.type != "LIGHT" or obj.hide_render:
                 continue
             light = obj.data
-
-            if getattr(light, "use_temperature", False):
-                self.log.warning(f"Temperature of light '{obj.name}' is not supported and will be ignored.")
             if obj.animation_data or light.animation_data:
                 self.log.warning(f"Light '{obj.name}' is animated, only its state at the current frame is saved.")
 
             scale = light.energy * 2 ** getattr(light, "exposure", 0.0) * getattr(light, "volume_factor", 1.0)
-            color = [c * scale for c in light.color]
+            emission, falloff = self._light_emission(obj)
+            temperature = light.temperature_color if getattr(light, "use_temperature", False) else (1.0, 1.0, 1.0)
+            color = [c * e * t * scale for c, e, t in zip(light.color, emission, temperature)]
+            matrix = obj.matrix_world.to_3x3()
+            # Lamps shine along their local -Z axis
+            towards = (matrix @ mathutils.Vector((0.0, 0.0, -1.0))).normalized()
+            position = list(obj.matrix_world.translation)
+            # Without normalization, Cycles doesn't divide the power of lamps by their area
+            normalize = getattr(light, "normalize", True)
 
             if light.type == "SUN":
-                # Sun lamps shine along their local -Z axis
-                direction = (obj.matrix_world.to_3x3() @ mathutils.Vector((0.0, 0.0, 1.0))).normalized()
-                suns.append({"direction": list(direction), "irradiance": color})
-            elif light.type == "POINT":
-                points.append(
-                    {"position": list(obj.matrix_world.translation), "power": color, "radius": light.shadow_soft_size}
+                suns.append({"direction": list(-towards), "irradiance": color})
+            elif light.type in ("POINT", "SPOT"):
+                radius = light.shadow_soft_size
+                power = color if normalize or radius == 0 else [c * np.pi * radius**2 for c in color]
+                lamp = {"position": position, "power": power, "radius": radius, **falloff}
+                if light.type == "POINT":
+                    points.append(lamp)
+                    continue
+                # Cycles stretches the cone of spots along their local axes, along with their scale
+                sx, sy, sz = obj.matrix_world.to_scale()
+                if abs(sx - sy) > 1e-3 * max(abs(sx), abs(sy)) or light.use_square:
+                    self.log.warning(f"The cone of spot light '{obj.name}' isn't circular, which isn't supported.")
+                stretch = (abs(sx) + abs(sy)) / 2 / max(abs(sz), 1e-9)
+                angle = 2 * np.arctan(np.tan(min(light.spot_size, np.pi - 1e-6) / 2) * stretch)
+                spots.append(lamp | {"direction": list(towards), "angle": float(angle), "blend": light.spot_blend})
+            elif light.type == "AREA":
+                # The object's scale stretches area lights
+                axis_u, axis_v = matrix @ mathutils.Vector((1.0, 0.0, 0.0)), matrix @ mathutils.Vector((0.0, 1.0, 0.0))
+                ellipse = light.shape in ("DISK", "ELLIPSE")
+                size_y = light.size_y if light.shape in ("RECTANGLE", "ELLIPSE") else light.size
+                size = [light.size * axis_u.length, size_y * axis_v.length]
+                area = size[0] * size[1] * (np.pi / 4 if ellipse else 1.0)
+                areas.append(
+                    {
+                        "position": position,
+                        "direction": list(towards),
+                        "axis_u": list(axis_u.normalized()),
+                        "size": size,
+                        "shape": "ellipse" if ellipse else "rectangle",
+                        "power": color if normalize else [c * area for c in color],
+                        "spread": min(light.spread, np.pi),
+                        **falloff,
+                    }
                 )
             else:
                 self.log.warning(f"{light.type.title()} light '{obj.name}' is not supported and will be ignored.")
 
-        return {"sky": self._world_radiance(), "suns": suns, "points": points}
+        return {"sky": self._world_radiance(), "suns": suns, "points": points, "spots": spots, "areas": areas}
 
     @require_initialized_service
     def exposed_save_lighting(self, path: str | os.PathLike | None = None) -> None:
@@ -1875,22 +2013,23 @@ class BlenderService(rpyc.Service):
         with open(path, "w") as f:
             json.dump(self.exposed_lighting_info(), f, indent=2)
 
+    @staticmethod
+    def _volume_only(obj: bpy.types.Object) -> bool:
+        """Whether an object is only a volume, such as the medium itself when rendered by Cycles."""
+        materials = [slot.material for slot in getattr(obj, "material_slots", []) if slot.material]
+        outputs = [
+            next((n for n in m.node_tree.nodes if n.bl_idname == "ShaderNodeOutputMaterial"), None)
+            for m in materials
+            if m.use_nodes and m.node_tree
+        ]
+        return bool(outputs) and all(
+            o is not None and not o.inputs["Surface"].is_linked and o.inputs["Volume"].is_linked for o in outputs
+        )
+
     @require_initialized_service
     def _shadow_casters(self, exclude: Collection[str]) -> tuple[list[bpy.types.Object], npt.NDArray[np.floating]]:
         """Objects that cast shadows onto a participating medium, and the corners of the box that contains them."""
-
-        def volume_only(obj: bpy.types.Object) -> bool:
-            # Volumes, such as the medium itself when rendered by Cycles, are left out of depth maps anyway
-            materials = [slot.material for slot in getattr(obj, "material_slots", []) if slot.material]
-            outputs = [
-                next((n for n in m.node_tree.nodes if n.bl_idname == "ShaderNodeOutputMaterial"), None)
-                for m in materials
-                if m.use_nodes and m.node_tree
-            ]
-            return bool(outputs) and all(
-                o is not None and not o.inputs["Surface"].is_linked and o.inputs["Volume"].is_linked for o in outputs
-            )
-
+        volume_only = self._volume_only
         depsgraph = bpy.context.evaluated_depsgraph_get()
         casters, corners = set(), []
         for instance in depsgraph.object_instances:
@@ -1922,14 +2061,17 @@ class BlenderService(rpyc.Service):
         sky_cells: Sequence[int] = SKY_CELLS,
         sun_resolution: int = 2048,
         sky_resolution: int = 512,
+        lamp_resolution: int = 1024,
     ) -> None:
         """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
 
         Orthographic depth maps of the objects that cast shadows are rendered with Cycles along the direction of each
         sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
-        split into equal ranges of azimuth. Maps span the box that contains these objects, and are saved to a ``.npz``
-        file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current frame, so
-        objects should be static. Render settings, the camera and the compositor are restored afterwards.
+        split into equal ranges of azimuth. Maps span the box that contains these objects. The distance to the first
+        object in every direction around each lamp (point, spot and area lights) is also rendered, in equirectangular
+        maps. All maps are saved to a ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They
+        are captured at the current frame, so objects should be static. Render settings, the camera and the compositor
+        are restored afterwards.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
@@ -1944,6 +2086,8 @@ class BlenderService(rpyc.Service):
                 Defaults to 2048.
             sky_resolution (int, optional): Number of texels along the longest side of the maps of the sky.
                 Defaults to 512.
+            lamp_resolution (int, optional): Number of texels along the width of the maps of lamps, which span all
+                azimuths, and half as many along their height, which spans all elevations. Defaults to 1024.
 
         Raises:
             ValueError: raised if the number of bands of the sky and of their edges do not match.
@@ -1954,10 +2098,15 @@ class BlenderService(rpyc.Service):
         path = Path(str(path)) if path else self.root_path / "occlusion.npz"
         path.parent.mkdir(parents=True, exist_ok=True)
         edges = np.sin(np.radians(np.asarray(sky_elevations, dtype=float)))
-        suns = [np.asarray(sun["direction"], dtype=float) for sun in self.exposed_lighting_info()["suns"]]
+        lighting = self.exposed_lighting_info()
+        suns = [np.asarray(sun["direction"], dtype=float) for sun in lighting["suns"]]
         suns = [sun / np.linalg.norm(sun) for sun in suns]
         jobs = [("sun", sun, sun_resolution) for sun in suns]
         jobs += [("sky", direction, sky_resolution) for direction in _sky_cell_directions(edges, sky_cells)]
+        # Area lights shine from their surface, from which the map is rendered just in front
+        lamps = [np.asarray(lamp["position"], dtype=float) for lamp in lighting["points"] + lighting["spots"]]
+        lamps += [np.asarray(a["position"]) + 1e-3 * np.asarray(a["direction"]) for a in lighting["areas"]]
+        jobs += [("lamp", position, lamp_resolution) for position in lamps]
 
         casters, bounds = self._shadow_casters(exclude)
         if not casters:
@@ -1966,7 +2115,7 @@ class BlenderService(rpyc.Service):
         center = bounds.mean(axis=0)
         corners = np.asarray(list(itertools.product(*bounds.T)), dtype=float)
         radius = float(np.linalg.norm(corners - center, axis=1).max())
-        maps: dict[str, list] = {"sun": [], "sky": []}
+        maps: dict[str, list] = {"sun": [], "sky": [], "lamp": []}
 
         # Render depth only, with a single sample at the center of each texel, and save it instead of the frame
         scene, render, cycles = self.scene, self.scene.render, self.scene.cycles
@@ -1986,6 +2135,8 @@ class BlenderService(rpyc.Service):
             (cycles, "filter_width", 0.01),
             (cycles, "max_bounces", 0),
             (self.view_layer, "use_pass_z", True),
+            # Without a world, which may hold a volume too, rays that miss every object record a huge depth
+            (scene, "world", None),
         ]
         restore = [(owner, name, getattr(owner, name)) for owner, name, _ in settings]
         restore += [(render, "resolution_x", render.resolution_x), (render, "resolution_y", render.resolution_y)]
@@ -1993,7 +2144,13 @@ class BlenderService(rpyc.Service):
         restore += [
             (node, "mute", node.mute) for node in self.tree.nodes if node.bl_idname == "CompositorNodeOutputFile"
         ]
-        hidden = [obj for obj in scene.objects if obj.name in exclude or not getattr(obj, "visible_shadow", True)]
+        # Volumes, such as the medium itself when rendered by Cycles, would scatter some of the rays of the maps before
+        # they reach any surface, leaving holes in the maps
+        hidden = [
+            obj
+            for obj in scene.objects
+            if obj.name in exclude or not getattr(obj, "visible_shadow", True) or self._volume_only(obj)
+        ]
         restore += [(obj, "hide_render", obj.hide_render) for obj in hidden]
         restore += [(obj, "visible_camera", obj.visible_camera) for obj in casters]
         output = next(n for n in self.tree.nodes if n.bl_idname in ("NodeGroupOutput", "CompositorNodeComposite"))
@@ -2013,19 +2170,33 @@ class BlenderService(rpyc.Service):
             self.tree.links.new(self.render_layers.outputs["Depth"], output.inputs[0])
             scene.collection.objects.link(camera)
             scene.camera = camera
-            camera.data.type, camera.data.sensor_fit = "ORTHO", "AUTO"
-            camera.data.clip_start, camera.data.clip_end = 0.01, 2 * radius + 2
+            camera.data.sensor_fit, camera.data.clip_start = "AUTO", 0.01
+            if hasattr(camera.data, "panorama_type"):
+                camera.data.panorama_type = "EQUIRECTANGULAR"
+            else:
+                camera.data.cycles.panorama_type = "EQUIRECTANGULAR"
 
             with tempfile.TemporaryDirectory() as root:
-                for index, (kind, direction, resolution) in enumerate(jobs):
-                    rotation = mathutils.Vector(direction.tolist()).to_track_quat("Z", "Y").to_matrix()
-                    axes = np.asarray(rotation, dtype=float).T  # rows: right, up, and towards the light
-                    extent = np.abs((corners - center) @ axes[:2].T).max(axis=0)
-                    texel = 2 * float(extent.max()) / resolution
-                    width, height = (max(1, int(np.ceil(2 * e / texel - 1e-6))) for e in extent)
-                    origin = center + axes[2] * (radius + 1)
+                for index, (kind, target, resolution) in enumerate(jobs):
+                    if kind == "lamp":
+                        # Equirectangular camera looking along +X with +Z up, whose texels map to world directions as
+                        # those of environment textures do, at the lamp's position, and whose depth is the distance
+                        # to the camera, see `visionsim.medium.occlusion.lamp_visibility`
+                        rotation = mathutils.Matrix(((0.0, 0.0, -1.0), (-1.0, 0.0, 0.0), (0.0, 1.0, 0.0)))
+                        axes, origin = np.asarray(rotation, dtype=float).T, target
+                        width, height, texel = resolution, max(1, resolution // 2), 2 * np.pi / resolution
+                        camera.data.type = "PANO"
+                        camera.data.clip_end = float(np.linalg.norm(corners - origin, axis=1).max()) + 1
+                    else:
+                        rotation = mathutils.Vector(target.tolist()).to_track_quat("Z", "Y").to_matrix()
+                        axes = np.asarray(rotation, dtype=float).T  # rows: right, up, and towards the light
+                        extent = np.abs((corners - center) @ axes[:2].T).max(axis=0)
+                        texel = 2 * float(extent.max()) / resolution
+                        width, height = (max(1, int(np.ceil(2 * e / texel - 1e-6))) for e in extent)
+                        origin = center + axes[2] * (radius + 1)
+                        camera.data.type, camera.data.clip_end = "ORTHO", 2 * radius + 2
+                        camera.data.ortho_scale = max(width, height) * texel
                     camera.matrix_world = mathutils.Matrix.Translation(origin.tolist()) @ rotation.to_4x4()
-                    camera.data.ortho_scale = max(width, height) * texel
                     render.resolution_x, render.resolution_y = width, height
                     render.filepath = str(Path(root) / f"{index}.exr")
                     bpy.ops.render.render(write_still=True)
@@ -2062,6 +2233,7 @@ class BlenderService(rpyc.Service):
             path,
             **arrays("sun"),
             **arrays("sky"),
+            **arrays("lamp"),
             sun_directions=np.asarray(suns if jobs else [], dtype=float).reshape(-1, 3),
             sky_edges=edges,
             sky_counts=np.asarray(sky_cells if jobs else [0] * len(sky_cells), dtype=int),

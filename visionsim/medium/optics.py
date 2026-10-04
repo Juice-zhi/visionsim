@@ -12,7 +12,8 @@ extinction coefficient at the wavelength of interest (see :meth:`Medium.extincti
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from typing import NamedTuple
 
 import numpy as np
 import torch
@@ -333,6 +334,71 @@ def height_fog_sun_inscatter(
     return torch.where((origin_extinction > 0) & above, result, torch.zeros_like(result))
 
 
+class LightAngles(NamedTuple):
+    """Geometry of rays as seen from a light, see :func:`light_angles`."""
+
+    along: torch.Tensor
+    """distance along each ray to its point of closest approach to the light"""
+    closest: torch.Tensor
+    """distance between the light and each ray, clamped to the light's radius"""
+    start: torch.Tensor
+    """angle at which the light sees the start of the lit part of each ray, from its point of closest approach"""
+    end: torch.Tensor
+    """angle at which the light sees the end of the lit part of each ray, which equals ``start`` if none is lit"""
+    cosines: tuple[torch.Tensor, torch.Tensor] | None
+    """cosines between the cone's axis and the direction from the light towards the point of closest approach, and
+    the ray's direction, or None without a cone"""
+
+
+def light_angles(
+    origin: torch.Tensor,
+    directions: torch.Tensor,
+    distance: torch.Tensor,
+    position: torch.Tensor,
+    radius: float = 0.0,
+    axis: torch.Tensor | None = None,
+    cone: float = -1.0,
+) -> LightAngles:
+    """Range of angles at which a light sees the part of each ray it lights, see :func:`point_light_inscatter`.
+
+    Args:
+        origin (torch.Tensor): Ray origin, of shape (3,).
+        directions (torch.Tensor): Unit ray directions, of shape (..., 3).
+        distance (torch.Tensor): Ray lengths in meters, of shape (...), can be infinite.
+        position (torch.Tensor): Position of the light, of shape (3,).
+        radius (float, optional): Radius of the light, below which distances to it are clamped. Defaults to 0.0.
+        axis (torch.Tensor | None, optional): Unit axis of the cone within which the light shines, of shape (3,).
+            Defaults to None, i.e. the light shines in every direction.
+        cone (float, optional): Cosine of the half-angle of the cone, which must be non-negative to restrict the range
+            of angles. Defaults to -1.0, i.e. the light shines in every direction.
+
+    Raises:
+        ValueError: raised if the cone is wider than a half-space.
+
+    Returns:
+        LightAngles: Geometry of the rays as seen from the light.
+    """
+    offset = position - origin
+    along = directions @ offset
+    closest = ((offset * offset).sum() - along * along).clamp_min(0).sqrt().clamp_min(max(radius, 1e-4))
+    start, end = torch.atan2(-along, closest), torch.atan2(distance - along, closest)
+    if axis is None:
+        return LightAngles(along, closest, start, end, None)
+    if -1 < cone < 0:
+        raise ValueError(f"Cones wider than a half-space are not supported, got a cosine of {cone}.")
+
+    # Unit vector from the light towards the point of closest approach, left at zero for rays through the light
+    towards = along[..., None] * directions - offset
+    towards = towards / towards.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    a_e, a_d = towards @ axis, directions @ axis
+    if cone >= 0:
+        amplitude, phi = torch.hypot(a_e, a_d), torch.atan2(a_d, a_e)
+        half = torch.acos((cone / amplitude.clamp_min(1e-12)).clamp(-1, 1))
+        start, end = torch.maximum(start, phi - half), torch.minimum(end, phi + half)
+        end = torch.where(amplitude > cone, torch.maximum(start, end), start)
+    return LightAngles(along, closest, start, end, (a_e, a_d))
+
+
 def point_light_inscatter(
     medium: Medium,
     origin: torch.Tensor,
@@ -343,6 +409,11 @@ def point_light_inscatter(
     radius: float = 0.0,
     time: float = 0.0,
     nodes: int = 32,
+    axis: torch.Tensor | None = None,
+    cone: float = -1.0,
+    profile: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    falloff: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    shadow: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Integral of ``σ(s) · T(s) · p(θ(s)) · T_light(s) / r(s)²`` along rays, for light from a point light.
 
@@ -355,6 +426,12 @@ def point_light_inscatter(
     such that Gauss-Legendre quadrature converges quickly. Light is attenuated towards the light in closed form, for
     any medium.
 
+    Lights that only shine within a cone, such as spot lights, are supported by integrating over the part of each ray
+    within the cone only, so that its edge doesn't spoil the quadrature: seen from the light, a ray sweeps a great circle
+    ``cos θ · e + sin θ · d``, where ``e`` points towards its point of closest approach and ``d`` is its direction, whose
+    cosine with the cone's axis ``a`` is ``R cos(θ - φ)``, with ``R cos φ = a · e`` and ``R sin φ = a · d``. It is thus
+    within the cone over a single range of angles, ``|θ - φ| <= acos(cos(half-angle) / R)``, see :func:`light_angles`.
+
     Args:
         medium (Medium): Participating medium.
         origin (torch.Tensor): Ray origin, of shape (3,).
@@ -365,21 +442,39 @@ def point_light_inscatter(
         radius (float, optional): Radius of the light, below which distances to it are clamped. Defaults to 0.0.
         time (float, optional): Time in seconds, used by moving media. Defaults to 0.0.
         nodes (int, optional): Number of quadrature nodes along each ray. Defaults to 32.
+        axis (torch.Tensor | None, optional): Unit axis of the cone within which the light shines, of shape (3,).
+            Defaults to None, i.e. the light shines in every direction.
+        cone (float, optional): Cosine of the half-angle of the cone, which must be non-negative, i.e. the cone can
+            be at most a half-space. Defaults to -1.0, i.e. the light shines in every direction.
+        profile (Callable[[torch.Tensor], torch.Tensor] | None, optional): Relative radiant intensity of the light,
+            given the cosine of the angle between the cone's axis and directions from the light. Defaults to None,
+            i.e. the light shines alike in every direction.
+        falloff (Callable[[torch.Tensor], torch.Tensor] | None, optional): Relative radiant intensity of the light,
+            given the distance to it, for lights that don't physically fall off as ``1 / r²``. Defaults to None.
+        shadow (Callable[[torch.Tensor], torch.Tensor] | None, optional): Visibility of the light averaged over
+            intervals of the rays, given the distances along each ray at their bounds, of shape (..., k + 1), see
+            :func:`lamp_shadow <visionsim.medium.occlusion.lamp_shadow>`. The weight of each node of the quadrature is
+            scaled by the visibility averaged between the midpoints with its neighbors. Defaults to None, i.e. the light
+            is never occluded.
+
+    Raises:
+        ValueError: raised if the cone is wider than a half-space.
 
     Returns:
         torch.Tensor: Single scattering integral, of shape (..., c), to be multiplied by the albedo and the light's
         radiant intensity.
     """
     kwargs = {"dtype": directions.dtype, "device": directions.device}
-    offset = position - origin
-    along = directions @ offset
-    closest = ((offset * offset).sum() - along * along).clamp_min(0).sqrt().clamp_min(max(radius, 1e-4))
-    start, end = torch.atan2(-along, closest), torch.atan2(distance - along, closest)
+    along, closest, start, end, cosines = light_angles(origin, directions, distance, position, radius, axis, cone)
 
     t, w = (torch.as_tensor(a, **kwargs) for a in np.polynomial.legendre.leggauss(nodes))
     theta = (start + end)[..., None] / 2 + (end - start)[..., None] / 2 * t
     weights = (end - start)[..., None] / 2 * w
     s = (along[..., None] + closest[..., None] * torch.tan(theta)).clamp_min(0)
+    if shadow is not None:
+        bounds = torch.cat([start[..., None], (theta[..., 1:] + theta[..., :-1]) / 2, end[..., None]], dim=-1)
+        bounds = (along[..., None] + closest[..., None] * torch.tan(bounds)).clamp_min(0)
+        weights = weights * shadow(torch.minimum(bounds, distance[..., None]))
     points = origin + s[..., None] * directions[..., None, :]
     to_light = position - points
     r = to_light.norm(dim=-1).clamp_min(max(radius, 1e-4))
@@ -388,6 +483,11 @@ def point_light_inscatter(
     tau = tau + optical_depth(medium, points, to_light / r[..., None], r, time=time)
     # The light is seen at an angle θ past the point of closest approach, i.e. cos(ray, towards light) = -sin(θ)
     phase = henyey_greenstein(-torch.sin(theta), medium.anisotropy)
+    if cosines is not None and profile is not None:
+        a_e, a_d = cosines
+        phase = phase * profile(a_e[..., None] * torch.cos(theta) + a_d[..., None] * torch.sin(theta))
+    if falloff is not None:
+        phase = phase * falloff(r)
     integrand = density(medium, points, time)[..., None] * beta * torch.exp(-tau[..., None] * beta) * phase[..., None]
     # Far along rays going down forever, the density overflows where no light is left anyway
     integrand = torch.nan_to_num(integrand, nan=0.0, posinf=0.0)

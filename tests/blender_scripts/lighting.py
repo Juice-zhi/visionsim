@@ -16,7 +16,7 @@ import tempfile
 import bpy  # type: ignore
 import numpy as np
 
-from visionsim.simulate.blender import BlenderService
+from visionsim.simulate.blender import BlenderService, _blackbody
 
 
 def main(blend_file: str, output: str) -> None:
@@ -44,6 +44,48 @@ def main(blend_file: str, output: str) -> None:
         (exported,) = service.exposed_lighting_info()["suns"]
         assert np.allclose(exported["direction"], (0.0, -0.5, math.cos(math.radians(30))))
         assert np.allclose(exported["irradiance"], np.array((1.0, 0.9, 0.8)) * 3.0 * 2**1.0 * 0.5)
+
+        # Spot light whose color is set by a Blackbody node, and its strength by the linear output of a Light Falloff
+        spot = bpy.data.lights.new("Spot", type="SPOT")
+        spot.energy, spot.spot_size, spot.spot_blend, spot.shadow_soft_size = 100.0, math.radians(60), 0.2, 0.05
+        spot.use_nodes = True
+        tree = spot.node_tree
+        emission = next(n for n in tree.nodes if n.bl_idname == "ShaderNodeEmission")
+        blackbody, falloff = tree.nodes.new("ShaderNodeBlackbody"), tree.nodes.new("ShaderNodeLightFalloff")
+        blackbody.inputs["Temperature"].default_value = 3000.0
+        falloff.inputs["Strength"].default_value, falloff.inputs["Smooth"].default_value = 5.0, 0.5
+        tree.links.new(blackbody.outputs["Color"], emission.inputs["Color"])
+        tree.links.new(falloff.outputs["Linear"], emission.inputs["Strength"])
+        obj = bpy.data.objects.new("Spot", spot)
+        obj.location, obj.rotation_euler = (1.0, 2.0, 3.0), (math.radians(30), 0.0, 0.0)
+        scene.collection.objects.link(obj)
+
+        # Rectangular area light stretched by its object's scale, and a disk light without normalization
+        rectangle = bpy.data.lights.new("Rectangle", type="AREA")
+        rectangle.shape, rectangle.size, rectangle.size_y, rectangle.energy = "RECTANGLE", 2.0, 1.0, 50.0
+        rectangle.spread = math.radians(150)
+        obj = bpy.data.objects.new("Rectangle", rectangle)
+        obj.location, obj.rotation_euler, obj.scale = (0.0, 0.0, 4.0), (0.0, 0.0, math.radians(90)), (1.5, 2.0, 1.0)
+        scene.collection.objects.link(obj)
+        disk = bpy.data.lights.new("Disk", type="AREA")
+        disk.shape, disk.size, disk.energy, disk.normalize = "DISK", 0.5, 20.0, False
+        scene.collection.objects.link(bpy.data.objects.new("Disk", disk))
+        bpy.context.view_layer.update()
+
+        info = service.exposed_lighting_info()
+        (exported,) = info["spots"]
+        assert np.allclose(exported["direction"], (0.0, math.sin(math.radians(30)), -math.cos(math.radians(30))))
+        assert np.allclose([exported["angle"], exported["blend"]], [math.radians(60), 0.2])
+        assert exported["falloff"] == "linear" and exported["smooth"] == 0.5
+        assert np.allclose(exported["power"], np.array(_blackbody(3000.0)) * 5.0 * 100.0)
+        rectangle, disk = sorted(info["areas"], key=lambda area: area["shape"], reverse=True)
+        assert np.allclose([rectangle["direction"], rectangle["axis_u"]], [(0, 0, -1), (0, 1, 0)], atol=1e-6)
+        assert np.allclose(rectangle["size"], (3.0, 2.0)) and rectangle["shape"] == "rectangle"
+        assert np.allclose([*rectangle["power"], rectangle["spread"]], [50.0] * 3 + [math.radians(150)])
+        assert disk["shape"] == "ellipse" and np.allclose(disk["size"], (0.5, 0.5))
+        assert np.allclose(disk["power"], 20.0 * math.pi / 4 * 0.5**2)
+        for name in ("Spot", "Rectangle", "Disk"):
+            bpy.data.objects.remove(bpy.data.objects[name])
 
         # Constant world color, scaled by its strength
         background = next(n for n in scene.world.node_tree.nodes if n.bl_idname == "ShaderNodeBackground")

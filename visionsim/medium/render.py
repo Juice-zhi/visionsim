@@ -2,19 +2,31 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from functools import partial
 from typing import Any, NamedTuple
 
 import numpy as np
 import numpy.typing as npt
 import torch
 
-from visionsim.medium.model import HeightFog, Lighting, Medium
-from visionsim.medium.occlusion import Occlusion, Shadows, occlusion_to, shade, shadows_to, trace
+from visionsim.medium.lights import AREA_LEVELS, AreaLevel, Emitter, area_weights, closest_distances, emitters
+from visionsim.medium.model import AreaLight, HeightFog, Lamp, Lighting, Medium, PointLight, SpotLight
+from visionsim.medium.occlusion import (
+    Occlusion,
+    ShadowMaps,
+    Shadows,
+    lamp_map_index,
+    lamp_shadow,
+    maps_to,
+    occlusion_to,
+    shade,
+    shadows_to,
+    trace,
+)
 from visionsim.medium.optics import (
     _per_channel,
     height_fog_sun_inscatter,
     henyey_greenstein,
+    light_angles,
     optical_depth,
     point_light_inscatter,
     sky_quadrature,
@@ -37,7 +49,10 @@ _SKY_NODES = 3 * 16 * 24
 _CHUNK_ELEMENTS = 4e7
 """Rough bound on the number of elements of intermediate tensors when processing pixels in chunks"""
 _POINT_LIGHT_NODES = 32
-"""Number of quadrature nodes along each ray used to integrate light from point lights"""
+"""Number of quadrature nodes along each ray used to integrate light from point and spot lights"""
+_LAMP_SHADOW_SAMPLES = 256
+"""Number of samples of the visibility of lamps along each ray, see :func:`lamp_shadow
+<visionsim.medium.occlusion.lamp_shadow>`"""
 
 
 class MediumResult(NamedTuple):
@@ -108,6 +123,105 @@ def _by_pixels(fn: Callable[..., Any], *images: torch.Tensor, elements_per_pixel
     return tuple(map(stitch, zip(*chunks))) if isinstance(chunks[0], tuple) else stitch(chunks)
 
 
+def lamp_inscatter(
+    medium: Medium,
+    origin: torch.Tensor,
+    directions: torch.Tensor,
+    distance: torch.Tensor,
+    beta: torch.Tensor,
+    lamp: Lamp,
+    time: float = 0.0,
+    area_levels: tuple[AreaLevel, ...] = AREA_LEVELS,
+    maps: ShadowMaps | None = None,
+) -> torch.Tensor:
+    """Light of a lamp scattered once towards the camera along rays, before it is scaled by the medium's albedo.
+
+    Lamps are made of point emitters, see :mod:`visionsim.medium.lights`, whose light is integrated with
+    :func:`point_light_inscatter <visionsim.medium.optics.point_light_inscatter>`. Rays that pass far from area lights
+    see them as a single emitter, and those that pass closer to them as finer grids of emitters, see
+    :func:`area_weights <visionsim.medium.lights.area_weights>`. Given maps of lamps, objects cast the shadows of the
+    lamp's center onto the medium, see :func:`lamp_shadow <visionsim.medium.occlusion.lamp_shadow>`.
+
+    Args:
+        medium (Medium): Participating medium.
+        origin (torch.Tensor): Ray origin, of shape (3,).
+        directions (torch.Tensor): Unit ray directions, of shape (r, 3).
+        distance (torch.Tensor): Ray lengths in meters, of shape (r,), can be infinite.
+        beta (torch.Tensor): Extinction coefficient per channel, of shape (c,).
+        lamp (Lamp): Point, spot or area light.
+        time (float, optional): Time in seconds, used by moving media. Defaults to 0.0.
+        area_levels (tuple[AreaLevel, ...], optional): Grids of emitters through which rays that pass close to area
+            lights see them. Defaults to :data:`AREA_LEVELS <visionsim.medium.lights.AREA_LEVELS>`.
+        maps (ShadowMaps | None, optional): Maps of lamps, see :attr:`Occlusion.lamp_maps
+            <visionsim.medium.occlusion.Occlusion.lamp_maps>`, among which the lamp's map is found by its position.
+            Defaults to None, i.e. the lamp's light is not occluded.
+
+    Returns:
+        torch.Tensor: Radiance scattered towards the camera, for an albedo of one, of shape (r, c).
+    """
+    n = len(beta)
+    kwargs: dict[str, Any] = {"dtype": directions.dtype, "device": directions.device}
+    # Maps of area lights are rendered just in front of them
+    center = torch.as_tensor(lamp.position, **kwargs)
+    shifted = center + 1e-3 * torch.as_tensor(lamp.direction, **kwargs) if isinstance(lamp, AreaLight) else center
+    index = lamp_map_index(maps, shifted)
+
+    def scatter(group: list[Emitter], nodes: int, directions: torch.Tensor, distance: torch.Tensor) -> torch.Tensor:
+        size = max(1, int(_CHUNK_ELEMENTS // max(nodes * (8 + 2 * n), 12 * _LAMP_SHADOW_SAMPLES * (index is not None))))
+        parts = []
+        for i in range(0, len(directions), size):
+            rays, lengths = directions[i : i + size], distance[i : i + size]
+            shadow = None
+            if maps is not None and index is not None:
+                shadow = lamp_shadow(maps, index, origin, rays, lengths, samples=_LAMP_SHADOW_SAMPLES)
+            total = rays.new_zeros(len(rays), n)
+            for emitter in group:
+                light = point_light_inscatter(
+                    medium,
+                    origin,
+                    rays,
+                    lengths,
+                    emitter.position,
+                    beta,
+                    radius=emitter.radius,
+                    time=time,
+                    nodes=nodes,
+                    axis=emitter.axis,
+                    cone=emitter.cone,
+                    profile=emitter.profile,
+                    falloff=emitter.falloff,
+                    shadow=shadow,
+                )
+                total = total + emitter.intensity * light
+            parts.append(total)
+        return torch.cat(parts)
+
+    result = directions.new_zeros(len(directions), n)
+    if isinstance(lamp, PointLight):
+        lit = torch.ones_like(distance, dtype=torch.bool)
+    else:
+        # Rays that never enter the cone of a spot, or that stay behind the plane of an area light, aren't lit at all
+        axis = torch.as_tensor(lamp.direction, **kwargs)
+        cone = max(math.cos(lamp.angle / 2), 0.0) if isinstance(lamp, SpotLight) else 0.0
+        angles = light_angles(origin, directions, distance, center, axis=axis / axis.norm(), cone=cone)
+        lit = angles.end > angles.start
+
+    if not isinstance(lamp, AreaLight):
+        rays = lit.nonzero().squeeze(-1)
+        if len(rays):
+            light = scatter(emitters(lamp, n, **kwargs), _POINT_LIGHT_NODES, directions[rays], distance[rays])
+            result = result.index_copy(0, rays, light)
+        return result
+
+    weights = area_weights(lamp, closest_distances(origin, directions, distance, center), area_levels)
+    grids = [(level.samples, level.nodes) for level in area_levels] + [(1, _POINT_LIGHT_NODES)]
+    for (samples, nodes), weight in zip(grids, weights):
+        if len(rays := ((weight > 0) & lit).nonzero().squeeze(-1)):
+            light = scatter(emitters(lamp, n, samples, **kwargs), nodes, directions[rays], distance[rays])
+            result = result.index_add(0, rays, weight[rays, None] * light)
+    return result
+
+
 def apply_medium(
     radiance: npt.ArrayLike | torch.Tensor,
     depth: npt.ArrayLike | torch.Tensor,
@@ -129,17 +243,17 @@ def apply_medium(
     """Add a participating medium to a rendered frame, in closed form.
 
     The radiance of each surface is attenuated by the medium's transmittance, and light from the environment,
-    suns and point lights is scattered towards the camera. Sunlight is integrated in closed form, without any ray
+    suns and lamps is scattered towards the camera. Sunlight is integrated in closed form, without any ray
     marching, light that reaches the medium from many directions (from the sky, from the ground, and light scattered
     more than once) is integrated once per frame along rays of every elevation and interpolated, see
-    :mod:`visionsim.medium.scattering`, and light from point lights is integrated with a quadrature that removes its
-    singularity, see :func:`point_light_inscatter <visionsim.medium.optics.point_light_inscatter>`. When shadow maps of
-    the scene are given, objects cast shadows onto the medium (light shafts) and hide part of the sky from it, see
-    :mod:`visionsim.medium.occlusion`. The result is deterministic and noise-free for the given model, which makes it
-    suitable as the common input of all sensor emulators, which then only add their own noise.
+    :mod:`visionsim.medium.scattering`, and light from point, spot and area lights is integrated with a quadrature that
+    removes its singularity, see :func:`lamp_inscatter`. When shadow maps of the scene are given, objects cast shadows
+    onto the medium (light shafts) and hide part of the sky from it, see :mod:`visionsim.medium.occlusion`. The result
+    is deterministic and noise-free for the given model, which makes it suitable as the common input of all sensor
+    emulators, which then only add their own noise.
 
     Note:
-        The dimming of surfaces lit through the medium is not yet modeled, light from point lights is only scattered
+        The dimming of surfaces lit through the medium is not yet modeled, light from lamps is only scattered
         once and isn't occluded, and neither is light reflected by the ground into the medium. The sky is assumed to
         have a uniform radiance above the horizon, and to be occluded by the ground below it.
 
@@ -252,7 +366,9 @@ def apply_medium(
         def tabulate(source: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]):
             return tabulate_along_rays(source, origin_extinction[channels] * fog.falloff, table_size)
 
-        if occlusion is None and shadows is None:
+        sources = elevation_sources(medium, lighting, beta[channels], n)
+        if (occlusion is None and shadows is None) or not (attenuated_suns or sources):
+            # Without shadows, or without suns or skylight to occlude, e.g. at night
             args = (origin_extinction, fog.falloff, directions[..., 2:3], distance[..., None])
             for towards_sun, color in attenuated_suns:
                 phase = henyey_greenstein(directions @ towards_sun, medium.anisotropy)[..., None]
@@ -276,7 +392,6 @@ def apply_medium(
                     sky_samples=shadow_samples,
                     ground_height=lighting.ground_height,
                 )
-            sources = elevation_sources(medium, lighting, beta[channels], n)
             scattered = medium.multiple_scattering and "scattered" in sources
             shaded = shade(
                 shadows_to(shadows, device=device, dtype=dtype),
@@ -291,21 +406,16 @@ def apply_medium(
             )
             inscatter = inscatter + shaded.reshape(*distance.shape, -1)
 
-    # Point lights shine with a radiant intensity of a quarter of their power per steradian, as in Cycles
-    for light in lighting.points:
-        intensity = _per_channel(light.power, n, "point light power", **kwargs) / (4 * math.pi)
-        scatter = partial(
-            point_light_inscatter,
-            medium,
-            origin,
-            position=torch.as_tensor(light.position, **kwargs),
-            beta=beta,
-            radius=light.radius,
-            time=time,
-            nodes=_POINT_LIGHT_NODES,
+    # Point, spot and area lights shine as in Cycles, see `visionsim.medium.lights`, and objects cast their shadows
+    lamp_maps = None
+    if occlusion is not None and occlusion.lamp_maps is not None:
+        # Single precision is enough to look up the maps of lamps, and faster
+        lamp_maps = maps_to(occlusion.lamp_maps, device=device, dtype=torch.float32)
+    for lamp in lighting.lamps:
+        light = lamp_inscatter(
+            medium, origin, directions.reshape(-1, 3), distance.reshape(-1), beta, lamp, time, maps=lamp_maps
         )
-        integral = _by_pixels(scatter, directions, distance, elements_per_pixel=_POINT_LIGHT_NODES * (8 + 2 * n))
-        inscatter = inscatter + medium.albedo * intensity * integral
+        inscatter = inscatter + medium.albedo * light.reshape(*distance.shape, n)
 
     return MediumResult(
         radiance=torch.cat([transmittance * radiance[..., :n] + inscatter, radiance[..., n:]], dim=-1),

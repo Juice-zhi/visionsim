@@ -8,7 +8,6 @@ which makes it a baseline against which to compare the closed form.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -16,6 +15,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from visionsim.medium.lights import emitters
 from visionsim.medium.model import HeightFog, Lighting, Medium
 from visionsim.medium.optics import density, henyey_greenstein, sky_quadrature
 from visionsim.medium.optics import optical_depth as segment_optical_depth
@@ -66,6 +66,7 @@ def ray_march_medium(
     time: float = 0.0,
     background_depth: float = 1e9,
     max_distance: float = 1000.0,
+    area_samples: int = 8,
     device: torch.device | str | None = None,
     dtype: torch.dtype = torch.float64,
 ) -> MediumResult:
@@ -99,6 +100,7 @@ def ray_march_medium(
             Defaults to 1e9.
         max_distance (float, optional): Distance up to which rays that see the background are marched, in meters.
             Defaults to 1000.0.
+        area_samples (int, optional): Number of emitters along the longest side of area lights. Defaults to 8.
         device (torch.device | str | None, optional): Device to run on. Defaults to None (CPU).
         dtype (torch.dtype, optional): Floating point precision. Defaults to torch.float64.
 
@@ -137,10 +139,8 @@ def ray_march_medium(
     for sun in lighting.suns:
         towards_sun = torch.as_tensor(sun.direction, **kwargs)
         suns.append((towards_sun / towards_sun.norm(), _per_channel(sun.irradiance, n, "sun irradiance", **kwargs)))
-    points = []
-    for light in lighting.points:
-        intensity = _per_channel(light.power, n, "point light power", **kwargs) / (4 * math.pi)
-        points.append((torch.as_tensor(light.position, **kwargs), medium.albedo * intensity, max(light.radius, 1e-4)))
+    # Lamps are made of point emitters, area lights of a fine grid of them, see `visionsim.medium.lights`
+    points = [emitter for lamp in lighting.lamps for emitter in emitters(lamp, n, area_samples, **kwargs)]
 
     def march(directions: torch.Tensor, distance: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Light which is the same at every sample of a ray
@@ -168,11 +168,16 @@ def ray_march_medium(
                     weight = weight * _sun_transmittance(samples, towards_sun, medium, beta, shadow_steps, time)
                 source = source + weight
 
-            for position, weight, radius in points:
-                to_light = position - samples
-                r = to_light.norm(dim=-1).clamp_min(radius)
+            for emitter in points:
+                to_light = emitter.position - samples
+                r = to_light.norm(dim=-1).clamp_min(max(emitter.radius, 1e-4))
                 phase = henyey_greenstein((directions * to_light).sum(dim=-1) / r, medium.anisotropy)
+                if emitter.axis is not None and emitter.profile is not None:
+                    phase = phase * emitter.profile(-(to_light @ emitter.axis) / r)
+                if emitter.falloff is not None:
+                    phase = phase * emitter.falloff(r)
                 depth = segment_optical_depth(medium, samples, to_light / r[..., None], r, time=time)
+                weight = medium.albedo * emitter.intensity
                 source = source + weight * (phase / (r * r))[..., None] * torch.exp(-depth[..., None] * beta)
 
             if elevation_light is not None:
