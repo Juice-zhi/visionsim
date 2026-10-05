@@ -173,6 +173,376 @@ def _blackbody(temperature: float) -> list[float]:
     return [max(c, 0.0) for c in rgb]
 
 
+EMISSIVE_LAMPS: int = 8
+"""Default number of groups of emissive surfaces, which each cast shadows from a single position"""
+EMISSIVE_PATCHES: int = 32
+"""Default number of patches into which emissive surfaces are split, over all of their groups"""
+EMISSIVE_GAP: float = 0.5
+"""Distance, in meters, beyond which emissive surfaces are apart, such as those of different lamps, and only grouped
+together if there are more than ``EMISSIVE_LAMPS`` of them"""
+_EMISSIVE_SAMPLES = 50_000
+"""Number of emissive triangles, drawn by their power, from each side of which rays are traced to find how much of their
+light leaves the surfaces"""
+_ESCAPE_RAYS = 8
+"""Number of rays traced from each side of these triangles, spread as the light they emit"""
+_ORIENTATION_TOLERANCE = 0.05
+"""Relative error of the area of a patch seen from each direction, as approximated from the moments of the normals of
+its faces (see `visionsim.medium.lights.projected_area`), above which it is split by orientation rather than position"""
+_PATCH_SIZE = 0.5
+"""Size, in meters, below which patches aren't split by position, as they only differ from a point emitter whose
+distances are clamped at their radius close to them"""
+_NEGLIGIBLE = 0.01
+"""Share of the light of all lamps, emissive surfaces included, that the faintest emissive surfaces can make up together
+and still be left out"""
+
+
+def _triangles(
+    corners: npt.NDArray[np.floating],
+) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+    """Centers, unit normals and areas of triangles, given their corners of shape (t, 3, 3)."""
+    cross = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+    areas = np.linalg.norm(cross, axis=-1) / 2
+    return corners.mean(axis=1), cross / np.maximum(2 * areas, 1e-300)[:, None], areas
+
+
+def _subdivide(
+    corners: npt.NDArray[np.floating], max_area: float
+) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.integer]]:
+    """Split triangles in four, between the middles of their sides, until none is larger than ``max_area``, which keeps
+    their orientation, and return them along with the index of the triangle each comes from."""
+    sources = np.arange(len(corners))
+    done, kept = [corners[:0]], [sources[:0]]
+    while len(corners):
+        large = _triangles(corners)[2] > max_area
+        done.append(corners[~large])
+        kept.append(sources[~large])
+        a, b, c = corners[large, 0], corners[large, 1], corners[large, 2]
+        ab, bc, ca = (a + b) / 2, (b + c) / 2, (c + a) / 2
+        corners = np.concatenate([np.stack(t, axis=1) for t in ((a, ab, ca), (ab, b, bc), (ca, bc, c), (ab, bc, ca))])
+        sources = np.tile(sources[large], 4)
+    return np.concatenate(done), np.concatenate(kept)
+
+
+def _separate(
+    lower: npt.NDArray[np.floating], upper: npt.NDArray[np.floating], gap: float
+) -> list[npt.NDArray[np.integer]]:
+    """Split items into groups that are further than ``gap`` apart along some axis, given the corners of their boxes,
+    each of shape (n, 3)."""
+    pending, groups = [np.arange(len(lower))], []
+    while pending:
+        group = pending.pop()
+        for axis in range(3):
+            order = group[np.argsort(lower[group, axis], kind="stable")]
+            reach = np.maximum.accumulate(upper[order, axis])
+            apart = np.flatnonzero(lower[order[1:], axis] > reach[:-1] + gap) + 1
+            if len(apart):
+                pending.extend(np.split(order, apart))
+                break
+        else:
+            groups.append(group)
+    return groups
+
+
+def _gather(
+    centers: npt.NDArray[np.floating], weights: npt.NDArray[np.floating], count: int
+) -> list[npt.NDArray[np.integer]]:
+    """Gather items into at most ``count`` groups, by splitting the box around their centers in two halves along its
+    longest side, the group of the largest weight times size first."""
+
+    def score(group: npt.NDArray[np.integer]) -> float:
+        return float(weights[group].sum() * np.ptp(centers[group], axis=0).max()) if len(group) > 1 else 0.0
+
+    groups = [np.arange(len(weights))]
+    scores = [score(groups[0])]
+    while len(groups) < count and max(scores) > 0:
+        best = int(np.argmax(scores))
+        group = groups[best]
+        axis = int(np.argmax(np.ptp(centers[group], axis=0)))
+        values = centers[group, axis]
+        low = values < (values.min() + values.max()) / 2
+        groups[best : best + 1] = parts = [group[low], group[~low]]
+        scores[best : best + 1] = [score(part) for part in parts]
+    return groups
+
+
+def _orientation(
+    normals: npt.NDArray[np.floating],
+    weights: npt.NDArray[np.floating],
+    front: npt.NDArray[np.floating],
+    back: npt.NDArray[np.floating],
+) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+    """Orientation and facing of faces, see :class:`EmissiveSurface <visionsim.medium.model.EmissiveSurface>`, given
+    their unit normals, weights, and the fraction of the light of their front and back that leaves the surfaces."""
+    share = weights / weights.sum()
+    orientation = np.einsum("k,ki,kj->ij", share * (front + back) / 2, normals, normals)
+    return orientation, (share * (front - back) / 2) @ normals
+
+
+def _fibonacci(count: int) -> npt.NDArray[np.floating]:
+    """Unit directions spread evenly over the sphere, of shape (count, 3)."""
+    i = np.arange(count) + 0.5
+    z = 1 - 2 * i / count
+    phi = np.pi * (3 - np.sqrt(5)) * i
+    s = np.sqrt(1 - z * z)
+    return np.stack([s * np.cos(phi), s * np.sin(phi), z], axis=-1)
+
+
+_ERROR_DIRECTIONS = _fibonacci(64)
+"""Directions in which the area of patches seen from them is checked"""
+
+
+def _orientation_error(
+    normals: npt.NDArray[np.floating],
+    weights: npt.NDArray[np.floating],
+    front: npt.NDArray[np.floating],
+    back: npt.NDArray[np.floating],
+) -> float:
+    """Relative error of the area of faces seen from each direction, as approximated from their orientation, see
+    :func:`visionsim.medium.lights.projected_area`."""
+    directions = _ERROR_DIRECTIONS
+    cosines = directions @ normals.T
+    seen = np.maximum(cosines, 0) * front + np.maximum(-cosines, 0) * back
+    exact = seen @ weights / weights.sum()
+    orientation, facing = _orientation(normals, weights, front, back)
+    even = np.sqrt(np.maximum(np.einsum("di,ij,dj->d", directions, orientation, directions), 0))
+    scale = np.trace(orientation) / (2 * even.mean()) if even.mean() > 0 else 0.0
+    approximation = np.maximum(scale * even + directions @ facing, 0)
+    return float(np.sqrt(np.mean((approximation - exact) ** 2)) / max(float(exact.mean()), 1e-300))
+
+
+def _split_by_orientation(
+    normals: npt.NDArray[np.floating], weights: npt.NDArray[np.floating]
+) -> npt.NDArray[np.bool_] | None:
+    """Split faces in two groups of alike orientations, by clustering ``n nᵀ`` in two, which ignores their sides, or
+    None if they are all alike."""
+    x, y, z = normals.T
+    features = np.stack([x * x, y * y, z * z, np.sqrt(2) * x * y, np.sqrt(2) * x * z, np.sqrt(2) * y * z], axis=-1)
+    first = features[np.argmax(weights)]
+    means = np.stack([first, features[np.argmax(((features - first) ** 2).sum(axis=-1))]])
+    second = np.zeros(len(normals), dtype=bool)
+    for _ in range(16):
+        second = ((features - means[1]) ** 2).sum(axis=-1) < ((features - means[0]) ** 2).sum(axis=-1)
+        if second.all() or not second.any():
+            return None
+        means = np.stack(
+            [np.average(features[side], axis=0, weights=weights[side] + 1e-300) for side in (~second, second)]
+        )
+    return second
+
+
+def _escape(
+    centers: npt.NDArray[np.floating],
+    normals: npt.NDArray[np.floating],
+    trace: Callable[[npt.NDArray[np.floating], npt.NDArray[np.floating]], npt.NDArray[np.bool_]],
+    rng: np.random.Generator,
+    rays: int = _ESCAPE_RAYS,
+) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+    """Fraction of the light that leaves the front and the back of triangles without hitting any other, by tracing rays
+    spread as the light they emit, i.e. as the cosine of the angle to their normal, in directions stratified in
+    angle."""
+    k = np.arange(rays)
+    sine, turn = np.sqrt((k + 0.5) / rays), 2 * np.pi * ((k * (np.sqrt(5) - 1) / 2) % 1)
+    angle = turn[None] + rng.uniform(0, 2 * np.pi, (len(centers), 1))
+    helper = np.where((np.abs(normals[:, 0]) < 0.9)[:, None], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
+    tangent = np.cross(normals, helper)
+    tangent /= np.linalg.norm(tangent, axis=-1, keepdims=True)
+    bitangent = np.cross(normals, tangent)
+    # Rays start just off the triangles, far enough for the single precision of the traced triangles
+    offset = 1e-5 * (10 + np.abs(centers).max(axis=-1, keepdims=True))
+    fractions = []
+    for side in (1.0, -1.0):
+        directions = (
+            (sine * np.cos(angle))[..., None] * tangent[:, None]
+            + (sine * np.sin(angle))[..., None] * bitangent[:, None]
+            + np.sqrt(1 - sine * sine)[None, :, None] * side * normals[:, None]
+        )
+        origins = np.broadcast_to((centers + side * offset * normals)[:, None], directions.shape)
+        hits = trace(origins.reshape(-1, 3), directions.reshape(-1, 3)).reshape(len(centers), rays)
+        fractions.append(1 - hits.mean(axis=-1))
+    return fractions[0], fractions[1]
+
+
+def _emissive_lamps(
+    corners: npt.NDArray[np.floating],
+    radiance: npt.NDArray[np.floating],
+    trace: Callable[[npt.NDArray[np.floating], npt.NDArray[np.floating]], npt.NDArray[np.bool_]],
+    lamps: int = EMISSIVE_LAMPS,
+    patches: int = EMISSIVE_PATCHES,
+    gap: float = EMISSIVE_GAP,
+    samples: int = _EMISSIVE_SAMPLES,
+    seed: int = 0,
+    other_power: float = 0.0,
+) -> list[dict[str, Any]]:
+    """Group emissive triangles into lamps, which each cast shadows from a single position, split into patches.
+
+    Triangles further than ``gap`` apart belong to different lamps, as long as there are at most ``lamps`` of them,
+    otherwise lamps are gathered by position, after leaving out the faintest surfaces, as long as they make up at most
+    1% of the light of all lamps, including other lamps of power ``other_power``, assuming that both sides of the
+    surfaces emit. Lamps are then split into ``patches`` patches in total, by repeatedly
+    splitting the patch of the largest power times size in two: by the orientation of its faces if the area it shows in
+    each direction isn't well approximated from their moments, and otherwise in two halves of equal power along its
+    longest side, after splitting triangles larger than a fraction of the patches. The light that leaves each side of
+    a sample of the triangles is found by tracing rays from them, as triangles block each other's light.
+
+    Args:
+        corners (npt.NDArray[np.floating]): World-space corners of the triangles, of shape (t, 3, 3).
+        radiance (npt.NDArray[np.floating]): Radiance of the triangles, of shape (t, c).
+        trace (Callable): Function that tells whether rays hit any of the triangles, given their origins and unit
+            directions, each of shape (r, 3).
+        lamps (int, optional): Maximum number of lamps. Defaults to :data:`EMISSIVE_LAMPS`.
+        patches (int, optional): Number of patches, over all lamps, which each have at least one. Defaults to
+            :data:`EMISSIVE_PATCHES`.
+        gap (float, optional): Distance beyond which triangles are apart. Defaults to :data:`EMISSIVE_GAP`.
+        samples (int, optional): Number of triangles from which rays are traced. Defaults to 50,000.
+        seed (int, optional): Seed of the random sampling of triangles and rays. Defaults to 0.
+        other_power (float, optional): Power of the other lamps of the scene, in W. Defaults to 0.0.
+
+    Returns:
+        list[dict[str, Any]]: Lamps, following the schema of :class:`EmissiveSurface
+        <visionsim.medium.model.EmissiveSurface>`.
+    """
+    areas = _triangles(corners)[2]
+    useful = (areas > 0) & (radiance.mean(axis=-1) > 0)
+    if not useful.any():
+        return []
+    fine, source = _subdivide(corners[useful], float(areas[useful].sum()) / (4 * patches))
+    centers, normals, areas = _triangles(fine)
+    radiance = np.maximum(radiance[useful][source], 0)
+    power = areas * radiance.mean(axis=-1)
+    # Covariance of the points of each triangle around its center
+    corners_offset = fine - centers[:, None]
+    spread = np.einsum("tki,tkj->tij", corners_offset, corners_offset) / 12
+
+    # Surfaces apart from each other are different lamps, the faintest of which are left out, and which are gathered by
+    # position if there are too many
+    components = _separate(fine.min(axis=1), fine.max(axis=1), gap)
+    totals = np.asarray([power[c].sum() for c in components])
+    order = np.argsort(totals, kind="stable")
+    left_out = np.cumsum(2 * np.pi * totals[order]) <= _NEGLIGIBLE * (2 * np.pi * totals.sum() + other_power)
+    components = [components[i] for i in sorted(order[~left_out])]
+    if not components:
+        return []
+    totals = np.asarray([power[c].sum() for c in components])
+    middles = np.stack([np.average(centers[c], axis=0, weights=power[c]) for c in components])
+    lamp_groups = [np.concatenate([components[i] for i in g]) for g in _gather(middles, totals, lamps)]
+
+    # Light that leaves each side of a sample of the triangles, drawn by their power
+    rng = np.random.default_rng(seed)
+    if len(power) <= samples:
+        sampled, weights = np.arange(len(power)), power
+    else:
+        sampled, counts = np.unique(rng.choice(len(power), size=samples, p=power / power.sum()), return_counts=True)
+        weights = counts.astype(float)
+    front, back = _escape(centers[sampled], normals[sampled], trace, rng)
+    slots = np.full(len(power), -1)
+    slots[sampled] = np.arange(len(sampled))
+
+    def sample(group: npt.NDArray[np.integer]) -> tuple[npt.NDArray[np.floating], ...]:
+        found = slots[group]
+        found = found[found >= 0]
+        return normals[sampled[found]], weights[found], front[found], back[found]
+
+    # Patches are split, from lamps, to reduce both their size and how poorly the moments of the normals of their faces
+    # approximate the area they show in each direction
+    reach = max(float(np.ptp(centers, axis=0).max()), 1e-9)
+
+    def cost(group: npt.NDArray[np.integer]) -> tuple[float, float]:
+        found = sample(group)
+        error = _orientation_error(*found) if len(found[0]) > 1 else 0.0
+        size = float(np.ptp(centers[group], axis=0).max()) if len(group) > 1 else 0.0
+        size = size if size > _PATCH_SIZE else 0.0
+        return float(power[group].sum()) * (size / reach + max(error - _ORIENTATION_TOLERANCE, 0.0)), error
+
+    def halves(group: npt.NDArray[np.integer]) -> list[npt.NDArray[np.integer]]:
+        axis = int(np.argmax(np.ptp(centers[group], axis=0)))
+        order = group[np.argsort(centers[group, axis], kind="stable")]
+        cumulative = np.cumsum(power[order])
+        # Split after the triangle whose cumulative power is closest to half of it
+        split = 1 + int(np.argmin(np.abs(cumulative[:-1] - cumulative[-1] / 2)))
+        return [order[:split], order[split:]]
+
+    groups = list(lamp_groups)
+    costs = [cost(group) for group in groups]
+    while len(groups) < patches and max(c for c, _ in costs) > 0:
+        best = int(np.argmax([c for c, _ in costs]))
+        group, (_, error) = groups[best], costs[best]
+        if len(group) < 2:
+            costs[best] = (0.0, error)
+            continue
+        candidates = [halves(group)]
+        if (
+            error > _ORIENTATION_TOLERANCE
+            and (second := _split_by_orientation(normals[group], power[group])) is not None
+        ):
+            candidates.append([group[~second], group[second]])
+        options = [(parts, [cost(part) for part in parts]) for parts in candidates]
+        parts, part_costs = min(options, key=lambda option: sum(c for c, _ in option[1]))
+        groups[best : best + 1] = parts
+        costs[best : best + 1] = part_costs
+
+    lamp_of = np.empty(len(power), dtype=int)
+    for k, group in enumerate(lamp_groups):
+        lamp_of[group] = k
+    surfaces: list[list[dict[str, Any]]] = [[] for _ in lamp_groups]
+    for group in groups:
+        found_normals, found_weights, found_front, found_back = sample(group)
+        if not len(found_normals):
+            # Faint patches may not have any sampled triangle, of which the brightest are traced instead
+            picked = group[np.argsort(power[group])[::-1][:64]]
+            found_front, found_back = _escape(centers[picked], normals[picked], trace, rng)
+            found_normals, found_weights = normals[picked], power[picked]
+        orientation, facing = _orientation(found_normals, found_weights, found_front, found_back)
+        if np.trace(orientation) <= 1e-12 and np.abs(facing).max() <= 1e-12:
+            # No light leaves these faces, e.g. those enclosed by other emissive surfaces
+            continue
+        area = float(areas[group].sum())
+        position = np.average(centers[group], axis=0, weights=power[group])
+        # Covariance of the points of the patch around its center, from those of its triangles
+        offsets = centers[group] - position
+        covariance = np.einsum("t,tij->ij", power[group], spread[group] + offsets[:, :, None] * offsets[:, None, :])
+        covariance /= power[group].sum()
+        pairs = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))
+        surfaces[lamp_of[group[0]]].append(
+            {
+                "position": position.tolist(),
+                "area": area,
+                "radiance": ((radiance[group] * areas[group, None]).sum(axis=0) / area).tolist(),
+                "orientation": [float(orientation[i, j]) for i, j in pairs],
+                "facing": facing.tolist(),
+                "spread": [float(covariance[i, j]) for i, j in pairs],
+            }
+        )
+
+    result = []
+    around = _fibonacci(16)
+    for group, lamp_patches in zip(lamp_groups, surfaces):
+        if not lamp_patches:
+            continue
+        # Shadows are cast from the lamp's center if the lamp surrounds it, as for a ball, which maps see through.
+        # Otherwise the center could lie within some other object, e.g. at the center of a ring of light, and shadows
+        # are cast from the center of the triangle nearest to it
+        position = np.average(centers[group], axis=0, weights=power[group])
+        if not trace(np.broadcast_to(position, around.shape), around).all():
+            position = centers[group[np.argmin(np.linalg.norm(centers[group] - position, axis=-1))]]
+        result.append(
+            {
+                "position": position.tolist(),
+                **{
+                    name: [patch[key] for patch in lamp_patches]
+                    for name, key in (
+                        ("positions", "position"),
+                        ("areas", "area"),
+                        ("radiance", "radiance"),
+                        ("orientation", "orientation"),
+                        ("facing", "facing"),
+                        ("spread", "spread"),
+                    )
+                },
+            }
+        )
+    return result
+
+
 def require_connected_client(
     func: Callable[..., Any],
 ) -> Callable[..., Any]:
@@ -1947,8 +2317,150 @@ class BlenderService(rpyc.Service):
                 strength = 1.0
         return [c * strength for c in color], falloff
 
+    def _shader_emission(self, node: bpy.types.Node, owner: str) -> npt.NDArray[np.floating]:
+        """Constant radiance that a shader node emits, as Cycles evaluates it, which is zero if it doesn't emit."""
+        kind = node.bl_idname
+        if kind in ("ShaderNodeEmission", "ShaderNodeBsdfPrincipled"):
+            principled = kind == "ShaderNodeBsdfPrincipled"
+            color, strength = (node.inputs[f"Emission {n}" if principled else n] for n in ("Color", "Strength"))
+            if strength.is_linked:
+                self.log.warning(f"The emission strength of '{owner}' is set by nodes, using its default value.")
+            if not strength.default_value:
+                return np.zeros(3)
+            # The alpha of a Principled BSDF fades its emission too
+            alpha = node.inputs["Alpha"] if principled and "Alpha" in node.inputs else None
+            fade = 1.0 if alpha is None or alpha.is_linked else float(alpha.default_value)
+            return self._color_of(color, owner) * strength.default_value * fade
+        if kind == "ShaderNodeAddShader":
+            emitted = (self._shader_emission(i.links[0].from_node, owner) for i in node.inputs if i.is_linked)
+            return sum(emitted, np.zeros(3))
+        if kind == "ShaderNodeMixShader":
+            factor = node.inputs[0]
+            source = factor.links[0] if factor.is_linked else None
+            if source is not None and source.from_node.bl_idname == "ShaderNodeLightPath":
+                # Cycles evaluates the emission of surfaces sampled as lights without any type of ray, so that e.g.
+                # surfaces only seen by the camera ("shadeless") don't light anything
+                fac = 0.0 if source.from_socket.identifier.startswith("Is ") else 0.5
+            else:
+                fac = 0.5 if source is not None else float(factor.default_value)
+            if source is not None and fac == 0.5:
+                self.log.warning(f"The mix of the emission of '{owner}' is set by nodes, mixing it evenly.")
+            emission = np.zeros(3)
+            for socket, weight in ((node.inputs[1], 1 - fac), (node.inputs[2], fac)):
+                if socket.is_linked:
+                    emission = emission + weight * self._shader_emission(socket.links[0].from_node, owner)
+            return emission
+        return np.zeros(3)
+
+    def _color_of(self, socket: bpy.types.NodeSocket, owner: str) -> npt.NDArray[np.floating]:
+        """Constant linear color of a socket, the mean of an image or of a black body that sets it, or its default."""
+        if not socket.is_linked:
+            return np.asarray(socket.default_value[:3], dtype=float)
+        node = socket.links[0].from_node
+        if node.bl_idname == "ShaderNodeRGB":
+            return np.asarray(node.outputs[0].default_value[:3], dtype=float)
+        if node.bl_idname == "ShaderNodeBlackbody" and not node.inputs["Temperature"].is_linked:
+            return np.asarray(_blackbody(node.inputs["Temperature"].default_value))
+        if node.bl_idname == "ShaderNodeTexImage" and node.image is not None and all(node.image.size):
+            image = node.image
+            pixels = np.empty(image.size[0] * image.size[1] * image.channels, dtype=np.float32)
+            image.pixels.foreach_get(pixels)
+            rgb = pixels.reshape(-1, image.channels)[:, :3].astype(float)
+            if not image.is_float and image.colorspace_settings.name.lower().startswith("srgb"):
+                rgb = np.where(rgb < 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+            return rgb.mean(axis=0)
+        self.log.warning(f"Unsupported color node {node.bl_idname} of the emission of '{owner}', using its default.")
+        return np.asarray(socket.default_value[:3], dtype=float)
+
+    def _material_emission(self, material: bpy.types.Material | None) -> npt.NDArray[np.floating] | None:
+        """Constant radiance that a material emits, or None if it doesn't emit light."""
+        if material is None or not material.use_nodes or not material.node_tree:
+            return None
+        outputs = [n for n in material.node_tree.nodes if n.bl_idname == "ShaderNodeOutputMaterial"]
+        output = next((n for n in outputs if n.is_active_output), outputs[0] if outputs else None)
+        if output is None or not output.inputs["Surface"].is_linked:
+            return None
+        emission = self._shader_emission(output.inputs["Surface"].links[0].from_node, material.name)
+        return emission if (emission > 0).any() else None
+
     @require_initialized_service
-    def exposed_lighting_info(self) -> dict[str, Any]:
+    def _emissive_triangles(self) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], list[str]]:
+        """World-space corners of the triangles of meshes that emit light, of shape (t, 3, 3), their radiance, of shape
+        (t, 3), and the names of their materials."""
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        emissions: dict[str, npt.NDArray[np.floating] | None] = {}
+        corners: list[npt.NDArray[np.floating]] = []
+        radiance: list[npt.NDArray[np.floating]] = []
+        for instance in depsgraph.object_instances:
+            obj = instance.object
+            owner = instance.parent.original if instance.is_instance and instance.parent else obj.original
+            if (
+                obj.type not in ("MESH", "CURVE", "SURFACE", "META", "FONT")
+                or owner.hide_render
+                or not getattr(owner, "visible_volume_scatter", True)
+            ):
+                continue
+            slots = [slot.material for slot in obj.material_slots]
+            for material in slots:
+                if material is not None and material.name not in emissions:
+                    emissions[material.name] = self._material_emission(material)
+            slot_emission = [emissions[m.name] if m is not None else None for m in slots]
+            if all(emission is None for emission in slot_emission):
+                continue
+
+            mesh = obj.to_mesh()
+            mesh.calc_loop_triangles()
+            vertices = np.empty(len(mesh.vertices) * 3)
+            mesh.vertices.foreach_get("co", vertices)
+            triangles = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int64)
+            mesh.loop_triangles.foreach_get("vertices", triangles)
+            materials = np.empty(len(mesh.loop_triangles), dtype=np.int64)
+            mesh.loop_triangles.foreach_get("material_index", materials)
+            obj.to_mesh_clear()
+
+            matrix = np.asarray(instance.matrix_world, dtype=float)
+            vertices = vertices.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+            triangles = triangles.reshape(-1, 3)
+            for index, emission in enumerate(slot_emission):
+                selected = materials == index
+                if emission is not None and selected.any():
+                    corners.append(vertices[triangles[selected]])
+                    radiance.append(np.broadcast_to(emission, (int(selected.sum()), 3)))
+        names = sorted(name for name, emission in emissions.items() if emission is not None)
+        if not corners:
+            return np.zeros((0, 3, 3)), np.zeros((0, 3)), names
+        return np.concatenate(corners), np.concatenate(radiance), names
+
+    @require_initialized_service
+    def _emissive_surfaces(
+        self, lamps: int, patches: int, other_power: float = 0.0
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Emissive surfaces of the scene, grouped into lamps, and the names of the materials that emit light, see
+        :meth:`lighting_info <exposed_lighting_info>` and :func:`_emissive_lamps`."""
+        from mathutils.bvhtree import BVHTree  # type: ignore
+
+        corners, radiance, names = self._emissive_triangles()
+        if not len(corners):
+            return [], names
+        # Light that a triangle emits towards another one doesn't leave the surfaces
+        count = len(corners)
+        tree = BVHTree.FromPolygons(
+            corners.reshape(-1, 3).tolist(), np.arange(3 * count).reshape(-1, 3).tolist(), all_triangles=True
+        )
+
+        def trace(origins: npt.NDArray[np.floating], directions: npt.NDArray[np.floating]) -> npt.NDArray[np.bool_]:
+            return np.fromiter(
+                (tree.ray_cast(o, d)[0] is not None for o, d in zip(origins.tolist(), directions.tolist())),
+                dtype=bool,
+                count=len(origins),
+            )
+
+        return _emissive_lamps(corners, radiance, trace, lamps, patches, other_power=other_power), names
+
+    @require_initialized_service
+    def exposed_lighting_info(
+        self, emissive_lamps: int = EMISSIVE_LAMPS, emissive_patches: int = EMISSIVE_PATCHES
+    ) -> dict[str, Any]:
         """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
 
         This includes sun, point, spot and area lights, whose intensities account for their exposure, temperature,
@@ -1957,9 +2469,28 @@ class BlenderService(rpyc.Service):
         shaders, square spots, and the elliptical cones of spots scaled unevenly are not supported, and approximated
         with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
 
+        Meshes that emit light, through an Emission shader or the emission of a Principled BSDF, possibly mixed or added
+        with other shaders, are included as emissive surfaces. Their radiance is the emission's strength times its
+        color, which can come from a Blackbody node, or from an image, whose mean color is used. Surfaces further than
+        :data:`EMISSIVE_GAP` apart are grouped into different lamps, which each cast shadows from a single position, as
+        long as there are at most ``emissive_lamps`` of them, and lamps are split into patches, whose light is
+        proportional to the area of their faces seen from each direction, see :func:`_emissive_lamps`.
+
+        Args:
+            emissive_lamps (int, optional): Maximum number of lamps into which emissive surfaces are grouped.
+                Defaults to :data:`EMISSIVE_LAMPS`.
+            emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
+                Defaults to :data:`EMISSIVE_PATCHES`.
+
         Returns:
             dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
         """
+        return self._lighting(emissive_lamps, emissive_patches)[0]
+
+    @require_initialized_service
+    def _lighting(self, emissive_lamps: int, emissive_patches: int) -> tuple[dict[str, Any], list[str]]:
+        """Lighting of the scene, see :meth:`lighting_info <exposed_lighting_info>`, and the names of the materials that
+        emit light."""
         suns: list[dict[str, Any]] = []
         points: list[dict[str, Any]] = []
         spots: list[dict[str, Any]] = []
@@ -2021,21 +2552,64 @@ class BlenderService(rpyc.Service):
             else:
                 self.log.warning(f"{light.type.title()} light '{obj.name}' is not supported and will be ignored.")
 
-        return {"sky": self._world_radiance(), "suns": suns, "points": points, "spots": spots, "areas": areas}
+        # Emissive surfaces too faint next to the other lamps are left out
+        other_power = sum(float(np.mean(lamp["power"])) for lamp in points + spots + areas)
+        emissive, materials = self._emissive_surfaces(emissive_lamps, emissive_patches, other_power)
+        lighting = {"sky": self._world_radiance(), "suns": suns, "points": points, "spots": spots, "areas": areas}
+        return lighting | {"emissive": emissive}, materials
 
     @require_initialized_service
-    def exposed_save_lighting(self, path: str | os.PathLike | None = None) -> None:
+    def exposed_save_lighting(
+        self,
+        path: str | os.PathLike | None = None,
+        emissive_lamps: int = EMISSIVE_LAMPS,
+        emissive_patches: int = EMISSIVE_PATCHES,
+    ) -> None:
         """Save the lighting of the scene, as returned by :meth:`lighting_info <exposed_lighting_info>`, to a JSON file.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
                 root directory of the renders.
+            emissive_lamps (int, optional): Maximum number of lamps into which emissive surfaces are grouped, which
+                should match that of :meth:`save_occlusion <exposed_save_occlusion>`. Defaults to
+                :data:`EMISSIVE_LAMPS`.
+            emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
+                Defaults to :data:`EMISSIVE_PATCHES`.
         """
         path = Path(str(path)) if path else self.root_path / "lighting.json"
         path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(path, "w") as f:
-            json.dump(self.exposed_lighting_info(), f, indent=2)
+            json.dump(self.exposed_lighting_info(emissive_lamps, emissive_patches), f, indent=2)
+
+    @contextmanager
+    def _transparent(self, names: Collection[str]) -> Iterator[None]:
+        """Make materials transparent while in this context, such that maps see through them."""
+        changes = []
+        try:
+            for name in names:
+                material = bpy.data.materials.get(name)
+                if material is None or not material.use_nodes or not material.node_tree:
+                    continue
+                if not getattr(material, "is_editable", material.library is None):
+                    self.log.warning(f"Material '{name}' is linked from a library, and hides its own light.")
+                    continue
+                tree = material.node_tree
+                outputs = [n for n in tree.nodes if n.bl_idname == "ShaderNodeOutputMaterial"]
+                output = next((n for n in outputs if n.is_active_output), outputs[0] if outputs else None)
+                if output is None:
+                    continue
+                surface = output.inputs["Surface"]
+                previous = surface.links[0].from_socket if surface.is_linked else None
+                node = tree.nodes.new("ShaderNodeBsdfTransparent")
+                changes.append((tree, node, surface, previous))
+                tree.links.new(node.outputs[0], surface)
+            yield
+        finally:
+            for tree, node, surface, previous in reversed(changes):
+                tree.nodes.remove(node)
+                if previous is not None:
+                    tree.links.new(previous, surface)
 
     @staticmethod
     def _volume_only(obj: bpy.types.Object) -> bool:
@@ -2086,16 +2660,19 @@ class BlenderService(rpyc.Service):
         sun_resolution: int = 2048,
         sky_resolution: int = 512,
         lamp_resolution: int = 1024,
+        emissive_lamps: int = EMISSIVE_LAMPS,
+        emissive_patches: int = EMISSIVE_PATCHES,
     ) -> None:
         """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
 
         Orthographic depth maps of the objects that cast shadows are rendered with Cycles along the direction of each
         sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
         split into equal ranges of azimuth. Maps span the box that contains these objects. The distance to the first
-        object in every direction around each lamp (point, spot and area lights) is also rendered, in equirectangular
-        maps. All maps are saved to a ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They
-        are captured at the current frame, so objects should be static. Render settings, the camera and the compositor
-        are restored afterwards.
+        object in every direction around each lamp (point, spot and area lights, and groups of emissive surfaces, see
+        :meth:`lighting_info <exposed_lighting_info>`) is also rendered, in equirectangular maps, through which emissive
+        surfaces are seen as if they were transparent, as they don't hide their own light. All maps are saved to a
+        ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current
+        frame, so objects should be static. Render settings, the camera and the compositor are restored afterwards.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
@@ -2112,6 +2689,10 @@ class BlenderService(rpyc.Service):
                 Defaults to 512.
             lamp_resolution (int, optional): Number of texels along the width of the maps of lamps, which span all
                 azimuths, and half as many along their height, which spans all elevations. Defaults to 1024.
+            emissive_lamps (int, optional): Maximum number of lamps into which emissive surfaces are grouped, which
+                should match that of :meth:`save_lighting <exposed_save_lighting>`. Defaults to :data:`EMISSIVE_LAMPS`.
+            emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
+                Defaults to :data:`EMISSIVE_PATCHES`.
 
         Raises:
             ValueError: raised if the number of bands of the sky and of their edges do not match.
@@ -2122,15 +2703,17 @@ class BlenderService(rpyc.Service):
         path = Path(str(path)) if path else self.root_path / "occlusion.npz"
         path.parent.mkdir(parents=True, exist_ok=True)
         edges = np.sin(np.radians(np.asarray(sky_elevations, dtype=float)))
-        lighting = self.exposed_lighting_info()
+        lighting, emissive_materials = self._lighting(emissive_lamps, emissive_patches)
         suns = [np.asarray(sun["direction"], dtype=float) for sun in lighting["suns"]]
         suns = [sun / np.linalg.norm(sun) for sun in suns]
-        jobs = [("sun", sun, sun_resolution) for sun in suns]
-        jobs += [("sky", direction, sky_resolution) for direction in _sky_cell_directions(edges, sky_cells)]
+        # Jobs are rendered in order, the last ones seeing through emissive surfaces
+        jobs = [("sun", sun, sun_resolution, False) for sun in suns]
+        jobs += [("sky", direction, sky_resolution, False) for direction in _sky_cell_directions(edges, sky_cells)]
         # Area lights shine from their surface, from which the map is rendered just in front
         lamps = [np.asarray(lamp["position"], dtype=float) for lamp in lighting["points"] + lighting["spots"]]
         lamps += [np.asarray(a["position"]) + 1e-3 * np.asarray(a["direction"]) for a in lighting["areas"]]
-        jobs += [("lamp", position, lamp_resolution) for position in lamps]
+        jobs += [("lamp", position, lamp_resolution, False) for position in lamps]
+        jobs += [("lamp", np.asarray(e["position"], dtype=float), lamp_resolution, True) for e in lighting["emissive"]]
 
         casters, bounds = self._shadow_casters(exclude)
         if not casters:
@@ -2159,6 +2742,8 @@ class BlenderService(rpyc.Service):
             (cycles, "filter_width", 0.01),
             (cycles, "max_bounces", 0),
             (self.view_layer, "use_pass_z", True),
+            # The depth of transparent surfaces isn't recorded, but that of the surfaces behind them
+            (self.view_layer, "pass_alpha_threshold", 0.5),
             # Without a world, which may hold a volume too, rays that miss every object record a huge depth
             (scene, "world", None),
         ]
@@ -2200,8 +2785,12 @@ class BlenderService(rpyc.Service):
             else:
                 camera.data.cycles.panorama_type = "EQUIRECTANGULAR"
 
-            with tempfile.TemporaryDirectory() as root:
-                for index, (kind, target, resolution) in enumerate(jobs):
+            with tempfile.TemporaryDirectory() as root, ExitStack() as stack:
+                see_through = False
+                for index, (kind, target, resolution, transparent) in enumerate(jobs):
+                    if transparent and not see_through:
+                        stack.enter_context(self._transparent(emissive_materials))
+                        see_through = True
                     if kind == "lamp":
                         # Equirectangular camera looking along +X with +Z up, whose texels map to world directions as
                         # those of environment textures do, at the lamp's position, and whose depth is the distance

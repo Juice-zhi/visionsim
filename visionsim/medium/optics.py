@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
+from functools import lru_cache
 from typing import NamedTuple
 
 import numpy as np
@@ -334,6 +335,12 @@ def height_fog_sun_inscatter(
     return torch.where((origin_extinction > 0) & above, result, torch.zeros_like(result))
 
 
+@lru_cache(maxsize=32)
+def _gauss_legendre(nodes: int) -> tuple[np.ndarray, np.ndarray]:
+    """Nodes and weights of the Gauss-Legendre quadrature over [-1, 1]."""
+    return np.polynomial.legendre.leggauss(nodes)
+
+
 class LightAngles(NamedTuple):
     """Geometry of rays as seen from a light, see :func:`light_angles`."""
 
@@ -365,7 +372,7 @@ def light_angles(
         origin (torch.Tensor): Ray origin, of shape (3,), or one per ray, of shape (..., 3).
         directions (torch.Tensor): Unit ray directions, of shape (..., 3).
         distance (torch.Tensor): Ray lengths in meters, of shape (...), can be infinite.
-        position (torch.Tensor): Position of the light, of shape (3,).
+        position (torch.Tensor): Position of the light, of shape (3,), or one per ray, of shape (..., 3).
         radius (float, optional): Radius of the light, below which distances to it are clamped. Defaults to 0.0.
         axis (torch.Tensor | None, optional): Unit axis of the cone within which the light shines, of shape (3,).
             Defaults to None, i.e. the light shines in every direction.
@@ -414,6 +421,7 @@ def point_light_inscatter(
     profile: Callable[[torch.Tensor], torch.Tensor] | None = None,
     falloff: Callable[[torch.Tensor], torch.Tensor] | None = None,
     shadow: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    pattern: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Integral of ``σ(s) · T(s) · p(θ(s)) · T_light(s) / r(s)²`` along rays, for light from a point light.
 
@@ -437,7 +445,8 @@ def point_light_inscatter(
         origin (torch.Tensor): Ray origin, of shape (3,), or one per ray, of shape (..., 3).
         directions (torch.Tensor): Unit ray directions, of shape (..., 3).
         distance (torch.Tensor): Ray lengths in meters, of shape (...), can be infinite.
-        position (torch.Tensor): Position of the light, of shape (3,).
+        position (torch.Tensor): Position of the light, of shape (3,), or one per ray, of shape (..., 3), e.g. to
+            integrate the light of several lights at once.
         beta (torch.Tensor): Extinction coefficient per channel, of shape (c,).
         radius (float, optional): Radius of the light, below which distances to it are clamped. Defaults to 0.0.
         time (float, optional): Time in seconds, used by moving media. Defaults to 0.0.
@@ -456,6 +465,9 @@ def point_light_inscatter(
             :func:`lamp_shadow <visionsim.medium.occlusion.lamp_shadow>`. The weight of each node of the quadrature is
             scaled by the visibility averaged between the midpoints with its neighbors. Defaults to None, i.e. the light
             is never occluded.
+        pattern (Callable[[torch.Tensor], torch.Tensor] | None, optional): Relative radiant intensity of the light,
+            given unit directions from the light, of shape (..., 3), for lights that don't shine symmetrically around
+            an axis, such as patches of emissive surfaces. Defaults to None.
 
     Raises:
         ValueError: raised if the cone is wider than a half-space.
@@ -467,7 +479,7 @@ def point_light_inscatter(
     kwargs = {"dtype": directions.dtype, "device": directions.device}
     along, closest, start, end, cosines = light_angles(origin, directions, distance, position, radius, axis, cone)
 
-    t, w = (torch.as_tensor(a, **kwargs) for a in np.polynomial.legendre.leggauss(nodes))
+    t, w = (torch.as_tensor(a, **kwargs) for a in _gauss_legendre(nodes))
     theta = (start + end)[..., None] / 2 + (end - start)[..., None] / 2 * t
     weights = (end - start)[..., None] / 2 * w
     s = (along[..., None] + closest[..., None] * torch.tan(theta)).clamp_min(0)
@@ -477,7 +489,7 @@ def point_light_inscatter(
         weights = weights * shadow(torch.minimum(bounds, distance[..., None]))
     starts = origin[..., None, :] if origin.ndim > 1 else origin
     points = starts + s[..., None] * directions[..., None, :]
-    to_light = position - points
+    to_light = (position[..., None, :] if position.ndim > 1 else position) - points
     r = to_light.norm(dim=-1).clamp_min(max(radius, 1e-4))
 
     tau = optical_depth(medium, starts, directions[..., None, :], s, time=time)
@@ -489,6 +501,8 @@ def point_light_inscatter(
         phase = phase * profile(a_e[..., None] * torch.cos(theta) + a_d[..., None] * torch.sin(theta))
     if falloff is not None:
         phase = phase * falloff(r)
+    if pattern is not None:
+        phase = phase * pattern(-to_light / to_light.norm(dim=-1, keepdim=True).clamp_min(1e-12))
     integrand = density(medium, points, time)[..., None] * beta * torch.exp(-tau[..., None] * beta) * phase[..., None]
     # Far along rays going down forever, the density overflows where no light is left anyway
     integrand = torch.nan_to_num(integrand, nan=0.0, posinf=0.0)

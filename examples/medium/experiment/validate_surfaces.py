@@ -6,8 +6,8 @@ form's illumination (``apply_medium`` given the normals of surfaces, see :mod:`v
 
 - by day, lit by the sun and the sky, with Cycles' renders with 0 and 32 volume bounces (``bounces.py``) and a render
   without fog with world-space normals (``render_passes.py --light-groups`` into ``runs/fog-comparison/lightgroups``);
-- at night, lit by a point, spot or area light (see ``validate_lighting.py``), with renders of the same variants
-  without their fog volume, e.g.::
+- at night, lit by a point, spot or area light, or an emissive panel or ball (see ``validate_lighting.py``), with renders
+  of the same variants without their fog volume, e.g.::
 
       blender -b runs/fog-comparison/variants/clear_spot.blend --python render_passes.py -- \\
           runs/fog-comparison/spot/clear --samples 512 --frame 255 345 --no-volume-passes --light-groups
@@ -94,7 +94,7 @@ def main():
             ROOT / "lightgroups", ROOT / "bounces" / "32", fog.model_copy(update={"multiple_scattering": True}), day
         ),
     }
-    for lamp in ("point", "spot", "area"):
+    for lamp in ("point", "spot", "area", "emissive_panel", "emissive_ball"):
         # Cycles clamps indirect light by default, which darkens the glow lighting surfaces near lamps
         fog_dir = ROOT / lamp / "noclamp_bounces0"
         fog_dir = fog_dir if fog_dir.exists() else ROOT / lamp / "bounces0"

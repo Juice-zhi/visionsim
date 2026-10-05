@@ -13,7 +13,10 @@ from the lamp, and averaged around the latter, which is exact for a lamp that sh
 homogeneous medium. Higher orders are iterated by integrating each order along the gathering rays, and later ones are
 extrapolated as a geometric series at each point. Tables are interpolated in log space, which is exact for powers of
 the distance to the lamp, along camera rays, whose nodes are spread evenly in angle as seen from the lamp. As they don't
-depend on the camera, they are computed once per lamp and medium, see :func:`cached_lamp_halo`.
+depend on the camera, they are computed once per lamp and medium, see :func:`cached_lamp_halo`. As the halo spreads far
+beyond lamps, the light scattered once is gathered from a single emitter per lamp: area lights aren't split into grids,
+and the patches of emissive surfaces are merged into one, see :func:`merge_patches
+<visionsim.medium.lights.merge_patches>`.
 
 The ground, at the lighting's ``ground_height``, stops light going down, but doesn't reflect any. Light reflected by
 other surfaces into the medium isn't modeled either.
@@ -28,7 +31,8 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 
-from visionsim.medium.model import Blob, Lamp, Medium
+from visionsim.medium.lights import merge_patches
+from visionsim.medium.model import Blob, EmissiveSurface, Lamp, Medium
 from visionsim.medium.occlusion import ShadowMaps, maps_to
 from visionsim.medium.optics import density, henyey_greenstein, optical_depth
 
@@ -215,7 +219,7 @@ def lamp_halo(
 
     Args:
         medium (Medium): Participating medium.
-        lamp (Lamp): Point, spot or area light.
+        lamp (Lamp): Point, spot or area light, or emissive surface.
         beta (torch.Tensor): Extinction coefficient per channel, of shape (c,).
         ground (float, optional): Height of the ground, which stops light going down. Defaults to 0.0.
         maps (ShadowMaps | None, optional): Maps of lamps, through which objects cast the lamp's shadows onto the light
@@ -226,9 +230,10 @@ def lamp_halo(
     Returns:
         LampHalo: Light of the lamp scattered more than once.
     """
-    # The light scattered once is computed as along camera rays, from each point of the grid
+    # The light scattered once is computed as along camera rays, from each point of the grid, from a single emitter
     from visionsim.medium.render import lamp_inscatter
 
+    lamp = merge_patches(lamp) if isinstance(lamp, EmissiveSurface) else lamp
     kwargs: dict[str, Any] = {"dtype": beta.dtype, "device": beta.device}
     g, albedo = medium.anisotropy, medium.albedo
     center = torch.as_tensor(lamp.position, **kwargs)
@@ -274,7 +279,15 @@ def lamp_halo(
         [
             albedo
             * lamp_inscatter(
-                medium, origins[i : i + 50000], rays[i : i + 50000], lengths[i : i + 50000], beta, lamp, time, maps=maps
+                medium,
+                origins[i : i + 50000],
+                rays[i : i + 50000],
+                lengths[i : i + 50000],
+                beta,
+                lamp,
+                time,
+                area_levels=(),
+                maps=maps,
             )
             for i in range(0, len(rays), 50000)
         ]
@@ -362,7 +375,7 @@ def halo_threshold(medium: Medium, lamp: Lamp, beta: torch.Tensor, extent: float
 
     Args:
         medium (Medium): Participating medium.
-        lamp (Lamp): Point, spot or area light.
+        lamp (Lamp): Point, spot or area light, or emissive surface.
         beta (torch.Tensor): Extinction coefficient per channel, of shape (c,).
         extent (float, optional): Extent of the halo, in meters. Defaults to that of :class:`HaloGrid`.
 

@@ -27,6 +27,17 @@
       blender -b runs/fog-comparison/variants/fog_point_shadow.blend --python export_occlusion.py -- \\
           runs/fog-comparison/point_shadow/occlusion.npz --exclude Plane
 
+  Meshes that emit light (``lamp_scene.py --type MESH``) are compared in the same way: a panel where the area light
+  is (``emissive_panel``), a ball (``emissive_ball``) and a tilted box (``emissive_box``) where the point light is, and
+  a ball behind the cube, whose shadows it casts (``emissive_shadow``), rendered without clamping into
+  ``noclamp_bounces0``, which is used when there is no ``bounces0``. As the camera doesn't see these meshes,
+  pixels whose rays go through the closed ones are left out, as Cycles' rays see their inside lit by their own faces,
+  e.g.::
+
+      blender -b runs/fog-comparison/fog_ref.blend --python lamp_scene.py -- \\
+          runs/fog-comparison/variants/fog_emissive_box.blend --type MESH --mesh BOX --position -1.5 22 3 \\
+          --direction 0.3 -0.5 -0.8 --size 0.4 --strength 2000
+
 - Halos of lamps: all the light of a point lamp scattered by the fog, in the scene without objects and with a black
   ground (lit by the lamp of the ``point`` variant, with soft falloff, or by a small sphere light), against Cycles'
   renders with 32 volume bounces without clamping, which otherwise darkens light scattered more than once near the
@@ -56,8 +67,45 @@ from visionsim.medium import Lighting, Medium, Occlusion, apply_medium, camera_r
 
 INDICES = (250, 340)
 ELEVATIONS = (-90, -10, -4, -1.5, 0, 1.5, 4, 10, 25, 90)
-LAMPS = ("point", "spot", "area", "point_smooth", "point_shadow")
+LAMPS = (
+    "point",
+    "spot",
+    "area",
+    "point_smooth",
+    "point_shadow",
+    "emissive_panel",
+    "emissive_ball",
+    "emissive_box",
+    "emissive_shadow",
+)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+INSIDE = {
+    "emissive_ball": ((-1.5, 22.0, 3.0), 0.15),
+    "emissive_box": ((-1.5, 22.0, 3.0), 0.2 * 3**0.5),
+    "emissive_shadow": ((4.0, 21.0, 1.5), 0.1),
+}
+"""Center and radius of a sphere around the closed meshes of emissive variants, which the camera doesn't see: Cycles'
+camera rays go through them, and see their inside lit by their own faces, unlike rays that would see their surface"""
+
+
+def through(transform: dict, depth: np.ndarray, center: tuple[float, ...], radius: float) -> np.ndarray:
+    """Pixels whose rays go through a sphere before they stop."""
+    origin, directions, scale = (x.numpy() for x in camera_rays(transform, transform["transform_matrix"]))
+    offset = np.asarray(center) - origin
+    along = directions @ offset
+    closest = np.sqrt(np.maximum((offset**2).sum() - along**2, 0))
+    return (closest < radius) & (along > 0) & (along - radius < depth * scale)
+
+
+def errors(ours: np.ndarray, theirs: np.ndarray, keep: np.ndarray) -> dict:
+    """Ratio of the total light of both, and relative L1 errors, as is and once blurred, over the pixels kept."""
+    mask = np.broadcast_to(keep[..., None], ours.shape)
+    return {
+        "ratio": float(ours[mask].sum() / theirs[mask].sum()),
+        "rel_l1": float(np.abs(ours - theirs)[mask].sum() / theirs[mask].sum()),
+        # Errors of blurred images, which leave out Cycles' noise
+        "rel_l1_blurred": float(np.abs(blur(ours) - blur(theirs))[mask].sum() / theirs[mask].sum()),
+    }
 
 
 def blur(images: np.ndarray, size: int = 5) -> np.ndarray:
@@ -138,28 +186,25 @@ def main():
     depths = Dataset.from_path(ROOT / "clear" / "depths")
     depth = np.stack([box_depth(np.asarray(depths[i][0])[..., 0], t) for i, t in zip(INDICES, transforms)])
     for lamp in LAMPS:
-        if not (ROOT / lamp / "bounces0").exists():
+        reference = next(
+            (ROOT / lamp / name for name in ("bounces0", "noclamp_bounces0") if (ROOT / lamp / name).exists()), None
+        )
+        if reference is None:
             continue
         lighting = Lighting.model_validate_json((ROOT / lamp / "lighting.json").read_text())
         ours = in_scattering(medium, lighting, depth, transforms)
-        theirs = load(ROOT / lamp / "bounces0" / "volume" / "direct")
-        results[f"{lamp}_vs_0_bounces"] = {
-            "ratio": float(ours.sum() / theirs.sum()),
-            "rel_l1": float(np.abs(ours - theirs).sum() / theirs.sum()),
-            # Errors of blurred images, which leave out Cycles' noise
-            "rel_l1_blurred": float(np.abs(blur(ours) - blur(theirs)).sum() / theirs.sum()),
-        }
-        np.savez_compressed(ROOT / lamp / "comparison.npz", ours=ours, theirs=theirs)
+        theirs = load(reference / "volume" / "direct")
+        keep = np.ones(ours.shape[:-1], dtype=bool)
+        if lamp in INSIDE:
+            keep = ~np.stack([through(t, d, *INSIDE[lamp]) for t, d in zip(transforms, depth)])
+        results[f"{lamp}_vs_0_bounces"] = errors(ours, theirs, keep)
+        np.savez_compressed(ROOT / lamp / "comparison.npz", ours=ours, theirs=theirs, keep=keep)
         if (ROOT / lamp / "occlusion.npz").exists():
             # Objects cast the lamp's shadows onto the fog
             occlusion = load_occlusion(ROOT / lamp / "occlusion.npz", dtype=torch.float64)
             shadowed = in_scattering(medium, lighting, depth, transforms, occlusion)
-            results[f"{lamp}_shadows_vs_0_bounces"] = {
-                "ratio": float(shadowed.sum() / theirs.sum()),
-                "rel_l1": float(np.abs(shadowed - theirs).sum() / theirs.sum()),
-                "rel_l1_blurred": float(np.abs(blur(shadowed) - blur(theirs)).sum() / theirs.sum()),
-            }
-            np.savez_compressed(ROOT / lamp / "comparison.npz", ours=ours, theirs=theirs, shadowed=shadowed)
+            results[f"{lamp}_shadows_vs_0_bounces"] = errors(shadowed, theirs, keep)
+            np.savez_compressed(ROOT / lamp / "comparison.npz", ours=ours, theirs=theirs, shadowed=shadowed, keep=keep)
         if (ROOT / lamp / "bounces32").exists():
             results[f"{lamp}_vs_32_bounces"] = {"ratio": float(ours.sum() / fog_light(ROOT / lamp / "bounces32").sum())}
 

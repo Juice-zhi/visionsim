@@ -1,4 +1,5 @@
-"""Lamps, i.e. point, spot and area lights, as sets of point emitters whose light is scattered by a medium.
+"""Lamps, i.e. point, spot and area lights and emissive surfaces, as sets of point emitters whose light is scattered by
+a medium.
 
 Emission follows Cycles, so that the medium is lit consistently with the scene:
 
@@ -7,6 +8,9 @@ Emission follows Cycles, so that the medium is lit consistently with the scene:
 - Area lights are one-sided Lambertian emitters, whose radiance is their power divided by π times their area. They are
   split into a grid of patches, each of which shines like a point emitter of radiant intensity ``radiance · area of the
   patch · cos φ``, at an angle ``φ`` from the light's normal, further restricted to the cone of the light's spread.
+- Emissive surfaces emit their radiance on both sides, and each of their patches shines like a point emitter of
+  radiant intensity ``radiance · area seen``, where the area seen from a direction only counts the faces of the patch
+  whose light leaves the surfaces towards it, e.g. not the inside of a closed surface, see :func:`projected_area`.
 
 Rays that pass far from an area light see it as a single emitter, so only rays that pass close to it need a grid, which
 is finer for rays that pass closer, see :func:`area_weights`.
@@ -21,7 +25,7 @@ from typing import NamedTuple
 
 import torch
 
-from visionsim.medium.model import AreaLight, Lamp, PointLight, SpotLight
+from visionsim.medium.model import AreaLight, EmissiveSurface, Lamp, PointLight, SpotLight
 from visionsim.medium.optics import _per_channel
 
 
@@ -56,7 +60,7 @@ class Emitter(NamedTuple):
     position: torch.Tensor
     """world-space position, of shape (3,)"""
     intensity: torch.Tensor
-    """radiant intensity per channel, in W/sr, which is scaled by ``profile`` if any, of shape (c,)"""
+    """radiant intensity per channel, in W/sr, which is scaled by ``profile`` and ``pattern`` if any, of shape (c,)"""
     radius: float
     """distance to the emitter below which distances are clamped, in meters"""
     axis: torch.Tensor | None = None
@@ -67,6 +71,9 @@ class Emitter(NamedTuple):
     """relative radiant intensity, given the cosine of the angle between the axis and directions from the emitter"""
     falloff: Callable[[torch.Tensor], torch.Tensor] | None = None
     """relative radiant intensity, given the distance to the emitter, or None if it physically falls off as 1 / r²"""
+    pattern: Callable[[torch.Tensor], torch.Tensor] | None = None
+    """relative radiant intensity, given unit directions from the emitter, of shape (..., 3), for emitters that don't
+    shine symmetrically around an axis"""
 
 
 def distance_falloff(distance: torch.Tensor, exponent: int, smooth: float) -> torch.Tensor:
@@ -126,6 +133,72 @@ def area_falloff(cos_angle: torch.Tensor, tan_half_spread: float, normalization:
     return cos_angle * ((tan_half_spread - tan_angle) * normalization).clamp_min(0)
 
 
+def two_sided_falloff(cos_angle: torch.Tensor, front: float, back: float) -> torch.Tensor:
+    """Relative intensity of a flat patch of an emissive surface, which is Lambertian on both sides.
+
+    Args:
+        cos_angle (torch.Tensor): Cosine of the angle between the patch's normal and directions from the patch.
+        front (float): Relative intensity towards the normal.
+        back (float): Relative intensity away from the normal.
+
+    Returns:
+        torch.Tensor: Relative intensity.
+    """
+    return torch.where(cos_angle >= 0, front * cos_angle, -back * cos_angle)
+
+
+def projected_area(
+    directions: torch.Tensor, orientation: torch.Tensor, facing: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """Area of the faces of a patch of an emissive surface seen from given directions, whose light leaves towards them,
+    relative to the area of the patch.
+
+    For faces of areas ``a_i`` and unit normals ``n_i``, a fraction ``f_i`` of the light of whose front leaves the
+    surface, and ``b_i`` of the light of their back, it is ``Σ a_i (f_i max(n_i·ω, 0) + b_i max(-n_i·ω, 0)) / Σ a_i``
+    in a direction ``ω``. This is the sum of an even part, ``Σ a_i s_i |n_i·ω| / Σ a_i`` with ``s_i = (f_i + b_i) / 2``,
+    and of an odd one, ``Σ a_i d_i n_i·ω / Σ a_i`` with ``d_i = (f_i - b_i) / 2``, which is exactly ``facing·ω``. The
+    even part is approximated by ``scale · sqrt(ωᵀ M ω)``, where ``M = Σ a_i s_i n_i n_iᵀ / Σ a_i`` is the orientation of
+    the faces and the scale keeps the light that they emit, see :func:`orientation_scale`. This is exact for flat
+    patches, whose normals are all alike, and for faces whose normals are spread evenly around one or every direction,
+    such as cylinders and spheres, and hemispheres with their odd part.
+
+    Args:
+        directions (torch.Tensor): Unit directions from the patch, of shape (..., 3).
+        orientation (torch.Tensor): Orientation ``M`` of the faces, of shape (3, 3).
+        facing (torch.Tensor): Normals of the faces weighted by ``d_i``, i.e. ``Σ a_i d_i n_i / Σ a_i``, of shape (3,).
+        scale (float): Scale of the even part, see :func:`orientation_scale`.
+
+    Returns:
+        torch.Tensor: Relative area seen from each direction, of shape (...).
+    """
+    quadratic = torch.einsum("...i,ij,...j->...", directions, orientation, directions)
+    return (scale * quadratic.clamp_min(0).sqrt() + directions @ facing).clamp_min(0)
+
+
+def orientation_scale(orientation: torch.Tensor, samples: int = 4096) -> float:
+    """Scale of the even part of the area of faces seen from each direction, see :func:`projected_area`, such that they
+    emit as much light as the faces do, i.e. such that ``scale · sqrt(ωᵀ M ω)`` integrates to ``2π · trace(M)`` over all
+    directions, as ``|n·ω|`` integrates to ``2π``.
+
+    Args:
+        orientation (torch.Tensor): Orientation ``M`` of the faces, of shape (3, 3).
+        samples (int, optional): Number of directions of the Fibonacci lattice that integrates over the sphere.
+            Defaults to 4096.
+
+    Returns:
+        float: Scale, which is one for flat patches whose normals are all alike, or zero if the faces don't emit.
+    """
+    i = torch.arange(samples, dtype=torch.float64) + 0.5
+    z = 1 - 2 * i / samples
+    phi = math.pi * (3 - math.sqrt(5)) * i
+    s = (1 - z * z).sqrt()
+    lattice = torch.stack([s * torch.cos(phi), s * torch.sin(phi), z], dim=-1)
+    matrix = orientation.detach().to(device="cpu", dtype=torch.float64)
+    mean = torch.einsum("ni,ij,nj->n", lattice, matrix, lattice).clamp_min(0).sqrt().mean()
+    trace = float(torch.diagonal(matrix).sum())
+    return 0.0 if trace <= 0 or float(mean) <= 0 else 2 * math.pi * trace / (4 * math.pi * float(mean))
+
+
 def area_radius(light: AreaLight) -> float:
     """Distance between the center of an area light and its farthest point, in meters."""
     return math.hypot(*light.size) / 2
@@ -135,11 +208,11 @@ def _unit(vector: torch.Tensor) -> torch.Tensor:
     return vector / vector.norm()
 
 
-def _grid(light: AreaLight, samples: int, **kwargs) -> torch.Tensor:
-    """Centers of patches of equal area that cover an area light, in units of its sizes, of shape (k, 2)."""
-    if light.shape == "rectangle":
+def _grid(size: tuple[float, float], shape: str, samples: int, **kwargs) -> torch.Tensor:
+    """Centers of patches of equal area that cover a rectangle or an ellipse, in units of its sizes, of shape (k, 2)."""
+    if shape == "rectangle":
         # Patches are about square, with `samples` of them along the longest side
-        counts = [max(1, round(samples * s / max(light.size))) for s in light.size]
+        counts = [max(1, round(samples * s / max(size))) for s in size]
         u, v = ((torch.arange(c, **kwargs) + 0.5) / c - 0.5 for c in counts)
         return torch.stack(torch.meshgrid(u, v, indexing="ij"), dim=-1).reshape(-1, 2)
 
@@ -154,19 +227,163 @@ def _grid(light: AreaLight, samples: int, **kwargs) -> torch.Tensor:
     return torch.stack([r * torch.cos(angle), r * torch.sin(angle)], dim=-1) / 2
 
 
+def _symmetric(values: tuple[float, ...], **kwargs) -> torch.Tensor:
+    """Symmetric matrix given as ``(xx, yy, zz, xy, xz, yz)``, of shape (3, 3)."""
+    xx, yy, zz, xy, xz, yz = values
+    return torch.tensor([[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]], **kwargs)
+
+
+def _flat_normal(orientation: torch.Tensor) -> tuple[torch.Tensor, float] | None:
+    """Normal of a flat patch given its orientation, which is then of rank one, and its eigenvalue, or None."""
+    values, vectors = torch.linalg.eigh(orientation)
+    if values[2] > 0 and values[:2].abs().sum() <= 1e-6 * values[2]:
+        return vectors[:, 2], float(values[2])
+    return None
+
+
+def patch_radius(lamp: EmissiveSurface, index: int) -> float:
+    """Radius of a patch of an emissive surface, in meters, below which distances to it are clamped: the root mean
+    square distance between its points and its center, or half the square root of its area without its spread."""
+    if lamp.spread:
+        return math.sqrt(max(sum(lamp.spread[index][:3]), 0.0))
+    return math.sqrt(lamp.areas[index]) / 2
+
+
+def patch_rectangle(lamp: EmissiveSurface, index: int) -> tuple[torch.Tensor, torch.Tensor, tuple[float, float]] | None:
+    """Rectangle of the same spread as a flat patch of an emissive surface, i.e. its axes and its sizes along them, see
+    :attr:`EmissiveSurface.spread <visionsim.medium.model.EmissiveSurface.spread>`, or None for other patches, which
+    are seen as a point at any distance.
+
+    Args:
+        lamp (EmissiveSurface): Emissive surface.
+        index (int): Index of the patch.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, tuple[float, float]] | None: Unit axes along the longest side of the rectangle
+        and along its other side, each of shape (3,), and its sizes, in meters.
+    """
+    flat = _flat_normal(_symmetric(lamp.orientation[index], dtype=torch.float64))
+    if not lamp.spread or flat is None:
+        return None
+    normal = flat[0]
+    # Spread within the patch's plane, of which a uniform rectangle of sides a and b has eigenvalues a² / 12 and b² / 12
+    plane = torch.eye(3, dtype=torch.float64) - torch.outer(normal, normal)
+    values, vectors = torch.linalg.eigh(plane @ _symmetric(lamp.spread[index], dtype=torch.float64) @ plane)
+    sizes = (math.sqrt(12 * max(float(values[2]), 0.0)), math.sqrt(12 * max(float(values[1]), 0.0)))
+    return (vectors[:, 2], vectors[:, 1], sizes) if sizes[0] > 0 else None
+
+
+def merge_patches(lamp: EmissiveSurface) -> EmissiveSurface:
+    """The same emissive surface as a single patch, which emits as much light in total and as the moments of the
+    normals of all its faces show, e.g. to integrate light that doesn't depend much on the shape of the surface.
+
+    Args:
+        lamp (EmissiveSurface): Emissive surface.
+
+    Returns:
+        EmissiveSurface: Surface of a single patch, at the mean position of the patches weighted by their light, which
+        casts shadows from the same position.
+    """
+    areas = torch.tensor(lamp.areas, dtype=torch.float64)
+    radiance = torch.stack([_per_channel(r, 1, "radiance", dtype=torch.float64).mean() for r in lamp.radiance])
+    # Patches are weighted by their light, but their colors are averaged by area, which keeps the light of each channel
+    light = areas * radiance
+    weights = light / light.sum() if bool(light.sum() > 0) else areas / areas.sum()
+    positions = torch.tensor(lamp.positions, dtype=torch.float64)
+    position = weights @ positions
+
+    def mean(values: tuple[tuple[float, ...], ...]) -> tuple[float, ...]:
+        return tuple((weights @ torch.tensor(values, dtype=torch.float64)).tolist())
+
+    channels = max(len(r) for r in lamp.radiance)
+    colors = torch.stack([_per_channel(r, channels, "radiance", dtype=torch.float64) for r in lamp.radiance])
+    spread: tuple[tuple[float, ...], ...] = ()
+    if lamp.spread:
+        offsets = positions - position
+        outer = offsets[:, :, None] * offsets[:, None, :]
+        within = torch.stack([_symmetric(s, dtype=torch.float64) for s in lamp.spread])
+        covariance = torch.einsum("k,kij->ij", weights, within + outer)
+        spread = (tuple(float(covariance[i, j]) for i, j in ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))),)
+    return EmissiveSurface(
+        position=lamp.position,
+        positions=(tuple(position.tolist()),),
+        areas=(float(areas.sum()),),
+        radiance=(tuple(((areas @ colors) / areas.sum()).tolist()),),
+        orientation=(mean(lamp.orientation),),
+        facing=(mean(lamp.facing),) if lamp.facing else (),
+        spread=spread,
+    )
+
+
+def patch_emitters(lamp: EmissiveSurface, index: int, channels: int, samples: int = 1, **kwargs) -> list[Emitter]:
+    """Point emitters that together shine like a patch of an emissive surface.
+
+    The patch shines in proportion to the area of its faces seen from each direction, see :func:`projected_area`.
+    Flat patches are Lambertian emitters on each side, which, as area lights, can be split into a grid of patches over
+    the rectangle of the same spread (see :func:`patch_rectangle`), with ``samples`` of them along its longest side.
+
+    Args:
+        lamp (EmissiveSurface): Emissive surface.
+        index (int): Index of the patch.
+        channels (int): Number of channels, i.e. wavelengths, of the intensities.
+        samples (int, optional): Number of patches along the longest side of flat patches. Defaults to 1, i.e. a single
+            emitter at the patch's center.
+        **kwargs: Floating point type and device of the tensors.
+
+    Returns:
+        list[Emitter]: Emitters of the patch, if it emits any light.
+    """
+    area = lamp.areas[index]
+    center = torch.as_tensor(lamp.positions[index], **kwargs)
+    towards = torch.as_tensor(lamp.facing[index] if lamp.facing else (0.0, 0.0, 0.0), **kwargs)
+    orientation = _symmetric(lamp.orientation[index], **kwargs)
+    intensity = _per_channel(lamp.radiance[index], channels, "radiance", **kwargs) * area
+    flat = _flat_normal(orientation)
+    if flat is None:
+        scale = orientation_scale(orientation)
+        if scale <= 0 and not bool(towards.any()):
+            return []
+        pattern = partial(projected_area, orientation=orientation, facing=towards, scale=scale)
+        return [Emitter(center, intensity, patch_radius(lamp, index), pattern=pattern)]
+
+    # Flat patches shine as a Lambertian emitter on each side. When a single side shines, only its half-space is
+    # integrated, otherwise their light is kinked at their plane, which barely affects the quadrature
+    normal, value = flat
+    along = float(normal @ towards)
+    front, back = value + along, value - along
+    if min(front, back) <= 1e-9 * max(front, back):
+        axis, cone = normal if front > back else -normal, 0.0
+        intensity = intensity * max(front, back)
+        profile = partial(area_falloff, tan_half_spread=math.inf, normalization=0.0)
+    else:
+        axis, cone, profile = normal, -1.0, partial(two_sided_falloff, front=front, back=back)
+    rectangle = patch_rectangle(lamp, index) if samples > 1 else None
+    if rectangle is None:
+        return [Emitter(center, intensity, patch_radius(lamp, index), axis, cone, profile)]
+    axis_u, axis_v, size = rectangle
+    grid = _grid(size, "rectangle", samples, **kwargs)
+    offsets = grid[:, :1] * size[0] * axis_u.to(center) + grid[:, 1:] * size[1] * axis_v.to(center)
+    radius = math.sqrt(area / len(grid)) / 2
+    return [Emitter(center + offset, intensity / len(grid), radius, axis, cone, profile) for offset in offsets]
+
+
 def emitters(lamp: Lamp, channels: int, samples: int = 1, **kwargs) -> list[Emitter]:
     """Point emitters that together shine like a lamp.
 
     Args:
-        lamp (Lamp): Point, spot or area light.
+        lamp (Lamp): Point, spot or area light, or emissive surface, see :func:`patch_emitters` for its patches.
         channels (int): Number of channels, i.e. wavelengths, of the intensities.
-        samples (int, optional): Number of patches along the longest side of area lights, which are split into about
-            ``samples²`` patches. Defaults to 1, i.e. area lights are a single emitter at their center.
+        samples (int, optional): Number of patches along the longest side of area lights, and of flat patches of
+            emissive surfaces, which are split into about ``samples²`` patches. Defaults to 1, i.e. area lights are a
+            single emitter at their center.
         **kwargs: Floating point type and device of the tensors.
 
     Returns:
         list[Emitter]: Emitters of the lamp.
     """
+    if isinstance(lamp, EmissiveSurface):
+        return [e for index in range(len(lamp.areas)) for e in patch_emitters(lamp, index, channels, samples, **kwargs)]
+
     power = _per_channel(lamp.power, channels, "light power", **kwargs)
     position = torch.as_tensor(lamp.position, **kwargs)
     exponent = {"quadratic": 0, "linear": 1, "constant": 2}[lamp.falloff]
@@ -193,7 +410,7 @@ def emitters(lamp: Lamp, channels: int, samples: int = 1, **kwargs) -> list[Emit
     else:
         profile = partial(area_falloff, tan_half_spread=math.inf, normalization=0.0)
 
-    grid = _grid(lamp, samples, **kwargs)
+    grid = _grid(lamp.size, lamp.shape, samples, **kwargs)
     offsets = grid[:, :1] * lamp.size[0] * axis_u + grid[:, 1:] * lamp.size[1] * axis_v
     # Each patch has a radiance of power / (π area) and an equal share of the area
     intensity = power / (math.pi * len(grid))
@@ -241,9 +458,15 @@ def area_weights(
         list[torch.Tensor]: Weight of each grid, followed by the weight of the single emitter, which add up to one,
         each of the same shape as ``closest``.
     """
-    weights, remaining = [], torch.ones_like(closest)
+    return level_weights(closest / area_radius(light), levels)
+
+
+def level_weights(relative: torch.Tensor, levels: tuple[AreaLevel, ...] = AREA_LEVELS) -> list[torch.Tensor]:
+    """Weights of the grids of emitters of a light, for rays that pass at given distances from its center, relative to
+    the distance between its center and its farthest point, see :func:`area_weights`."""
+    weights, remaining = [], torch.ones_like(relative)
     for level in levels:
-        x = ((closest / area_radius(light) - level.near) / (level.far - level.near)).clamp(0, 1)
+        x = ((relative - level.near) / (level.far - level.near)).clamp(0, 1)
         coarser = x * x * (3 - 2 * x)
         weights.append(remaining * (1 - coarser))
         remaining = remaining * coarser

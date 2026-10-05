@@ -75,7 +75,7 @@ properties:
 
 The medium is lit by the same lights as the scene, which are exported from Blender to ``lighting.json`` (see
 :meth:`lighting_info <visionsim.simulate.blender.BlenderService.exposed_lighting_info>`): sun, point, spot and area
-lights, and the average radiance of the world background above the horizon, i.e. the sky. The export accounts for each
+lights, meshes that emit light, and the average radiance of the world background above the horizon, i.e. the sky. The export accounts for each
 light's power, color, exposure, temperature, volume factor and object scale, and for the node trees that commonly set
 their emission: an Emission node whose color can come from a Blackbody node, and whose strength can come from a Light
 Falloff node (including its linear and constant outputs, and its smoothing near the light) or an IES Texture node, whose
@@ -139,12 +139,32 @@ light see a grid of 16 patches along its longest side, those that pass within 3 
 within 8 radii a grid of 2, and those further away a single emitter, with smooth transitions in between. This is within
 about 1% of a fine grid over a frame.
 
+Meshes that emit light, through an Emission shader or the emission of a Principled BSDF, possibly mixed or added with
+other shaders, light the medium too: their radiance is the emission's strength times its color, which can come from a
+Blackbody node or from an image, whose mean color is used, while emission that only the camera sees (mixed in by a
+Light Path node, as for "shadeless" materials) is left out, as it lights nothing. Emissive surfaces further than half a
+meter apart are grouped into different lamps, up to 8 of them, beyond which lamps are gathered by position, and lamps
+are split into 32 patches in total, those of the most light times size first (both can be set with
+``--config.lighting``), see :meth:`lighting_info <visionsim.simulate.blender.BlenderService.exposed_lighting_info>`. As in
+Cycles, both sides of a surface emit, but surfaces block each other's light, such as the light emitted inside a closed
+surface: rays are traced from each side of a sample of their faces to find how much of their light leaves them. Each
+patch then shines as a point emitter in proportion to the area of its faces seen from each direction, counting those
+whose light leaves towards it, which is approximated from the first two moments of their normals: exactly for flat
+patches, spheres, cylinders and hemispheres, see :func:`projected_area <visionsim.medium.lights.projected_area>`.
+Patches whose faces it approximates poorly, such as those of a box, are split by the orientation of their faces.
+Distances to a patch are clamped at the root mean square distance between its points and its center, e.g. the radius
+of a ball, and rays that pass close to flat patches see them as grids over the rectangle of the same spread of points,
+as they do area lights, see :func:`patch_emitters <visionsim.medium.lights.patch_emitters>`.
+
 Objects also cast the shadows of lamps onto the medium, through an equirectangular map of the distance to the first
 surface around each lamp, rendered by Cycles from the lamp's position. Their visibility is sampled along each ray at
 angles evenly spread as seen from the lamp, which matches the map's angular resolution whatever the distance, and the
 weight of each node of the quadrature is scaled by the visibility averaged between its neighbors, rather than at the
 node, so that the edges of shadows don't spoil the quadrature, see :func:`lamp_shadow
-<visionsim.medium.occlusion.lamp_shadow>`. Area lights cast the shadows of their center.
+<visionsim.medium.occlusion.lamp_shadow>`. Area lights cast the shadows of their center, and so do emissive lamps
+that surround their center, such as a ball, otherwise they cast those of the center of their face nearest to it, as
+it could lie within another object, such as the middle of a ring of light. Their maps see through emissive surfaces,
+as these don't hide their own light.
 
 In dense media, light from lamps scattered more than once spreads a halo around them, much wider than the glow of light
 scattered once. With ``multiple_scattering``, it is computed on a grid of points around each lamp, spread
@@ -153,7 +173,9 @@ towards the lamp, where most of it comes from, and scattered again with the phas
 going away from the lamp, it is tabulated against the angle between the direction it is scattered towards and the
 direction away from the lamp. Higher orders are iterated by integrating each order along the gathering rays, and later
 ones are extrapolated geometrically at each point, see :mod:`visionsim.medium.halos`. The tables don't depend on the
-camera, so they are computed once per lamp and medium, and integrated along camera rays as light scattered once is.
+camera, so they are computed once per lamp and medium, and integrated along camera rays as light scattered once is. As
+halos spread far beyond lamps, each lamp is a single emitter there: area lights aren't split into grids, and the
+patches of emissive surfaces are merged into one.
 
 Surfaces are lit through the medium too: their light is attenuated on its way to them, while the medium's glow lights
 them. Given the normals of surfaces (``normals`` of :func:`apply_medium <visionsim.medium.render.apply_medium>`, which
@@ -201,7 +223,12 @@ Cycles' single scattering overall: 0.6% for a point light, 0.1% for a spot light
 a point light whose light is smoothed by a Light Falloff node, with per-pixel differences of 1% to 2% once Cycles' noise
 is blurred out, the largest right next to the lamps. With a point light right behind a cube, which hides it from the
 camera, objects casting its shadows bring the light scattered by the fog within 0.3% of Cycles', with per-pixel
-differences of 0.9% once blurred, against eleven times too much light without shadows. With multiple scattering, all the
+differences of 0.9% once blurred, against eleven times too much light without shadows. The light of meshes that emit
+light is within 1% of Cycles' too: 0.2% for a panel of 2 by 1 m whose two sides emit, where the area light is, 0.9% for a
+ball of 15 cm radius and 0.2% for a tilted box of 40 cm, with per-pixel differences of 1.3%, 2.7% and 1.6% once blurred,
+leaving out the few pixels whose rays go through the closed meshes, which the camera of these renders doesn't see. With
+the ball right behind the cube, objects casting its shadows bring its light within 0.5% of Cycles', with per-pixel
+differences of 1.4% once blurred, against eleven times too much light without shadows. With multiple scattering, all the
 light of a point lamp scattered by the fog, in the scene without objects and with a black ground, is within 1.4% of
 Cycles' with 32 volume bounces, and within 5% at any distance from the lamp, with per-pixel differences of 2.5% once
 blurred, against 15% too dark with single scattering only. Note that Cycles clamps indirect light by default (Clamp
@@ -212,7 +239,8 @@ Surfaces lit through the fog (``validate_surfaces.py``) are within 1% of Cycles'
 scattering, against 13% too bright in the render without fog for single scattering, with per-pixel differences of 3.5%
 and 4.6%, against 14% and 5%. Walls, which only see the glow of the fog around them, are within about 3%, against 26% too
 bright. Surfaces lit by a point, spot or area light are within 1.3%, against 4% to 6% too bright, with per-pixel
-differences of 4% to 6%, against 7% to 9%. Note that Cycles' renders with no volume bounces include light scattered once
+differences of 4% to 6%, against 7% to 9%, and surfaces lit by the emissive panel or ball within 0.6%, against 5% and 4%
+too bright, with per-pixel differences of 3.2% and 5.8%, against 5.8% and 7.4%. Note that Cycles' renders with no volume bounces include light scattered once
 on its way to surfaces too, as the light is sampled from where it scatters, and that references lit by lamps are rendered
 without clamping indirect light, see below.
 
@@ -228,17 +256,19 @@ Limitations
 The following are not yet modeled:
 
 - Shadows of moving objects, as shadow maps are rendered once per scene, and the soft shadows of large lamps, which
-  cast the hard shadows of their center.
-- Emissive surfaces lighting the medium, IES profiles and other node trees of lamps, square spot lights, and the
-  elliptical cones of spot lights scaled unevenly. Light that surfaces lit by lamps reflect into the medium, which, in
-  ``examples/medium``, adds as much again to the light of a lamp scattered twice near the lit ground.
+  cast the hard shadows of a single point.
+- IES profiles and other node trees of lamps, square spot lights, and the elliptical cones of spot lights scaled
+  unevenly. Emission whose strength is set by other nodes, or whose color varies over a surface, as it does with an
+  image, which is averaged. Close to curved emissive surfaces, within about the size of their patches, their light is
+  that of point emitters. Light that surfaces lit by lamps reflect into the medium, which, in ``examples/medium``, adds as much again
+  to the light of a lamp scattered twice near the lit ground.
 - Multiple scattering in media other than a single height fog, and skies whose radiance varies with direction.
 - Multiple scattering near objects, which is overestimated, by about 30% to 60% within 5 m of the objects of
   ``examples/medium``: the medium around objects is itself in their shadow, and so darker than the open medium that
   the approximation assumes.
 - The shadows of objects on the glow that lights surfaces, which assumes that surfaces stand in the open, unless shadow
-  maps show that they don't see the sky, and the glow of lamps on surfaces beyond what the reduced extinction of
-  the reduced extinction accounts for. Surfaces are assumed to be diffuse, and light that bounces off other surfaces to be
+  maps show that they don't see the sky, and the glow of lamps on surfaces beyond what the reduced extinction
+  accounts for. Surfaces are assumed to be diffuse, and light that bounces off other surfaces to be
   dimmed as the frame's direct light is on average.
 - Anti-aliasing: depth maps are not anti-aliased, so edges between near and far objects can show halos in dense
   media. Rendering at a higher resolution and downsampling the results reduces these.

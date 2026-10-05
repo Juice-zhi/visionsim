@@ -108,6 +108,56 @@ def main(blend_file: str, output: str) -> None:
         expected = (np.array((1.0, 0.5, 0.25)) + 100 * zenith_weight) * 2.0
         assert np.allclose(service.exposed_lighting_info()["sky"], expected)
 
+        # Emissive meshes: a panel whose emission's color comes from a Blackbody node, both sides of which emit, and a
+        # bulb whose Principled BSDF emits, mixed evenly with a diffuse BSDF, whose light only leaves outwards, both
+        # bright enough not to be left out next to the scene's point light
+        bpy.ops.mesh.primitive_plane_add(size=2.0, location=(10.0, 0.0, 3.0))
+        panel = bpy.context.active_object
+        material = bpy.data.materials.new("Panel")
+        material.use_nodes = True
+        tree = material.node_tree
+        emission = tree.nodes.new("ShaderNodeEmission")
+        blackbody = tree.nodes.new("ShaderNodeBlackbody")
+        blackbody.inputs["Temperature"].default_value = 4000.0
+        emission.inputs["Strength"].default_value = 5.0
+        tree.links.new(blackbody.outputs["Color"], emission.inputs["Color"])
+        surface = next(n for n in tree.nodes if n.bl_idname == "ShaderNodeOutputMaterial").inputs["Surface"]
+        tree.links.new(emission.outputs[0], surface)
+        panel.data.materials.append(material)
+
+        bpy.ops.mesh.primitive_uv_sphere_add(radius=0.1, location=(-10.0, 0.0, 2.0))
+        bulb = bpy.context.active_object
+        material = bpy.data.materials.new("Bulb")
+        material.use_nodes = True
+        tree = material.node_tree
+        principled = next(n for n in tree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled")
+        principled.inputs["Emission Color"].default_value = (1.0, 0.8, 0.6, 1.0)
+        principled.inputs["Emission Strength"].default_value = 2000.0
+        mix, diffuse = tree.nodes.new("ShaderNodeMixShader"), tree.nodes.new("ShaderNodeBsdfDiffuse")
+        tree.links.new(diffuse.outputs[0], mix.inputs[1])
+        tree.links.new(principled.outputs[0], mix.inputs[2])
+        surface = next(n for n in tree.nodes if n.bl_idname == "ShaderNodeOutputMaterial").inputs["Surface"]
+        tree.links.new(mix.outputs[0], surface)
+        bulb.data.materials.append(material)
+        bpy.context.view_layer.update()
+
+        lamps = sorted(service.exposed_lighting_info(emissive_patches=8)["emissive"], key=lambda e: -e["position"][0])
+        assert len(lamps) == 2
+
+        def emitted(lamp):
+            # Light of the patches, as their orientation and facing integrate to 2π trace(M) and zero
+            radiance, areas = np.asarray(lamp["radiance"]), np.asarray(lamp["areas"])
+            return ((radiance * areas[:, None]).T * 2 * np.pi * np.asarray(lamp["orientation"])[:, :3].sum(-1)).sum(-1)
+
+        panel_lamp, bulb_lamp = lamps
+        assert len(panel_lamp["areas"]) > 1 and abs(panel_lamp["position"][2] - 3.0) < 1e-6
+        assert np.allclose(emitted(panel_lamp), 2 * np.pi * np.array(_blackbody(4000.0)) * 5.0 * 4.0, rtol=1e-4)
+        area = sum(polygon.area for polygon in bulb.data.polygons)
+        assert len(bulb_lamp["areas"]) == 1 and np.isclose(sum(bulb_lamp["areas"]), area)
+        assert np.allclose(emitted(bulb_lamp), np.pi * np.array((1.0, 0.8, 0.6)) * 1000.0 * area, rtol=0.02)
+        # The bulb casts shadows from its center, which it surrounds
+        assert np.linalg.norm(np.subtract(bulb_lamp["position"], (-10.0, 0.0, 2.0))) < 0.01
+
         service.exposed_save_lighting(output)
 
 

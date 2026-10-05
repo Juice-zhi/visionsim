@@ -164,6 +164,16 @@ class EmissionConfig:
 
 
 @dataclass
+class LightingConfig:
+    """For more information see :meth:`lighting_info <visionsim.simulate.blender.BlenderService.exposed_lighting_info>`."""
+
+    emissive_lamps: int = 8
+    """Maximum number of lamps into which emissive surfaces are grouped, which each cast shadows from a single position"""
+    emissive_patches: int = 32
+    """Number of patches into which emissive surfaces are split, in total"""
+
+
+@dataclass
 class OcclusionConfig:
     """For more information see :meth:`save_occlusion <visionsim.simulate.blender.BlenderService.exposed_save_occlusion>`."""
 
@@ -233,6 +243,8 @@ class RenderConfig:
     """Emitted light configuration options"""
     include_lighting: bool = False
     """If true, save the scene's lighting to ``lighting.json``, as needed to add participating media with ``medium.apply``"""
+    lighting: LightingConfig = field(default_factory=LightingConfig)
+    """Lighting configuration options, which shadow maps also follow"""
     include_occlusion: bool = False
     """If true, save shadow maps of the scene to ``occlusion.npz``, through which its objects cast shadows onto
     participating media added with ``medium.apply``. Objects should be static"""

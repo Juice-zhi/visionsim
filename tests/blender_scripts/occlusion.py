@@ -33,6 +33,19 @@ def main(blend_file: str, output: str) -> None:
         scene.collection.objects.link(sun)
         bpy.ops.mesh.primitive_plane_add(size=1000, location=(0, 0, -5))
         bpy.context.active_object.name = "Ground"
+        # A glowing ball above the cube, which casts shadows from its surface, through itself
+        bpy.ops.mesh.primitive_uv_sphere_add(radius=0.25, location=(0, 0, 4))
+        ball = bpy.context.active_object
+        ball.name = "Ball"
+        material = bpy.data.materials.new("Glow")
+        material.use_nodes = True
+        tree = material.node_tree
+        emission = tree.nodes.new("ShaderNodeEmission")
+        # As bright as the scene's point light, rather than left out next to it
+        emission.inputs["Strength"].default_value = 1000.0
+        surface = next(n for n in tree.nodes if n.bl_idname == "ShaderNodeOutputMaterial").inputs["Surface"]
+        tree.links.new(emission.outputs[0], surface)
+        ball.data.materials.append(material)
 
         before = {
             "camera": scene.camera,
@@ -44,9 +57,10 @@ def main(blend_file: str, output: str) -> None:
             "objects": len(bpy.data.objects),
             "outputs": [(n.name, n.mute) for n in service.tree.nodes if n.bl_idname == "CompositorNodeOutputFile"],
             "links": sorted((link.from_node.name, link.to_node.name) for link in service.tree.links),
+            "material": sorted((link.from_node.name, link.to_node.name) for link in tree.links) + [len(tree.nodes)],
         }
-        # Only the cube casts shadows, the scene's huge axes and grids would otherwise make the maps span them
-        exclude = [obj.name for obj in scene.objects if obj.name != "Cube"]
+        # Only the cube and the ball cast shadows, the scene's huge axes and grids would otherwise make the maps span them
+        exclude = [obj.name for obj in scene.objects if obj.name not in ("Cube", "Ball")]
         service.exposed_save_occlusion(
             output,
             exclude=exclude,
@@ -66,6 +80,7 @@ def main(blend_file: str, output: str) -> None:
             "objects": len(bpy.data.objects),
             "outputs": [(n.name, n.mute) for n in service.tree.nodes if n.bl_idname == "CompositorNodeOutputFile"],
             "links": sorted((link.from_node.name, link.to_node.name) for link in service.tree.links),
+            "material": sorted((link.from_node.name, link.to_node.name) for link in tree.links) + [len(tree.nodes)],
         }
         assert before == after, (before, after)
         assert not any(bpy.data.objects[name].hide_render for name in exclude)

@@ -6,7 +6,7 @@ import torch
 
 from visionsim.medium import Lighting, Medium, apply_medium
 from visionsim.medium.halos import HaloGrid, _around, halo_inscatter, halo_threshold, lamp_halo
-from visionsim.medium.model import HeightFog, Homogeneous, PointLight
+from visionsim.medium.model import EmissiveSurface, HeightFog, Homogeneous, PointLight
 from visionsim.medium.optics import density, henyey_greenstein, optical_depth, point_light_inscatter
 
 SMALL = HaloGrid(radii=14, extent=(0.05, 30.0), directions=(8, 10), angles=(20, 8), gathered=(16, 16), orders=2)
@@ -59,6 +59,29 @@ def test_halo_matches_gathering_along_rays():
                 s[1] - s[0]
             )
         assert value.item() == pytest.approx(total, rel=0.06)
+
+
+def test_halo_of_a_ball_is_that_of_a_point_light():
+    # A glowing ball, split into patches whose light only leaves outwards, spreads the halo of a point light of the
+    # same power, from which its patches are merged
+    medium = Medium(extinction=0.08, anisotropy=0.6, components=[Homogeneous()])
+    beta = T([medium.extinction])
+    radiance, radius = 2000.0, 0.05
+    normals = np.eye(3)[[0, 0, 1, 1, 2, 2]] * [[1], [-1], [1], [-1], [1], [-1]]
+    ball = EmissiveSurface(
+        position=LAMP.position,
+        positions=tuple(tuple(np.add(LAMP.position, radius * n)) for n in normals),
+        areas=(4 * math.pi * radius**2 / 6,) * 6,
+        radiance=((radiance,),) * 6,
+        # Each patch, a sixth of a sphere, is approximated by a sphere whose light leaves outwards, and the patches
+        # spread over the sphere as its points do, so that the merged patch has its radius
+        orientation=((1 / 6, 1 / 6, 1 / 6, 0, 0, 0),) * 6,
+        spread=((0.0,) * 6,) * 6,
+    )
+    point = LAMP.model_copy(update={"power": (math.pi * radiance * 4 * math.pi * radius**2,), "radius": radius})
+    ours = lamp_halo(medium, ball, beta, ground=-100.0, grid=SMALL)
+    theirs = lamp_halo(medium, point, beta, ground=-100.0, grid=SMALL)
+    assert torch.allclose(ours.values.exp(), theirs.values.exp(), rtol=1e-6)
 
 
 def test_halo_vanishes_without_scattering():

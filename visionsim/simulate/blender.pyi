@@ -45,6 +45,118 @@ _BLACKBODY_B: Incomplete
 def _blackbody(temperature: float) -> list[float]:
     """Linear Rec.709 color of a black body at a temperature in Kelvin, as computed by Cycles' Blackbody node."""
 
+EMISSIVE_LAMPS: int
+EMISSIVE_PATCHES: int
+EMISSIVE_GAP: float
+_EMISSIVE_SAMPLES: int
+_ESCAPE_RAYS: int
+_ORIENTATION_TOLERANCE: float
+_PATCH_SIZE: float
+_NEGLIGIBLE: float
+
+def _triangles(
+    corners: npt.NDArray[np.floating],
+) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+    """Centers, unit normals and areas of triangles, given their corners of shape (t, 3, 3)."""
+
+def _subdivide(
+    corners: npt.NDArray[np.floating], max_area: float
+) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.integer]]:
+    """Split triangles in four, between the middles of their sides, until none is larger than ``max_area``, which keeps
+    their orientation, and return them along with the index of the triangle each comes from."""
+
+def _separate(
+    lower: npt.NDArray[np.floating], upper: npt.NDArray[np.floating], gap: float
+) -> list[npt.NDArray[np.integer]]:
+    """Split items into groups that are further than ``gap`` apart along some axis, given the corners of their boxes,
+    each of shape (n, 3)."""
+
+def _gather(
+    centers: npt.NDArray[np.floating], weights: npt.NDArray[np.floating], count: int
+) -> list[npt.NDArray[np.integer]]:
+    """Gather items into at most ``count`` groups, by splitting the box around their centers in two halves along its
+    longest side, the group of the largest weight times size first."""
+
+def _orientation(
+    normals: npt.NDArray[np.floating],
+    weights: npt.NDArray[np.floating],
+    front: npt.NDArray[np.floating],
+    back: npt.NDArray[np.floating],
+) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+    """Orientation and facing of faces, see :class:`EmissiveSurface <visionsim.medium.model.EmissiveSurface>`, given
+    their unit normals, weights, and the fraction of the light of their front and back that leaves the surfaces."""
+
+def _fibonacci(count: int) -> npt.NDArray[np.floating]:
+    """Unit directions spread evenly over the sphere, of shape (count, 3)."""
+
+_ERROR_DIRECTIONS: Incomplete
+
+def _orientation_error(
+    normals: npt.NDArray[np.floating],
+    weights: npt.NDArray[np.floating],
+    front: npt.NDArray[np.floating],
+    back: npt.NDArray[np.floating],
+) -> float:
+    """Relative error of the area of faces seen from each direction, as approximated from their orientation, see
+    :func:`visionsim.medium.lights.projected_area`."""
+
+def _split_by_orientation(
+    normals: npt.NDArray[np.floating], weights: npt.NDArray[np.floating]
+) -> npt.NDArray[np.bool_] | None:
+    """Split faces in two groups of alike orientations, by clustering ``n nᵀ`` in two, which ignores their sides, or
+    None if they are all alike."""
+
+def _escape(
+    centers: npt.NDArray[np.floating],
+    normals: npt.NDArray[np.floating],
+    trace: Callable[[npt.NDArray[np.floating], npt.NDArray[np.floating]], npt.NDArray[np.bool_]],
+    rng: np.random.Generator,
+    rays: int = ...,
+) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+    """Fraction of the light that leaves the front and the back of triangles without hitting any other, by tracing rays
+    spread as the light they emit, i.e. as the cosine of the angle to their normal, in directions stratified in
+    angle."""
+
+def _emissive_lamps(
+    corners: npt.NDArray[np.floating],
+    radiance: npt.NDArray[np.floating],
+    trace: Callable[[npt.NDArray[np.floating], npt.NDArray[np.floating]], npt.NDArray[np.bool_]],
+    lamps: int = ...,
+    patches: int = ...,
+    gap: float = ...,
+    samples: int = ...,
+    seed: int = 0,
+    other_power: float = 0.0,
+) -> list[dict[str, Any]]:
+    """Group emissive triangles into lamps, which each cast shadows from a single position, split into patches.
+
+    Triangles further than ``gap`` apart belong to different lamps, as long as there are at most ``lamps`` of them,
+    otherwise lamps are gathered by position, after leaving out the faintest surfaces, as long as they make up at most
+    1% of the light of all lamps, including other lamps of power ``other_power``, assuming that both sides of the
+    surfaces emit. Lamps are then split into ``patches`` patches in total, by repeatedly
+    splitting the patch of the largest power times size in two: by the orientation of its faces if the area it shows in
+    each direction isn't well approximated from their moments, and otherwise in two halves of equal power along its
+    longest side, after splitting triangles larger than a fraction of the patches. The light that leaves each side of
+    a sample of the triangles is found by tracing rays from them, as triangles block each other's light.
+
+    Args:
+        corners (npt.NDArray[np.floating]): World-space corners of the triangles, of shape (t, 3, 3).
+        radiance (npt.NDArray[np.floating]): Radiance of the triangles, of shape (t, c).
+        trace (Callable): Function that tells whether rays hit any of the triangles, given their origins and unit
+            directions, each of shape (r, 3).
+        lamps (int, optional): Maximum number of lamps. Defaults to :data:`EMISSIVE_LAMPS`.
+        patches (int, optional): Number of patches, over all lamps, which each have at least one. Defaults to
+            :data:`EMISSIVE_PATCHES`.
+        gap (float, optional): Distance beyond which triangles are apart. Defaults to :data:`EMISSIVE_GAP`.
+        samples (int, optional): Number of triangles from which rays are traced. Defaults to 50,000.
+        seed (int, optional): Seed of the random sampling of triangles and rays. Defaults to 0.
+        other_power (float, optional): Power of the other lamps of the scene, in W. Defaults to 0.0.
+
+    Returns:
+        list[dict[str, Any]]: Lamps, following the schema of :class:`EmissiveSurface
+        <visionsim.medium.model.EmissiveSurface>`.
+    """
+
 def require_connected_client(func: Callable[..., Any]) -> Callable[..., Any]:
     """Decorator which ensures a client is connected.
 
@@ -871,8 +983,29 @@ class BlenderService(rpyc.Service):
             <visionsim.medium.model.PointLight>`.
         """
 
+    def _shader_emission(self, node: bpy.types.Node, owner: str) -> npt.NDArray[np.floating]:
+        """Constant radiance that a shader node emits, as Cycles evaluates it, which is zero if it doesn't emit."""
+
+    def _color_of(self, socket: bpy.types.NodeSocket, owner: str) -> npt.NDArray[np.floating]:
+        """Constant linear color of a socket, the mean of an image or of a black body that sets it, or its default."""
+
+    def _material_emission(self, material: bpy.types.Material | None) -> npt.NDArray[np.floating] | None:
+        """Constant radiance that a material emits, or None if it doesn't emit light."""
+
     @require_initialized_service
-    def exposed_lighting_info(self) -> dict[str, Any]:
+    def _emissive_triangles(self) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], list[str]]:
+        """World-space corners of the triangles of meshes that emit light, of shape (t, 3, 3), their radiance, of shape
+        (t, 3), and the names of their materials."""
+
+    @require_initialized_service
+    def _emissive_surfaces(
+        self, lamps: int, patches: int, other_power: float = 0.0
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Emissive surfaces of the scene, grouped into lamps, and the names of the materials that emit light, see
+        :meth:`lighting_info <exposed_lighting_info>` and :func:`_emissive_lamps`."""
+
+    @require_initialized_service
+    def exposed_lighting_info(self, emissive_lamps: int = ..., emissive_patches: int = ...) -> dict[str, Any]:
         """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
 
         This includes sun, point, spot and area lights, whose intensities account for their exposure, temperature,
@@ -881,18 +1014,47 @@ class BlenderService(rpyc.Service):
         shaders, square spots, and the elliptical cones of spots scaled unevenly are not supported, and approximated
         with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
 
+        Meshes that emit light, through an Emission shader or the emission of a Principled BSDF, possibly mixed or added
+        with other shaders, are included as emissive surfaces. Their radiance is the emission's strength times its
+        color, which can come from a Blackbody node, or from an image, whose mean color is used. Surfaces further than
+        :data:`EMISSIVE_GAP` apart are grouped into different lamps, which each cast shadows from a single position, as
+        long as there are at most ``emissive_lamps`` of them, and lamps are split into patches, whose light is
+        proportional to the area of their faces seen from each direction, see :func:`_emissive_lamps`.
+
+        Args:
+            emissive_lamps (int, optional): Maximum number of lamps into which emissive surfaces are grouped.
+                Defaults to :data:`EMISSIVE_LAMPS`.
+            emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
+                Defaults to :data:`EMISSIVE_PATCHES`.
+
         Returns:
             dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
         """
 
     @require_initialized_service
-    def exposed_save_lighting(self, path: str | os.PathLike | None = None) -> None:
+    def _lighting(self, emissive_lamps: int, emissive_patches: int) -> tuple[dict[str, Any], list[str]]:
+        """Lighting of the scene, see :meth:`lighting_info <exposed_lighting_info>`, and the names of the materials that
+        emit light."""
+
+    @require_initialized_service
+    def exposed_save_lighting(
+        self, path: str | os.PathLike | None = None, emissive_lamps: int = ..., emissive_patches: int = ...
+    ) -> None:
         """Save the lighting of the scene, as returned by :meth:`lighting_info <exposed_lighting_info>`, to a JSON file.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
                 root directory of the renders.
+            emissive_lamps (int, optional): Maximum number of lamps into which emissive surfaces are grouped, which
+                should match that of :meth:`save_occlusion <exposed_save_occlusion>`. Defaults to
+                :data:`EMISSIVE_LAMPS`.
+            emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
+                Defaults to :data:`EMISSIVE_PATCHES`.
         """
+
+    @contextmanager
+    def _transparent(self, names: Collection[str]) -> Iterator[None]:
+        """Make materials transparent while in this context, such that maps see through them."""
 
     @staticmethod
     def _volume_only(obj: bpy.types.Object) -> bool:
@@ -912,16 +1074,19 @@ class BlenderService(rpyc.Service):
         sun_resolution: int = 2048,
         sky_resolution: int = 512,
         lamp_resolution: int = 1024,
+        emissive_lamps: int = ...,
+        emissive_patches: int = ...,
     ) -> None:
         """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
 
         Orthographic depth maps of the objects that cast shadows are rendered with Cycles along the direction of each
         sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
         split into equal ranges of azimuth. Maps span the box that contains these objects. The distance to the first
-        object in every direction around each lamp (point, spot and area lights) is also rendered, in equirectangular
-        maps. All maps are saved to a ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They
-        are captured at the current frame, so objects should be static. Render settings, the camera and the compositor
-        are restored afterwards.
+        object in every direction around each lamp (point, spot and area lights, and groups of emissive surfaces, see
+        :meth:`lighting_info <exposed_lighting_info>`) is also rendered, in equirectangular maps, through which emissive
+        surfaces are seen as if they were transparent, as they don't hide their own light. All maps are saved to a
+        ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current
+        frame, so objects should be static. Render settings, the camera and the compositor are restored afterwards.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
@@ -938,6 +1103,10 @@ class BlenderService(rpyc.Service):
                 Defaults to 512.
             lamp_resolution (int, optional): Number of texels along the width of the maps of lamps, which span all
                 azimuths, and half as many along their height, which spans all elevations. Defaults to 1024.
+            emissive_lamps (int, optional): Maximum number of lamps into which emissive surfaces are grouped, which
+                should match that of :meth:`save_lighting <exposed_save_lighting>`. Defaults to :data:`EMISSIVE_LAMPS`.
+            emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
+                Defaults to :data:`EMISSIVE_PATCHES`.
 
         Raises:
             ValueError: raised if the number of bands of the sky and of their edges do not match.
@@ -1718,7 +1887,7 @@ class BlenderClient:
         """
 
     @type_check_only
-    def lighting_info(self) -> dict[str, Any]:
+    def lighting_info(self, emissive_lamps: int = ..., emissive_patches: int = ...) -> dict[str, Any]:
         """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
 
         This includes sun, point, spot and area lights, whose intensities account for their exposure, temperature,
@@ -1727,17 +1896,37 @@ class BlenderClient:
         shaders, square spots, and the elliptical cones of spots scaled unevenly are not supported, and approximated
         with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
 
+        Meshes that emit light, through an Emission shader or the emission of a Principled BSDF, possibly mixed or added
+        with other shaders, are included as emissive surfaces. Their radiance is the emission's strength times its
+        color, which can come from a Blackbody node, or from an image, whose mean color is used. Surfaces further than
+        :data:`EMISSIVE_GAP` apart are grouped into different lamps, which each cast shadows from a single position, as
+        long as there are at most ``emissive_lamps`` of them, and lamps are split into patches, whose light is
+        proportional to the area of their faces seen from each direction, see :func:`_emissive_lamps`.
+
+        Args:
+            emissive_lamps (int, optional): Maximum number of lamps into which emissive surfaces are grouped.
+                Defaults to :data:`EMISSIVE_LAMPS`.
+            emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
+                Defaults to :data:`EMISSIVE_PATCHES`.
+
         Returns:
             dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
         """
 
     @type_check_only
-    def save_lighting(self, path: str | os.PathLike | None = None) -> None:
+    def save_lighting(
+        self, path: str | os.PathLike | None = None, emissive_lamps: int = ..., emissive_patches: int = ...
+    ) -> None:
         """Save the lighting of the scene, as returned by :meth:`lighting_info <exposed_lighting_info>`, to a JSON file.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
                 root directory of the renders.
+            emissive_lamps (int, optional): Maximum number of lamps into which emissive surfaces are grouped, which
+                should match that of :meth:`save_occlusion <exposed_save_occlusion>`. Defaults to
+                :data:`EMISSIVE_LAMPS`.
+            emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
+                Defaults to :data:`EMISSIVE_PATCHES`.
         """
 
     @type_check_only
@@ -1750,16 +1939,19 @@ class BlenderClient:
         sun_resolution: int = 2048,
         sky_resolution: int = 512,
         lamp_resolution: int = 1024,
+        emissive_lamps: int = ...,
+        emissive_patches: int = ...,
     ) -> None:
         """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
 
         Orthographic depth maps of the objects that cast shadows are rendered with Cycles along the direction of each
         sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
         split into equal ranges of azimuth. Maps span the box that contains these objects. The distance to the first
-        object in every direction around each lamp (point, spot and area lights) is also rendered, in equirectangular
-        maps. All maps are saved to a ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They
-        are captured at the current frame, so objects should be static. Render settings, the camera and the compositor
-        are restored afterwards.
+        object in every direction around each lamp (point, spot and area lights, and groups of emissive surfaces, see
+        :meth:`lighting_info <exposed_lighting_info>`) is also rendered, in equirectangular maps, through which emissive
+        surfaces are seen as if they were transparent, as they don't hide their own light. All maps are saved to a
+        ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current
+        frame, so objects should be static. Render settings, the camera and the compositor are restored afterwards.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
@@ -1776,6 +1968,10 @@ class BlenderClient:
                 Defaults to 512.
             lamp_resolution (int, optional): Number of texels along the width of the maps of lamps, which span all
                 azimuths, and half as many along their height, which spans all elevations. Defaults to 1024.
+            emissive_lamps (int, optional): Maximum number of lamps into which emissive surfaces are grouped, which
+                should match that of :meth:`save_lighting <exposed_save_lighting>`. Defaults to :data:`EMISSIVE_LAMPS`.
+            emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
+                Defaults to :data:`EMISSIVE_PATCHES`.
 
         Raises:
             ValueError: raised if the number of bands of the sky and of their edges do not match.
@@ -2629,7 +2825,7 @@ class BlenderClients(tuple):
         """
 
     @type_check_only
-    def lighting_info(self) -> tuple[dict[str, Any],]:
+    def lighting_info(self, emissive_lamps: int = ..., emissive_patches: int = ...) -> tuple[dict[str, Any],]:
         """Get the lighting of the scene, as needed to light a participating medium consistently with the scene.
 
         This includes sun, point, spot and area lights, whose intensities account for their exposure, temperature,
@@ -2638,17 +2834,37 @@ class BlenderClients(tuple):
         shaders, square spots, and the elliptical cones of spots scaled unevenly are not supported, and approximated
         with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
 
+        Meshes that emit light, through an Emission shader or the emission of a Principled BSDF, possibly mixed or added
+        with other shaders, are included as emissive surfaces. Their radiance is the emission's strength times its
+        color, which can come from a Blackbody node, or from an image, whose mean color is used. Surfaces further than
+        :data:`EMISSIVE_GAP` apart are grouped into different lamps, which each cast shadows from a single position, as
+        long as there are at most ``emissive_lamps`` of them, and lamps are split into patches, whose light is
+        proportional to the area of their faces seen from each direction, see :func:`_emissive_lamps`.
+
+        Args:
+            emissive_lamps (int, optional): Maximum number of lamps into which emissive surfaces are grouped.
+                Defaults to :data:`EMISSIVE_LAMPS`.
+            emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
+                Defaults to :data:`EMISSIVE_PATCHES`.
+
         Returns:
             dict[str, Any]: Lighting information, following the schema of :class:`Lighting <visionsim.medium.model.Lighting>`.
         """
 
     @type_check_only
-    def save_lighting(self, path: str | os.PathLike | None = None) -> None:
+    def save_lighting(
+        self, path: str | os.PathLike | None = None, emissive_lamps: int = ..., emissive_patches: int = ...
+    ) -> None:
         """Save the lighting of the scene, as returned by :meth:`lighting_info <exposed_lighting_info>`, to a JSON file.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
                 root directory of the renders.
+            emissive_lamps (int, optional): Maximum number of lamps into which emissive surfaces are grouped, which
+                should match that of :meth:`save_occlusion <exposed_save_occlusion>`. Defaults to
+                :data:`EMISSIVE_LAMPS`.
+            emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
+                Defaults to :data:`EMISSIVE_PATCHES`.
         """
 
     @type_check_only
@@ -2661,16 +2877,19 @@ class BlenderClients(tuple):
         sun_resolution: int = 2048,
         sky_resolution: int = 512,
         lamp_resolution: int = 1024,
+        emissive_lamps: int = ...,
+        emissive_patches: int = ...,
     ) -> None:
         """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
 
         Orthographic depth maps of the objects that cast shadows are rendered with Cycles along the direction of each
         sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
         split into equal ranges of azimuth. Maps span the box that contains these objects. The distance to the first
-        object in every direction around each lamp (point, spot and area lights) is also rendered, in equirectangular
-        maps. All maps are saved to a ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They
-        are captured at the current frame, so objects should be static. Render settings, the camera and the compositor
-        are restored afterwards.
+        object in every direction around each lamp (point, spot and area lights, and groups of emissive surfaces, see
+        :meth:`lighting_info <exposed_lighting_info>`) is also rendered, in equirectangular maps, through which emissive
+        surfaces are seen as if they were transparent, as they don't hide their own light. All maps are saved to a
+        ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current
+        frame, so objects should be static. Render settings, the camera and the compositor are restored afterwards.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
@@ -2687,6 +2906,10 @@ class BlenderClients(tuple):
                 Defaults to 512.
             lamp_resolution (int, optional): Number of texels along the width of the maps of lamps, which span all
                 azimuths, and half as many along their height, which spans all elevations. Defaults to 1024.
+            emissive_lamps (int, optional): Maximum number of lamps into which emissive surfaces are grouped, which
+                should match that of :meth:`save_lighting <exposed_save_lighting>`. Defaults to :data:`EMISSIVE_LAMPS`.
+            emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
+                Defaults to :data:`EMISSIVE_PATCHES`.
 
         Raises:
             ValueError: raised if the number of bands of the sky and of their edges do not match.

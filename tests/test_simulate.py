@@ -187,18 +187,19 @@ def test_camera_intrinsics(executable):
 
 def test_save_occlusion(executable, tmp_path):
     # Shadow maps are rendered from within Blender, which checks that the scene is left as it was, then the maps of
-    # the test scene's cube, lit by a sun that leans towards -y, are checked here
+    # the test scene's cube, lit by a sun that leans towards -y, and of a glowing ball above it, are checked here
     _run_blender_script(executable, "occlusion.py", tmp_path / "occlusion.npz")
     occlusion = load_occlusion(tmp_path / "occlusion.npz", dtype=torch.float64)
     assert occlusion.sky_counts == (4, 2) and len(occlusion.sky_maps.texels) == 6 and len(occlusion.sun_maps.texels) == 1
     low, high = occlusion.bounds.numpy()
-    assert np.allclose(low, -1, atol=0.05) and np.allclose(high, 1, atol=0.05)  # only the cube casts shadows
+    # Only the cube and the ball above it cast shadows
+    assert np.allclose(low, -1, atol=0.05) and np.allclose(high, [1, 1, 4.25], atol=0.05)
 
     # Points right below the cube, along the sun's direction, are in its shadow, unlike points beside it
     towards = occlusion.sun_directions[0]
-    center = torch.as_tensor((low + high) / 2, dtype=torch.float64)
-    below = center - towards * float(np.linalg.norm(high - low))
-    beside = below + torch.as_tensor([float(high[0] - low[0]) * 2, 0.0, 0.0], dtype=torch.float64)
+    center = torch.zeros(3, dtype=torch.float64)
+    below = center - towards * 2 * math.sqrt(3)
+    beside = below + torch.as_tensor([4.0, 0.0, 0.0], dtype=torch.float64)
     origin = center + torch.as_tensor([0.0, 0.0, 50.0], dtype=torch.float64)
     points = torch.stack([below, beside])
     offset = points - origin
@@ -209,7 +210,7 @@ def test_save_occlusion(executable, tmp_path):
 
     # The scene's point light has a map too, behind the cube from which points are in its shadow, unlike points
     # in front of the light or beside the cube
-    (lamp,) = occlusion.lamp_maps.origins
+    lamp, ball = occlusion.lamp_maps.origins
     assert tuple(occlusion.lamp_maps.shapes[0].tolist()) == (128, 256)
     away = (center - lamp) / (center - lamp).norm()
     side = torch.linalg.cross(away, torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64))
@@ -231,6 +232,12 @@ def test_save_occlusion(executable, tmp_path):
     assert 0.1 < mean.item() < 0.9
     assert mean.item() == pytest.approx(lamp_visibility(occlusion.lamp_maps, 0, samples).mean().item(), abs=0.01)
 
+    # The glowing ball casts shadows from its center, through itself but not through the cube
+    assert (ball - torch.tensor([0.0, 0.0, 4.0], dtype=torch.float64)).norm().item() < 0.01
+    through = ball + torch.tensor([3.0, 0.0, 0.0], dtype=torch.float64)
+    under = ball + 2 * (center - ball)
+    assert lamp_visibility(occlusion.lamp_maps, 1, torch.stack([through, under])).tolist() == [1.0, 0.0]
+
 
 def test_lighting_info(executable, tmp_path):
     # Lights are added and checked from within Blender, the saved lighting is then validated here
@@ -239,3 +246,4 @@ def test_lighting_info(executable, tmp_path):
     latitudes = (np.arange(16) + 0.5) / 32 * np.pi
     expected_sky = (np.array((1.0, 0.5, 0.25)) + 100 * np.cos(latitudes[-1]) / np.cos(latitudes).sum()) * 2.0
     assert len(lighting.suns) == 1 and len(lighting.points) == 1 and lighting.sky == pytest.approx(expected_sky)
+    assert len(lighting.emissive) == 2

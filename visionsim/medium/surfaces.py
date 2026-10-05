@@ -330,8 +330,10 @@ def surface_irradiance(
             seen_lamp = lamp_visibility(lamp_maps, index, points.float())[:, None].to(points)
         for emitter in emitters(lamp, n, samples=4, **kwargs):
             to_light = emitter.position - points
-            r = to_light.norm(dim=-1).clamp_min(max(emitter.radius, 1e-3))
-            u = to_light / r[:, None]
+            # Distances are clamped at the emitter's radius, unlike directions
+            distance = to_light.norm(dim=-1).clamp_min(1e-12)
+            r = distance.clamp_min(max(emitter.radius, 1e-3))
+            u = to_light / distance[:, None]
             factor = (normals * u).sum(dim=-1).clamp_min(0) / (r * r)
             if emitter.axis is not None:
                 cosine = -(u @ emitter.axis)
@@ -340,8 +342,10 @@ def surface_irradiance(
                     factor = factor * emitter.profile(cosine)
             if emitter.falloff is not None:
                 factor = factor * emitter.falloff(r)
+            if emitter.pattern is not None:
+                factor = factor * emitter.pattern(-u)
             lit = seen_lamp * factor[:, None] * emitter.intensity
-            depth = optical_depth(medium, points, u, r, time=time)[:, None]
+            depth = optical_depth(medium, points, u, distance, time=time)[:, None]
             clear, through = clear + lit, through + lit * torch.exp(-reduced * depth * beta)
     return clear, through
 

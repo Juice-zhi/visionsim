@@ -257,7 +257,63 @@ class AreaLight(BaseModel):
         return self.size[0] * self.size[1] * (math.pi / 4 if self.shape == "ellipse" else 1.0)
 
 
-Lamp = Union[PointLight, SpotLight, AreaLight]
+class EmissiveSurface(BaseModel):
+    """Surfaces of meshes that emit light, such as screens, bulbs or neon tubes, which shine and cast shadows as a lamp.
+
+    As in Cycles, both sides of the surfaces emit a constant radiance in every direction (Lambertian emission), except
+    for the light that the surfaces block themselves, such as the light emitted inside a closed surface. The surfaces
+    are described by patches, each a part of them of a given position, area and radiance, e.g. clusters of their faces,
+    see :meth:`BlenderService.lighting_info <visionsim.simulate.blender.BlenderService.exposed_lighting_info>`. A patch
+    shines in each direction in proportion to the area of its faces seen from there whose light leaves towards it,
+    which is approximated from the moments of their normals, exactly for flat patches, spheres, cylinders and
+    hemispheres, see :func:`projected_area <visionsim.medium.lights.projected_area>`.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    position: Vector3
+    """world-space position from which the surfaces cast shadows, in meters, typically their center if they surround
+    it, or a point on them near it"""
+    positions: tuple[Vector3, ...]
+    """world-space center of each patch, in meters"""
+    areas: tuple[PositiveFloat, ...]
+    """area of each patch, in m²"""
+    radiance: tuple[tuple[float, ...], ...]
+    """radiance of each patch per color channel, in W/(m²·sr), i.e. the emission strength times its color in Blender"""
+    orientation: tuple[tuple[float, float, float, float, float, float], ...]
+    """mean of ``n nᵀ`` over the unit world-space normals ``n`` of the faces of each patch, weighted by their area and
+    by the mean of the fractions of their light that leave their two sides, as ``(xx, yy, zz, xy, xz, yz)``. It is
+    ``n nᵀ`` for a flat patch whose two sides emit, ``n nᵀ / 2`` if only its front does, and a sixth of the identity
+    for a sphere"""
+    facing: tuple[Vector3, ...] = ()
+    """mean of the unit normals of the faces of each patch, weighted by their area and by half the difference between
+    the fractions of their light that leave their front and their back. It is ``n / 2`` for a flat patch of normal ``n``
+    only the front of which emits. Defaults to zero, i.e. faces whose light leaves both sides alike"""
+    spread: tuple[tuple[float, float, float, float, float, float], ...] = ()
+    """covariance of the world-space points of each patch around its center, in m², as ``(xx, yy, zz, xy, xz, yz)``.
+    The square root of its trace, the root mean square distance between the points and the center, is the radius of the
+    patch, below which distances to it are clamped, e.g. the radius of a sphere, and flat patches are seen as the
+    rectangle of the same spread by rays that pass close to them, see :func:`patch_emitters
+    <visionsim.medium.lights.patch_emitters>`. Defaults to patches seen as a point, whose radius is half the square
+    root of their area"""
+
+    @model_validator(mode="after")
+    def _validate_patches(self) -> Self:
+        sizes = {len(self.positions), len(self.areas), len(self.radiance), len(self.orientation)}
+        if not self.areas or len(sizes) != 1 or {len(self.facing), len(self.spread)} - {0, len(self.areas)}:
+            raise ValueError(
+                "Expected as many positions, areas, radiances, orientations, and facings and spreads if any, one per "
+                "patch, and at least one patch."
+            )
+        return self
+
+    @property
+    def area(self) -> float:
+        """Area of the surfaces, in m²."""
+        return sum(self.areas)
+
+
+Lamp = Union[PointLight, SpotLight, AreaLight, EmissiveSurface]
 """Light source at a finite distance, as opposed to suns"""
 
 
@@ -285,6 +341,8 @@ class Lighting(BaseModel):
     """spot light sources, whose light is attenuated by the medium on its way, and scattered once"""
     areas: list[AreaLight] = Field(default_factory=list)
     """area light sources, whose light is attenuated by the medium on its way, and scattered once"""
+    emissive: list[EmissiveSurface] = Field(default_factory=list)
+    """surfaces that emit light, whose light is attenuated by the medium on its way, and scattered once"""
     ground_albedo: tuple[float, ...] = (0.0, 0.0, 0.0)
     """albedo per color channel of the ground, modeled as a Lambertian plane at ``ground_height`` lit by suns and
     the sky, which reflects light into the medium. This is only used when sunlight is attenuated by the medium"""
@@ -293,5 +351,5 @@ class Lighting(BaseModel):
 
     @property
     def lamps(self) -> list[Lamp]:
-        """Light sources at a finite distance, i.e. point, spot and area lights."""
-        return [*self.points, *self.spots, *self.areas]
+        """Light sources at a finite distance, i.e. point, spot and area lights, and emissive surfaces."""
+        return [*self.points, *self.spots, *self.areas, *self.emissive]

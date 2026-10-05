@@ -176,6 +176,8 @@ def ray_march_medium(
                     phase = phase * emitter.profile(-(to_light @ emitter.axis) / r)
                 if emitter.falloff is not None:
                     phase = phase * emitter.falloff(r)
+                if emitter.pattern is not None:
+                    phase = phase * emitter.pattern(-to_light / to_light.norm(dim=-1, keepdim=True).clamp_min(1e-12))
                 depth = segment_optical_depth(medium, samples, to_light / r[..., None], r, time=time)
                 weight = medium.albedo * emitter.intensity
                 source = source + weight * (phase / (r * r))[..., None] * torch.exp(-depth[..., None] * beta)
