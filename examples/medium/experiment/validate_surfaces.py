@@ -95,9 +95,12 @@ def main():
         ),
     }
     for lamp in ("point", "spot", "area"):
-        if (ROOT / lamp / "clear").exists() and (ROOT / lamp / "bounces0").exists():
+        # Cycles clamps indirect light by default, which darkens the glow lighting surfaces near lamps
+        fog_dir = ROOT / lamp / "noclamp_bounces0"
+        fog_dir = fog_dir if fog_dir.exists() else ROOT / lamp / "bounces0"
+        if (ROOT / lamp / "clear").exists() and fog_dir.exists():
             lighting = Lighting.model_validate_json((ROOT / lamp / "lighting.json").read_text())
-            results[f"{lamp}_vs_0_bounces"] = compare(ROOT / lamp / "clear", ROOT / lamp / "bounces0", fog, lighting)
+            results[f"{lamp}_vs_0_bounces"] = compare(ROOT / lamp / "clear", fog_dir, fog, lighting)
     (ROOT / "results" / "surfaces.json").write_text(json.dumps(results, indent=1))
     for name, regions in results.items():
         for region, entry in regions.items():

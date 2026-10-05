@@ -13,10 +13,11 @@ without the medium, estimated from the position and the normal of the surface, a
   and, with ``multiple_scattering``, light scattered more times, from the tables of :mod:`visionsim.medium.scattering`.
   The glow only depends on the height of surfaces, on the elevation of their normal and on its azimuth relative to
   suns, so it is tabulated once per frame, see :func:`surface_tables`.
-- Light from lamps is attenuated towards each of their emitters, with the extinction reduced to the share of light that
-  isn't scattered within the narrow forward peak of the phase function, which keeps going towards surfaces,
-  ``1 - albedo · g²`` (the delta-Eddington approximation of Joseph et al., "The Delta-Eddington Approximation for
-  Radiative Flux Transfer", 1976).
+- Light from lamps is attenuated towards each of their emitters with a reduced extinction, as the light that the
+  medium scatters mostly keeps going forward, towards surfaces: ``1 - albedo · g`` times the extinction, the similarity
+  relation of radiative transfer (e.g. Wyman et al., "Similarity relations for anisotropic scattering in monte carlo
+  simulations of deeply penetrating neutral particles", 1989). Against Cycles, it lights surfaces better than the
+  delta-Eddington approximation, ``1 - albedo · g²``.
 - Light that reaches surfaces indirectly, after bouncing off other surfaces, makes up an ambient share of the frame's
   direct light, and is dimmed as the frame's direct light is on average, see :func:`surface_attenuation`.
 
@@ -314,8 +315,8 @@ def surface_irradiance(
         azimuth_index = torch.remainder(azimuth + math.pi, 2 * math.pi).sub(math.pi).abs() / math.pi * (_AZIMUTHS - 1)
         through = through + open_sky * _interpolate(tables.suns[k], height_index, normal_index, azimuth_index)
 
-    # Lamps, whose light is attenuated with the share of the extinction that doesn't keep going forward
-    reduced = 1 - medium.albedo * medium.anisotropy**2
+    # Lamps, whose light is attenuated with a reduced extinction, as scattered light mostly keeps going forward
+    reduced = 1 - medium.albedo * medium.anisotropy
     lamp_maps = None
     if occlusion is not None and occlusion.lamp_maps is not None:
         lamp_maps = maps_to(occlusion.lamp_maps, device=points.device)

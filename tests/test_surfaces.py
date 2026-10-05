@@ -64,7 +64,7 @@ def test_lamps_are_attenuated_with_the_reduced_extinction():
     clear, through = surface_irradiance(medium, lighting, T([medium.extinction]), points, normals)
     distance = (lighting.points[0].position - points.numpy()) ** 2
     distance = np.sqrt(distance.sum(-1))
-    reduced = 1 - 0.9 * 0.7**2
+    reduced = 1 - 0.9 * 0.7
     assert through[:, 0].numpy() == pytest.approx(clear[:, 0].numpy() * np.exp(-reduced * 0.1 * distance))
     assert clear[0, 0].item() == pytest.approx(1000 / (4 * math.pi) / 25)
 

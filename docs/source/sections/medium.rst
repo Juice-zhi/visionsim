@@ -163,9 +163,9 @@ reflected by the ground are attenuated in closed form, and the glow arrives from
 scattered once, with the phase function towards each direction, so that surfaces facing the sun receive much more of
 it than those facing away, the light of the sky and the ground scattered once, and, with ``multiple_scattering``, light
 scattered more times. As the glow only depends on the height of surfaces and on the orientation of their normal, it is
-tabulated once per frame. Light from lamps is attenuated with the share of the extinction that isn't scattered within
-the forward peak of the phase function, ``1 - albedo · g²`` (delta-Eddington), as light scattered forward keeps going
-towards surfaces. Light that bounces off other surfaces first is assumed to be dimmed as the frame's direct light is on
+tabulated once per frame. Light from lamps is attenuated with a reduced extinction, ``1 - albedo · g`` times it (the
+similarity relation of radiative transfer), as light scattered forward keeps going towards surfaces. Light that bounces
+off other surfaces first is assumed to be dimmed as the frame's direct light is on
 average, and the light that surfaces emit, given by an emission pass (``--include-emission``), isn't dimmed at all.
 
 Objects block sunlight from the medium behind them, which casts light shafts, and hide part of the sky from the medium
@@ -211,9 +211,10 @@ rendered without clamping (``render_passes.py --no-clamp``).
 Surfaces lit through the fog (``validate_surfaces.py``) are within 1% of Cycles' overall, both with single and multiple
 scattering, against 13% too bright in the render without fog for single scattering, with per-pixel differences of 3.5%
 and 4.6%, against 14% and 5%. Walls, which only see the glow of the fog around them, are within about 3%, against 26% too
-bright. Surfaces lit by a point, spot or area light are within 1% to 2.4%, against 8% to 11%. Note that Cycles' renders
-with no volume bounces include light scattered once on its way to surfaces too, as the light is sampled from where it
-scatters.
+bright. Surfaces lit by a point, spot or area light are within 1.3%, against 4% to 6% too bright, with per-pixel
+differences of 4% to 6%, against 7% to 9%. Note that Cycles' renders with no volume bounces include light scattered once
+on its way to surfaces too, as the light is sampled from where it scatters, and that references lit by lamps are rendered
+without clamping indirect light, see below.
 
 With objects casting shadows, the sun's light scattered by the fog is within 1.3% of Cycles' over surfaces and within
 0.8% over the sky, against 17% and 3% without shadows, and the sky's is within 1% over both, against 25% and 3%.
@@ -237,7 +238,7 @@ The following are not yet modeled:
   the approximation assumes.
 - The shadows of objects on the glow that lights surfaces, which assumes that surfaces stand in the open, unless shadow
   maps show that they don't see the sky, and the glow of lamps on surfaces beyond what the reduced extinction of
-  delta-Eddington accounts for. Surfaces are assumed to be diffuse, and light that bounces off other surfaces to be
+  the reduced extinction accounts for. Surfaces are assumed to be diffuse, and light that bounces off other surfaces to be
   dimmed as the frame's direct light is on average.
 - Anti-aliasing: depth maps are not anti-aliased, so edges between near and far objects can show halos in dense
   media. Rendering at a higher resolution and downsampling the results reduces these.
