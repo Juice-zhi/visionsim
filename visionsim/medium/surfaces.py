@@ -36,7 +36,7 @@ import numpy as np
 import torch
 
 from visionsim.medium.lights import emitters
-from visionsim.medium.model import AreaLight, HeightFog, Lighting, Medium
+from visionsim.medium.model import AreaLight, EmissiveSurface, HeightFog, Lighting, Medium
 from visionsim.medium.occlusion import (
     Occlusion,
     lamp_map_index,
@@ -317,17 +317,21 @@ def surface_irradiance(
 
     # Lamps, whose light is attenuated with a reduced extinction, as scattered light mostly keeps going forward
     reduced = 1 - medium.albedo * medium.anisotropy
-    lamp_maps = None
-    if occlusion is not None and occlusion.lamp_maps is not None:
-        lamp_maps = maps_to(occlusion.lamp_maps, device=points.device)
+    # Maps of emissive surfaces see through them
+    found = (
+        {False: None, True: None} if occlusion is None else {False: occlusion.lamp_maps, True: occlusion.emissive_maps}
+    )
+    lamp_maps = {k: maps_to(m, device=points.device) if m is not None else None for k, m in found.items()}
+    tolerance = occlusion.lamp_tolerance if occlusion is not None else 0.01
     for lamp in lighting.lamps:
         seen_lamp = torch.ones(len(points), 1, **kwargs)
         center = torch.as_tensor(lamp.position, **kwargs)
         if isinstance(lamp, AreaLight):
             # Maps of area lights are rendered just in front of them
             center = center + 1e-3 * center.new_tensor(_unit(lamp.direction))
-        if lamp_maps is not None and (index := lamp_map_index(lamp_maps, center)) is not None:
-            seen_lamp = lamp_visibility(lamp_maps, index, points.float())[:, None].to(points)
+        chosen = lamp_maps[isinstance(lamp, EmissiveSurface)]
+        if chosen is not None and (index := lamp_map_index(chosen, center, tolerance)) is not None:
+            seen_lamp = lamp_visibility(chosen, index, points.float())[:, None].to(points)
         for emitter in emitters(lamp, n, samples=4, **kwargs):
             to_light = emitter.position - points
             # Distances are clamped at the emitter's radius, unlike directions

@@ -79,13 +79,6 @@ def render_job(
         client.include_points(**asdict(config.points))
     if config.include_emission:
         client.include_emission(**asdict(config.emission))
-    if config.include_lighting:
-        # All clients load the same scene, so a single one saves its lighting
-        (client[0] if isinstance(client, BlenderClients) else client).save_lighting(**asdict(config.lighting))
-    if config.include_occlusion:
-        (client[0] if isinstance(client, BlenderClients) else client).save_occlusion(
-            **asdict(config.occlusion), **asdict(config.lighting)
-        )
 
     if config.unbind_camera:
         client.unbind_camera()
@@ -100,6 +93,21 @@ def render_job(
             client.offset_camera(config.camera_offset)
             client.set_camera_keyframe(frame_number)
     client.move_keyframes(scale=config.keyframe_multiplier)
+
+    if config.include_lighting or config.include_occlusion:
+        # All clients load the same scene, so a single one saves its lighting, at the frames that are rendered, once
+        # keyframes are moved, so that lights move as they do in these frames
+        primary = client[0] if isinstance(client, BlenderClients) else client
+        start, end, step = primary.animation_range_tuple()
+        frames = None
+        if config.lighting.animated:
+            first, last = start if frame_start is None else frame_start, end if frame_end is None else frame_end
+            frames = list(range(first, last + 1, step if frame_step is None else frame_step))
+        lighting = {k: v for k, v in asdict(config.lighting).items() if k != "animated"}
+        if config.include_lighting:
+            primary.save_lighting(frames=frames, **lighting)
+        if config.include_occlusion:
+            primary.save_occlusion(frames=frames, **asdict(config.occlusion), **lighting)
 
     if output_blend_file is not None:
         client.save_file(output_blend_file)

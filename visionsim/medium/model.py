@@ -353,3 +353,35 @@ class Lighting(BaseModel):
     def lamps(self) -> list[Lamp]:
         """Light sources at a finite distance, i.e. point, spot and area lights, and emissive surfaces."""
         return [*self.points, *self.spots, *self.areas, *self.emissive]
+
+
+class AnimatedLighting(BaseModel):
+    """Lighting of the frames of an animation, which changes over them, e.g. as lamps move or turn on and off.
+
+    This is typically exported from the Blender scene, along with the lighting of its first frame, when lights are
+    animated, see :meth:`BlenderService.save_lighting <visionsim.simulate.blender.BlenderService.exposed_save_lighting>`.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    frames: dict[int, Lighting]
+    """lighting by frame number, at the frames at which it changes, which holds until the next of them"""
+
+    @model_validator(mode="after")
+    def _validate_frames(self) -> Self:
+        if not self.frames:
+            raise ValueError("Expected the lighting of at least one frame.")
+        return self
+
+    def at(self, frame: int) -> Lighting:
+        """Lighting of a frame, i.e. that of the last frame at or before it at which the lighting changed, or that of the
+        first frame for frames before it.
+
+        Args:
+            frame (int): Frame number.
+
+        Returns:
+            Lighting: Lighting of the frame.
+        """
+        before = [number for number in self.frames if number <= frame]
+        return self.frames[max(before) if before else min(self.frames)]

@@ -12,8 +12,10 @@ lit through the medium too (:mod:`visionsim.medium.surfaces`). The same model ca
 """
 
 from visionsim.medium.model import (
+    AnimatedLighting,
     AreaLight,
     Blob,
+    EmissiveSurface,
     HeightFog,
     Homogeneous,
     Lighting,
@@ -30,8 +32,10 @@ from visionsim.medium.transient import Flash, Transient, capture_histogram, esti
 
 __all__ = [
     "RGB_WAVELENGTHS",
+    "AnimatedLighting",
     "AreaLight",
     "Blob",
+    "EmissiveSurface",
     "Flash",
     "HeightFog",
     "Homogeneous",

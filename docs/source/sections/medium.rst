@@ -44,6 +44,15 @@ of the scene by adding ``--config.include-occlusion`` when rendering, and exclud
 otherwise make the maps span all of it, with ``--config.occlusion.exclude Plane``. ``medium.apply`` then uses the
 ``occlusion.npz`` it finds in the renders.
 
+Lights can be animated: lighting is exported at every rendered frame, after keyframes are moved by
+``--config.keyframe-multiplier``, and when it changes, e.g. as lamps move or their power changes, the lighting of each
+frame at which it changes is saved to ``animated-lighting.json``, which ``medium.apply`` uses by the number of each
+frame (see :class:`AnimatedLighting <visionsim.medium.model.AnimatedLighting>`). Moving lamps get shadow maps along
+their way, rendered at the frames from which they move further than ``--config.occlusion.lamp-spacing`` (10 cm by
+default) from where their previous maps were, and cast the shadows of the nearest one. Emissive surfaces are exported
+again at every frame if they, their parents or their materials are animated. ``--config.lighting.no-animated`` only
+exports the lighting of the first frame.
+
 Tracing where objects hide the lights along the rays of a frame takes most of the time of shadows, but doesn't depend
 on the medium. To add several media to the same frame, such as fogs of different visibilities, trace shadows once with
 :func:`trace_shadows <visionsim.medium.render.trace_shadows>` and pass them to :func:`apply_medium
@@ -255,8 +264,10 @@ Limitations
 
 The following are not yet modeled:
 
-- Shadows of moving objects, as shadow maps are rendered once per scene, and the soft shadows of large lamps, which
-  cast the hard shadows of a single point.
+- Shadows of moving objects, as shadow maps are rendered at the first frame, except those of moving lamps, which are
+  rendered at the frames at which lamps reach new positions, and the soft shadows of large lamps, which cast the hard
+  shadows of a single point. Suns that move cast the shadows of the first frame. Halos of moving lamps are computed
+  again at every frame.
 - IES profiles and other node trees of lamps, square spot lights, and the elliptical cones of spot lights scaled
   unevenly. Emission whose strength is set by other nodes, or whose color varies over a surface, as it does with an
   image, which is averaged. Close to curved emissive surfaces, within about the size of their patches, their light is

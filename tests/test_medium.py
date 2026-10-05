@@ -10,11 +10,13 @@ from visionsim.cli.emulate import spad
 from visionsim.cli.medium import _write_exr, apply
 from visionsim.dataset import Dataset, Metadata
 from visionsim.medium import (
+    AnimatedLighting,
     Blob,
     HeightFog,
     Homogeneous,
     Lighting,
     Medium,
+    PointLight,
     Sun,
     apply_medium,
     camera_rays,
@@ -465,6 +467,27 @@ def test_cli_apply_lights_surfaces_through_the_medium(tmp_path):
     # Without normals, or when asked not to, surfaces keep their light
     apply(tmp_path / "render", tmp_path / "plain", tmp_path / "medium.json", device="cpu", surfaces=False)
     assert not (tmp_path / "plain" / "illumination").exists()
+
+
+def test_cli_apply_animated_lighting(tmp_path):
+    # Frames are lit by the lighting of the last frame, at or before them by their number, at which it changed
+    lighting = make_render(tmp_path / "render", n=3)
+    lamp = PointLight(position=(0.0, 6.0, 2.0), power=(500.0,), radius=0.1)
+    moved = lamp.model_copy(update={"position": (1.0, 6.0, 2.0), "power": (2000.0,)})
+    frames = {0: lighting.model_copy(update={"points": [lamp]}), 2: lighting.model_copy(update={"points": [moved]})}
+    animated = AnimatedLighting(frames=frames)
+    (tmp_path / "render" / "animated-lighting.json").write_text(animated.model_dump_json())
+    medium = Medium(extinction=0.1)
+    (tmp_path / "medium.json").write_text(medium.model_dump_json())
+    apply(tmp_path / "render", tmp_path / "fog", tmp_path / "medium.json", device="cpu")
+
+    rendered, depths = (Dataset.from_path(tmp_path / "render" / name) for name in ("frames", "depths"))
+    saved = Dataset.from_path(tmp_path / "fog" / "frames")
+    for i, ((radiance, transform), (depth, _)) in enumerate(zip(rendered, depths)):
+        expected = apply_medium(radiance, depth, transform, transform["transform_matrix"], medium, animated.at(i))
+        assert np.allclose(saved[i][0], expected.radiance.numpy(), rtol=1e-6, atol=1e-6)
+    assert not np.allclose(saved[1][0], saved[2][0])
+    assert AnimatedLighting.model_validate_json((tmp_path / "fog" / "animated-lighting.json").read_text()) == animated
 
 
 def test_cli_apply_requires_lighting(tmp_path):

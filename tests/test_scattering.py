@@ -8,7 +8,7 @@ from scipy.special import ellipe
 
 from visionsim.medium import Lighting, Medium, Sun, apply_medium, camera_rays
 from visionsim.medium.lights import AREA_LEVELS, area_radius, area_weights, closest_distances, emitters, spot_falloff
-from visionsim.medium.model import AreaLight, Blob, HeightFog, Homogeneous, PointLight, SpotLight
+from visionsim.medium.model import AnimatedLighting, AreaLight, Blob, HeightFog, Homogeneous, PointLight, SpotLight
 from visionsim.medium.optics import (
     density,
     height_fog_sun_inscatter,
@@ -380,6 +380,16 @@ def test_lamps_round_trip():
     assert lighting.areas[0].area == 2 and lighting.areas[0].model_copy(update={"shape": "ellipse"}).area == math.pi / 2
     with pytest.raises(ValueError):
         SpotLight(position=(0, 0, 0), direction=(0, 0, -1), power=(1.0,), angle=4.0)
+
+
+def test_animated_lighting():
+    # The lighting of a frame is that of the last frame at or before it at which it changed, or of the first one
+    first, later = Lighting(sky=(1.0,)), Lighting(sky=(2.0,))
+    animated = AnimatedLighting(frames={10: first, 20: later})
+    assert [animated.at(frame).sky for frame in (5, 10, 15, 20, 25)] == [(1.0,)] * 3 + [(2.0,)] * 2
+    assert AnimatedLighting.model_validate_json(animated.model_dump_json()) == animated
+    with pytest.raises(ValueError, match="at least one frame"):
+        AnimatedLighting(frames={})
 
 
 def test_multiple_scattering_requires_sun_attenuation():

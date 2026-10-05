@@ -21,7 +21,8 @@ horizon is not occluded.
 
 Lamps cast shadows through equirectangular maps of the distance between each lamp and the first surface in every
 direction, see :func:`lamp_visibility`, whose visibility is sampled along rays at angles evenly spread as seen from the
-lamp and averaged around each node of the quadrature that integrates the lamp's light, see :func:`lamp_shadow`.
+lamp and averaged around each node of the quadrature that integrates the lamp's light, see :func:`lamp_shadow`. Lamps
+that move have maps at several of their positions, and cast the shadows of the nearest one.
 """
 
 from __future__ import annotations
@@ -94,7 +95,14 @@ class Occlusion(NamedTuple):
     """corners of the box that contains every object casting shadows, of shape (2, 3)"""
     lamp_maps: ShadowMaps | None = None
     """one equirectangular map per lamp, which records the distance between the lamp, at the map's origin, and the first
-    surface in every direction, see :func:`lamp_visibility`, and whose texels are in radians"""
+    surface in every direction, see :func:`lamp_visibility`, and whose texels are in radians. Lamps that move have maps
+    at several of their positions"""
+    emissive_maps: ShadowMaps | None = None
+    """maps of emissive surfaces, as those of lamps, which see through emissive surfaces as they don't hide their own
+    light"""
+    lamp_tolerance: float = 0.01
+    """distance, in meters, within which a lamp casts the shadows of a map rendered at another position, as moving lamps
+    get a new map once they move further than a given spacing from their previous ones"""
 
 
 def select_maps(maps: ShadowMaps, index: int) -> ShadowMaps:
@@ -120,6 +128,7 @@ def occlusion_to(
         sky_maps=move(occlusion.sky_maps),
         bounds=occlusion.bounds.to(device=device, dtype=dtype),
         lamp_maps=move(occlusion.lamp_maps) if occlusion.lamp_maps is not None else None,
+        emissive_maps=move(occlusion.emissive_maps) if occlusion.emissive_maps is not None else None,
     )
 
 
@@ -197,6 +206,8 @@ def load_occlusion(
             bounds=torch.as_tensor(data["bounds"], **kwargs).reshape(2, 3),
             # Maps saved before lamps cast shadows don't have any
             lamp_maps=maps("lamp") if "lamp_depths" in data else None,
+            emissive_maps=maps("emissive") if "emissive_depths" in data else None,
+            lamp_tolerance=max(float(data["lamp_spacing"]), 0.01) if "lamp_spacing" in data else 0.01,
         )
 
     expected = sky_cell_directions(edges, counts)

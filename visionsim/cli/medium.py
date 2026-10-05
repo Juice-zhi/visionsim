@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -48,8 +49,11 @@ def apply(
         input_dir: directory containing rendered frames and depth maps, such as the output of ``blender.render-animation``
         output_dir: directory in which to save frames with the medium, as linear EXRs, and ground truths
         medium: path to a JSON file describing the medium, see :class:`Medium <visionsim.medium.model.Medium>`
-        lighting: path to a JSON file describing the lighting, see :class:`Lighting <visionsim.medium.model.Lighting>`.
-            Defaults to the ``lighting.json`` saved in ``input_dir`` when rendering with ``--include-lighting``
+        lighting: path to a JSON file describing the lighting, see :class:`Lighting <visionsim.medium.model.Lighting>`,
+            or the lighting of each frame at which it changes, see :class:`AnimatedLighting
+            <visionsim.medium.model.AnimatedLighting>`, in which case frames are matched by the number of their file
+            name. Defaults to the ``animated-lighting.json`` saved in ``input_dir`` when rendering with
+            ``--include-lighting`` and lights change over the frames, or else to its ``lighting.json``
         occlusion: path to the shadow maps through which objects cast shadows onto the medium, see
             :mod:`visionsim.medium.occlusion`. Defaults to the ``occlusion.npz`` saved in ``input_dir`` when rendering
             with ``--include-occlusion``, if any. Only used by media that attenuate sunlight
@@ -73,7 +77,7 @@ def apply(
 
     from visionsim.cli import _log
     from visionsim.dataset import Dataset, Metadata
-    from visionsim.medium import Blob, Lighting, Medium, apply_medium
+    from visionsim.medium import AnimatedLighting, Blob, Lighting, Medium, apply_medium
     from visionsim.medium.occlusion import load_occlusion
     from visionsim.utils.color import LINEAR_EXTENSIONS, to_linearrgb
     from visionsim.utils.progress import ElapsedProgress
@@ -85,13 +89,17 @@ def apply(
     else:
         shutil.rmtree(output_dir, ignore_errors=True)
 
+    if lighting is None and (input_dir / "animated-lighting.json").exists():
+        lighting = input_dir / "animated-lighting.json"
     lighting = lighting or input_dir / "lighting.json"
     if not lighting.exists():
         raise FileNotFoundError(
             f"No lighting found at {lighting}, either render with `--include-lighting` or provide it with `--lighting`."
         )
     medium_spec = Medium.model_validate_json(Path(medium).read_text())
-    lighting_spec = Lighting.model_validate_json(lighting.read_text())
+    data = json.loads(lighting.read_text())
+    animated = AnimatedLighting.model_validate(data) if "frames" in data else None
+    lighting_spec = animated.frames[min(animated.frames)] if animated is not None else Lighting.model_validate(data)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     if occlusion is None and (input_dir / "occlusion.npz").exists():
@@ -140,6 +148,10 @@ def apply(
                 # EXRs whose channels are all identical, as in gray scenes, are collapsed when loaded
                 radiance = np.repeat(radiance, c, axis=-1)
             emitted = np.asarray(ds_emission[i][0], dtype=float) if ds_emission is not None else None
+            frame_lighting = lighting_spec
+            if animated is not None:
+                # Frames are saved by their number, e.g. as frames/0000/255.exr, or else follow the lighting's first
+                frame_lighting = animated.at(int(path.stem) if path.stem.isdigit() else min(animated.frames) + i)
 
             result = apply_medium(
                 radiance,
@@ -147,7 +159,7 @@ def apply(
                 transform,
                 transform["transform_matrix"],
                 medium_spec,
-                lighting_spec,
+                frame_lighting,
                 wavelengths=wavelengths,
                 time=i / fps if fps else 0.0,
                 occlusion=shadows,
@@ -169,3 +181,5 @@ def apply(
         Metadata.from_dense_transforms(transforms).save(output_dir / name / "transforms.json")
     (output_dir / "medium.json").write_text(medium_spec.model_dump_json(indent=2))
     (output_dir / "lighting.json").write_text(lighting_spec.model_dump_json(indent=2))
+    if animated is not None:
+        (output_dir / "animated-lighting.json").write_text(animated.model_dump_json(indent=2))

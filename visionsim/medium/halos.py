@@ -214,6 +214,7 @@ def lamp_halo(
     maps: ShadowMaps | None = None,
     grid: HaloGrid = HALO_GRID,
     time: float = 0.0,
+    map_tolerance: float = 0.01,
 ) -> LampHalo:
     """Tabulate the light of a lamp scattered more than once by a medium, around the lamp.
 
@@ -226,6 +227,8 @@ def lamp_halo(
             it scatters once, see :func:`lamp_inscatter <visionsim.medium.render.lamp_inscatter>`. Defaults to None.
         grid (HaloGrid, optional): Resolution of the tables. Defaults to :data:`HALO_GRID`.
         time (float, optional): Time in seconds, used by moving media. Defaults to 0.0.
+        map_tolerance (float, optional): Distance within which the lamp casts the shadows of a map rendered at another
+            position. Defaults to 0.01.
 
     Returns:
         LampHalo: Light of the lamp scattered more than once.
@@ -288,6 +291,7 @@ def lamp_halo(
                 time,
                 area_levels=(),
                 maps=maps,
+                map_tolerance=map_tolerance,
             )
             for i in range(0, len(rays), 50000)
         ]
@@ -336,11 +340,13 @@ def _cached_lamp_halo(
     time: float,
     dtype: torch.dtype,
     device: str,
+    map_tolerance: float,
 ) -> LampHalo:
     tensor = torch.tensor(beta, dtype=dtype, device=device)
     # Single precision is enough to look up the maps of lamps
     maps = maps_to(maps, device=device, dtype=torch.float32) if maps is not None else None
-    return lamp_halo(Medium.model_validate_json(medium), lamp, tensor, ground, maps, grid, time)
+    medium_model = Medium.model_validate_json(medium)
+    return lamp_halo(medium_model, lamp, tensor, ground, maps, grid, time, map_tolerance)
 
 
 def cached_lamp_halo(
@@ -351,6 +357,8 @@ def cached_lamp_halo(
     maps: ShadowMaps | None = None,
     grid: HaloGrid = HALO_GRID,
     time: float = 0.0,
+    *,
+    map_tolerance: float = 0.01,
 ) -> LampHalo:
     """Same as :func:`lamp_halo`, cached for the last few lamps and media, as it doesn't depend on the camera and can be
     reused for every frame, unless the medium moves. Maps are keyed by identity, so the same maps should be given for
@@ -366,6 +374,7 @@ def cached_lamp_halo(
         time if moving else 0.0,
         beta.dtype,
         str(beta.device),
+        map_tolerance,
     )
 
 

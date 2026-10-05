@@ -54,6 +54,9 @@ _ORIENTATION_TOLERANCE: float
 _PATCH_SIZE: float
 _NEGLIGIBLE: float
 
+def _lamp_power(lights: dict[str, Any]) -> float:
+    """Total power of the point, spot and area lights of exported lighting, averaged over color channels, in W."""
+
 def _triangles(
     corners: npt.NDArray[np.floating],
 ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], npt.NDArray[np.floating]]:
@@ -993,16 +996,17 @@ class BlenderService(rpyc.Service):
         """Constant radiance that a material emits, or None if it doesn't emit light."""
 
     @require_initialized_service
-    def _emissive_triangles(self) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], list[str]]:
+    def _emissive_triangles(self) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], list[str], list[str]]:
         """World-space corners of the triangles of meshes that emit light, of shape (t, 3, 3), their radiance, of shape
-        (t, 3), and the names of their materials."""
+        (t, 3), the names of their materials, and of the objects they belong to, or that instance them."""
 
     @require_initialized_service
     def _emissive_surfaces(
         self, lamps: int, patches: int, other_power: float = 0.0
-    ) -> tuple[list[dict[str, Any]], list[str]]:
-        """Emissive surfaces of the scene, grouped into lamps, and the names of the materials that emit light, see
-        :meth:`lighting_info <exposed_lighting_info>` and :func:`_emissive_lamps`."""
+    ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+        """Emissive surfaces of the scene, grouped into lamps, the names of the materials that emit light, and of the
+        objects whose surfaces emit it, or that instance them, see :meth:`lighting_info <exposed_lighting_info>` and
+        :func:`_emissive_lamps`."""
 
     @require_initialized_service
     def exposed_lighting_info(self, emissive_lamps: int = ..., emissive_patches: int = ...) -> dict[str, Any]:
@@ -1012,7 +1016,8 @@ class BlenderService(rpyc.Service):
         volume factor and common node trees (see :meth:`_light_emission`), as well as the average radiance of the world
         background above the horizon, i.e. the sky (either a constant color or an environment texture). Other world
         shaders, square spots, and the elliptical cones of spots scaled unevenly are not supported, and approximated
-        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
+        with a warning. Lighting is captured at the current frame, see :meth:`save_lighting <exposed_save_lighting>`
+        for lighting that changes over frames, and :mod:`visionsim.medium` for its usage.
 
         Meshes that emit light, through an Emission shader or the emission of a Principled BSDF, possibly mixed or added
         with other shaders, are included as emissive surfaces. Their radiance is the emission's strength times its
@@ -1032,15 +1037,50 @@ class BlenderService(rpyc.Service):
         """
 
     @require_initialized_service
-    def _lighting(self, emissive_lamps: int, emissive_patches: int) -> tuple[dict[str, Any], list[str]]:
-        """Lighting of the scene, see :meth:`lighting_info <exposed_lighting_info>`, and the names of the materials that
-        emit light."""
+    def _lighting(
+        self, emissive_lamps: int, emissive_patches: int, warn: bool = True
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Lighting of the scene at the current frame, see :meth:`lighting_info <exposed_lighting_info>`, and the names
+        of the materials that emit light."""
+
+    @require_initialized_service
+    def _animated_lighting(
+        self, frames: Iterable[int], emissive_lamps: int, emissive_patches: int
+    ) -> tuple[dict[int, dict[str, Any]], list[str]]:
+        """Lighting of the scene at the frames, among the given ones, at which it changes, and the names of the materials
+        that emit light at any of them, see :meth:`save_lighting <exposed_save_lighting>`.
+
+        Lights are exported at every frame, but emissive surfaces only again when the power of the other lamps changes,
+        unless any of the objects that emit light, their parents or their materials are animated, in which case they are
+        exported at every frame too. The current frame is restored afterwards.
+        """
+
+    @staticmethod
+    def _animated(objects: Collection[str], materials: Collection[str]) -> bool:
+        """Whether any of these objects, or their parents, or these materials may change over time, as they are
+        animated, driven, constrained or deformed."""
+
+    @require_initialized_service
+    def _lights(self, warn: bool = True) -> dict[str, Any]:
+        """Sun, point, spot and area lights of the scene, and its sky, at the current frame, see :meth:`lighting_info
+        <exposed_lighting_info>`, warning about lights that are animated if ``warn``."""
 
     @require_initialized_service
     def exposed_save_lighting(
-        self, path: str | os.PathLike | None = None, emissive_lamps: int = ..., emissive_patches: int = ...
+        self,
+        path: str | os.PathLike | None = None,
+        emissive_lamps: int = ...,
+        emissive_patches: int = ...,
+        frames: Iterable[int] | None = None,
     ) -> None:
         """Save the lighting of the scene, as returned by :meth:`lighting_info <exposed_lighting_info>`, to a JSON file.
+
+        Given frames, such as those that are rendered, the lighting of the first of them is saved, and if the lighting
+        changes over them, e.g. as lights move or their power changes, so is the lighting of each frame at which it
+        changes, to ``animated-<name>`` next to the file, see :class:`AnimatedLighting
+        <visionsim.medium.model.AnimatedLighting>`. Emissive surfaces are exported again at every frame only if any of
+        the objects that emit light, their parents or their materials are animated, and their meshes are assumed not
+        to deform otherwise.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
@@ -1050,6 +1090,8 @@ class BlenderService(rpyc.Service):
                 :data:`EMISSIVE_LAMPS`.
             emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
                 Defaults to :data:`EMISSIVE_PATCHES`.
+            frames (Iterable[int] | None, optional): Frames whose lighting is saved. Defaults to None, i.e. only the
+                current frame's.
         """
 
     @contextmanager
@@ -1076,6 +1118,8 @@ class BlenderService(rpyc.Service):
         lamp_resolution: int = 1024,
         emissive_lamps: int = ...,
         emissive_patches: int = ...,
+        frames: Iterable[int] | None = None,
+        lamp_spacing: float = 0.1,
     ) -> None:
         """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
 
@@ -1083,10 +1127,13 @@ class BlenderService(rpyc.Service):
         sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
         split into equal ranges of azimuth. Maps span the box that contains these objects. The distance to the first
         object in every direction around each lamp (point, spot and area lights, and groups of emissive surfaces, see
-        :meth:`lighting_info <exposed_lighting_info>`) is also rendered, in equirectangular maps, through which emissive
-        surfaces are seen as if they were transparent, as they don't hide their own light. All maps are saved to a
-        ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current
-        frame, so objects should be static. Render settings, the camera and the compositor are restored afterwards.
+        :meth:`lighting_info <exposed_lighting_info>`) is also rendered, in equirectangular maps, those of emissive
+        surfaces seeing through them as if they were transparent, as they don't hide their own light. All maps are saved
+        to a ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. Maps are captured at the
+        current frame, or given frames, at the first of them, but for lamps that move over them, whose maps are rendered
+        at the frames from which they move further than ``lamp_spacing`` from where their maps were rendered, as
+        lighting is saved by :meth:`save_lighting <exposed_save_lighting>`. Objects should be static otherwise. Render
+        settings, the camera, the current frame and the compositor are restored afterwards.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
@@ -1107,6 +1154,10 @@ class BlenderService(rpyc.Service):
                 should match that of :meth:`save_lighting <exposed_save_lighting>`. Defaults to :data:`EMISSIVE_LAMPS`.
             emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
                 Defaults to :data:`EMISSIVE_PATCHES`.
+            frames (Iterable[int] | None, optional): Frames over which lamps can move, see :meth:`save_lighting
+                <exposed_save_lighting>`. Defaults to None, i.e. only the current frame.
+            lamp_spacing (float, optional): Distance, in meters, from which a moving lamp gets a new map, rather than
+                casting the shadows of the nearest one. Defaults to 0.1.
 
         Raises:
             ValueError: raised if the number of bands of the sky and of their edges do not match.
@@ -1894,7 +1945,8 @@ class BlenderClient:
         volume factor and common node trees (see :meth:`_light_emission`), as well as the average radiance of the world
         background above the horizon, i.e. the sky (either a constant color or an environment texture). Other world
         shaders, square spots, and the elliptical cones of spots scaled unevenly are not supported, and approximated
-        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
+        with a warning. Lighting is captured at the current frame, see :meth:`save_lighting <exposed_save_lighting>`
+        for lighting that changes over frames, and :mod:`visionsim.medium` for its usage.
 
         Meshes that emit light, through an Emission shader or the emission of a Principled BSDF, possibly mixed or added
         with other shaders, are included as emissive surfaces. Their radiance is the emission's strength times its
@@ -1915,9 +1967,20 @@ class BlenderClient:
 
     @type_check_only
     def save_lighting(
-        self, path: str | os.PathLike | None = None, emissive_lamps: int = ..., emissive_patches: int = ...
+        self,
+        path: str | os.PathLike | None = None,
+        emissive_lamps: int = ...,
+        emissive_patches: int = ...,
+        frames: Iterable[int] | None = None,
     ) -> None:
         """Save the lighting of the scene, as returned by :meth:`lighting_info <exposed_lighting_info>`, to a JSON file.
+
+        Given frames, such as those that are rendered, the lighting of the first of them is saved, and if the lighting
+        changes over them, e.g. as lights move or their power changes, so is the lighting of each frame at which it
+        changes, to ``animated-<name>`` next to the file, see :class:`AnimatedLighting
+        <visionsim.medium.model.AnimatedLighting>`. Emissive surfaces are exported again at every frame only if any of
+        the objects that emit light, their parents or their materials are animated, and their meshes are assumed not
+        to deform otherwise.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
@@ -1927,6 +1990,8 @@ class BlenderClient:
                 :data:`EMISSIVE_LAMPS`.
             emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
                 Defaults to :data:`EMISSIVE_PATCHES`.
+            frames (Iterable[int] | None, optional): Frames whose lighting is saved. Defaults to None, i.e. only the
+                current frame's.
         """
 
     @type_check_only
@@ -1941,6 +2006,8 @@ class BlenderClient:
         lamp_resolution: int = 1024,
         emissive_lamps: int = ...,
         emissive_patches: int = ...,
+        frames: Iterable[int] | None = None,
+        lamp_spacing: float = 0.1,
     ) -> None:
         """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
 
@@ -1948,10 +2015,13 @@ class BlenderClient:
         sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
         split into equal ranges of azimuth. Maps span the box that contains these objects. The distance to the first
         object in every direction around each lamp (point, spot and area lights, and groups of emissive surfaces, see
-        :meth:`lighting_info <exposed_lighting_info>`) is also rendered, in equirectangular maps, through which emissive
-        surfaces are seen as if they were transparent, as they don't hide their own light. All maps are saved to a
-        ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current
-        frame, so objects should be static. Render settings, the camera and the compositor are restored afterwards.
+        :meth:`lighting_info <exposed_lighting_info>`) is also rendered, in equirectangular maps, those of emissive
+        surfaces seeing through them as if they were transparent, as they don't hide their own light. All maps are saved
+        to a ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. Maps are captured at the
+        current frame, or given frames, at the first of them, but for lamps that move over them, whose maps are rendered
+        at the frames from which they move further than ``lamp_spacing`` from where their maps were rendered, as
+        lighting is saved by :meth:`save_lighting <exposed_save_lighting>`. Objects should be static otherwise. Render
+        settings, the camera, the current frame and the compositor are restored afterwards.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
@@ -1972,6 +2042,10 @@ class BlenderClient:
                 should match that of :meth:`save_lighting <exposed_save_lighting>`. Defaults to :data:`EMISSIVE_LAMPS`.
             emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
                 Defaults to :data:`EMISSIVE_PATCHES`.
+            frames (Iterable[int] | None, optional): Frames over which lamps can move, see :meth:`save_lighting
+                <exposed_save_lighting>`. Defaults to None, i.e. only the current frame.
+            lamp_spacing (float, optional): Distance, in meters, from which a moving lamp gets a new map, rather than
+                casting the shadows of the nearest one. Defaults to 0.1.
 
         Raises:
             ValueError: raised if the number of bands of the sky and of their edges do not match.
@@ -2832,7 +2906,8 @@ class BlenderClients(tuple):
         volume factor and common node trees (see :meth:`_light_emission`), as well as the average radiance of the world
         background above the horizon, i.e. the sky (either a constant color or an environment texture). Other world
         shaders, square spots, and the elliptical cones of spots scaled unevenly are not supported, and approximated
-        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
+        with a warning. Lighting is captured at the current frame, see :meth:`save_lighting <exposed_save_lighting>`
+        for lighting that changes over frames, and :mod:`visionsim.medium` for its usage.
 
         Meshes that emit light, through an Emission shader or the emission of a Principled BSDF, possibly mixed or added
         with other shaders, are included as emissive surfaces. Their radiance is the emission's strength times its
@@ -2853,9 +2928,20 @@ class BlenderClients(tuple):
 
     @type_check_only
     def save_lighting(
-        self, path: str | os.PathLike | None = None, emissive_lamps: int = ..., emissive_patches: int = ...
+        self,
+        path: str | os.PathLike | None = None,
+        emissive_lamps: int = ...,
+        emissive_patches: int = ...,
+        frames: Iterable[int] | None = None,
     ) -> None:
         """Save the lighting of the scene, as returned by :meth:`lighting_info <exposed_lighting_info>`, to a JSON file.
+
+        Given frames, such as those that are rendered, the lighting of the first of them is saved, and if the lighting
+        changes over them, e.g. as lights move or their power changes, so is the lighting of each frame at which it
+        changes, to ``animated-<name>`` next to the file, see :class:`AnimatedLighting
+        <visionsim.medium.model.AnimatedLighting>`. Emissive surfaces are exported again at every frame only if any of
+        the objects that emit light, their parents or their materials are animated, and their meshes are assumed not
+        to deform otherwise.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
@@ -2865,6 +2951,8 @@ class BlenderClients(tuple):
                 :data:`EMISSIVE_LAMPS`.
             emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
                 Defaults to :data:`EMISSIVE_PATCHES`.
+            frames (Iterable[int] | None, optional): Frames whose lighting is saved. Defaults to None, i.e. only the
+                current frame's.
         """
 
     @type_check_only
@@ -2879,6 +2967,8 @@ class BlenderClients(tuple):
         lamp_resolution: int = 1024,
         emissive_lamps: int = ...,
         emissive_patches: int = ...,
+        frames: Iterable[int] | None = None,
+        lamp_spacing: float = 0.1,
     ) -> None:
         """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
 
@@ -2886,10 +2976,13 @@ class BlenderClients(tuple):
         sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
         split into equal ranges of azimuth. Maps span the box that contains these objects. The distance to the first
         object in every direction around each lamp (point, spot and area lights, and groups of emissive surfaces, see
-        :meth:`lighting_info <exposed_lighting_info>`) is also rendered, in equirectangular maps, through which emissive
-        surfaces are seen as if they were transparent, as they don't hide their own light. All maps are saved to a
-        ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current
-        frame, so objects should be static. Render settings, the camera and the compositor are restored afterwards.
+        :meth:`lighting_info <exposed_lighting_info>`) is also rendered, in equirectangular maps, those of emissive
+        surfaces seeing through them as if they were transparent, as they don't hide their own light. All maps are saved
+        to a ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. Maps are captured at the
+        current frame, or given frames, at the first of them, but for lamps that move over them, whose maps are rendered
+        at the frames from which they move further than ``lamp_spacing`` from where their maps were rendered, as
+        lighting is saved by :meth:`save_lighting <exposed_save_lighting>`. Objects should be static otherwise. Render
+        settings, the camera, the current frame and the compositor are restored afterwards.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
@@ -2910,6 +3003,10 @@ class BlenderClients(tuple):
                 should match that of :meth:`save_lighting <exposed_save_lighting>`. Defaults to :data:`EMISSIVE_LAMPS`.
             emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
                 Defaults to :data:`EMISSIVE_PATCHES`.
+            frames (Iterable[int] | None, optional): Frames over which lamps can move, see :meth:`save_lighting
+                <exposed_save_lighting>`. Defaults to None, i.e. only the current frame.
+            lamp_spacing (float, optional): Distance, in meters, from which a moving lamp gets a new map, rather than
+                casting the shadows of the nearest one. Defaults to 0.1.
 
         Raises:
             ValueError: raised if the number of bands of the sky and of their edges do not match.

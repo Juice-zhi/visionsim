@@ -171,6 +171,9 @@ class LightingConfig:
     """Maximum number of lamps into which emissive surfaces are grouped, which each cast shadows from a single position"""
     emissive_patches: int = 32
     """Number of patches into which emissive surfaces are split, in total"""
+    animated: bool = True
+    """If true, also save the lighting of each rendered frame at which it changes, e.g. as lights move, and the shadow
+    maps of moving lamps at their positions, otherwise only that of the first frame"""
 
 
 @dataclass
@@ -185,6 +188,8 @@ class OcclusionConfig:
     """Number of texels along the longest side of the shadow maps of the sky"""
     lamp_resolution: int = 1024
     """Number of texels along the width of the maps of lamps, which span all directions around them"""
+    lamp_spacing: float = 0.1
+    """Distance, in meters, from which a moving lamp gets a new map, rather than casting the shadows of the nearest one"""
 
 
 @dataclass
@@ -242,7 +247,8 @@ class RenderConfig:
     emission: EmissionConfig = field(default_factory=EmissionConfig)
     """Emitted light configuration options"""
     include_lighting: bool = False
-    """If true, save the scene's lighting to ``lighting.json``, as needed to add participating media with ``medium.apply``"""
+    """If true, save the scene's lighting to ``lighting.json``, as needed to add participating media with ``medium.apply``,
+    and if it changes over the rendered frames, that of each frame at which it does to ``animated-lighting.json``"""
     lighting: LightingConfig = field(default_factory=LightingConfig)
     """Lighting configuration options, which shadow maps also follow"""
     include_occlusion: bool = False

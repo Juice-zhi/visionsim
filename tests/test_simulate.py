@@ -12,7 +12,7 @@ import torch
 from peewee import SqliteDatabase
 
 from visionsim.dataset import Dataset, Metadata
-from visionsim.medium import Lighting
+from visionsim.medium import AnimatedLighting, Lighting
 from visionsim.medium.occlusion import lamp_shadow, lamp_visibility, load_occlusion, visibility
 from visionsim.simulate.blender import INDEX_PADDING, ITEMS_PER_SUBFOLDER, BlenderClients
 from visionsim.simulate.schema import _MODELS, _Data
@@ -210,7 +210,7 @@ def test_save_occlusion(executable, tmp_path):
 
     # The scene's point light has a map too, behind the cube from which points are in its shadow, unlike points
     # in front of the light or beside the cube
-    lamp, ball = occlusion.lamp_maps.origins
+    (lamp,), (ball,) = occlusion.lamp_maps.origins, occlusion.emissive_maps.origins
     assert tuple(occlusion.lamp_maps.shapes[0].tolist()) == (128, 256)
     away = (center - lamp) / (center - lamp).norm()
     side = torch.linalg.cross(away, torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64))
@@ -236,7 +236,24 @@ def test_save_occlusion(executable, tmp_path):
     assert (ball - torch.tensor([0.0, 0.0, 4.0], dtype=torch.float64)).norm().item() < 0.01
     through = ball + torch.tensor([3.0, 0.0, 0.0], dtype=torch.float64)
     under = ball + 2 * (center - ball)
-    assert lamp_visibility(occlusion.lamp_maps, 1, torch.stack([through, under])).tolist() == [1.0, 0.0]
+    assert lamp_visibility(occlusion.emissive_maps, 0, torch.stack([through, under])).tolist() == [1.0, 0.0]
+
+
+def test_animated_lighting(executable, tmp_path):
+    # A point light rises and brightens over frames, which are all saved as they all change, and gets maps along its way,
+    # wherever it moved further than the spacing from where its maps were rendered
+    _run_blender_script(executable, "animated.py", tmp_path)
+    animated = AnimatedLighting.model_validate_json((tmp_path / "animated-lighting.json").read_text())
+    assert sorted(animated.frames) == [1, 2, 3, 4, 5]
+    assert Lighting.model_validate_json((tmp_path / "lighting.json").read_text()) == animated.frames[1]
+    heights = [animated.frames[frame].points[0].position[2] for frame in range(1, 6)]
+    powers = [animated.frames[frame].points[0].power[0] for frame in range(1, 6)]
+    assert np.allclose(np.diff(heights), 0.5)
+    assert np.allclose(np.asarray(powers) / powers[0], [1, 2.5, 4, 4, 4])
+
+    occlusion = load_occlusion(tmp_path / "occlusion.npz", dtype=torch.float64)
+    assert occlusion.lamp_tolerance == 0.75 and occlusion.emissive_maps is not None
+    assert np.allclose(occlusion.lamp_maps.origins[:, 2].numpy() - heights[0], [0, 1, 2])
 
 
 def test_lighting_info(executable, tmp_path):

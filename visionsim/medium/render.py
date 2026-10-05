@@ -148,6 +148,7 @@ def lamp_inscatter(
     time: float = 0.0,
     area_levels: tuple[AreaLevel, ...] = AREA_LEVELS,
     maps: ShadowMaps | None = None,
+    map_tolerance: float = 0.01,
 ) -> torch.Tensor:
     """Light of a lamp scattered once towards the camera along rays, before it is scaled by the medium's albedo.
 
@@ -170,6 +171,9 @@ def lamp_inscatter(
         maps (ShadowMaps | None, optional): Maps of lamps, see :attr:`Occlusion.lamp_maps
             <visionsim.medium.occlusion.Occlusion.lamp_maps>`, among which the lamp's map is found by its position.
             Defaults to None, i.e. the lamp's light is not occluded.
+        map_tolerance (float, optional): Distance, in meters, within which the lamp casts the shadows of a map rendered
+            at another position, see :attr:`Occlusion.lamp_tolerance
+            <visionsim.medium.occlusion.Occlusion.lamp_tolerance>`. Defaults to 0.01.
 
     Returns:
         torch.Tensor: Radiance scattered towards the camera, for an albedo of one, of shape (r, c).
@@ -179,7 +183,7 @@ def lamp_inscatter(
     # Maps of area lights are rendered just in front of them
     center = torch.as_tensor(lamp.position, **kwargs)
     shifted = center + 1e-3 * torch.as_tensor(lamp.direction, **kwargs) if isinstance(lamp, AreaLight) else center
-    index = lamp_map_index(maps, shifted)
+    index = lamp_map_index(maps, shifted, map_tolerance)
 
     def take(origin: torch.Tensor, rays: torch.Tensor | slice) -> torch.Tensor:
         # Origins are either shared by all rays, or one per ray, which follow the rays
@@ -506,18 +510,22 @@ def apply_medium(
             inscatter = inscatter + shaded.reshape(*distance.shape, -1)
 
     # Lamps and emissive surfaces shine as in Cycles, see `visionsim.medium.lights`, and objects cast their shadows
-    lamp_maps = None
-    if occlusion is not None and occlusion.lamp_maps is not None:
-        # Single precision is enough to look up the maps of lamps, and faster
-        lamp_maps = maps_to(occlusion.lamp_maps, device=device, dtype=torch.float32)
+    # Single precision is enough to look up the maps of lamps, and faster. Those of emissive surfaces see through them
+    tolerance = occlusion.lamp_tolerance if occlusion is not None else 0.01
+    stored = (
+        {False: None, True: None} if occlusion is None else {False: occlusion.lamp_maps, True: occlusion.emissive_maps}
+    )
+    single = {k: maps_to(m, device=device, dtype=torch.float32) if m is not None else None for k, m in stored.items()}
     rays, lengths = directions.reshape(-1, 3), distance.reshape(-1)
     for lamp in lighting.lamps:
-        light = lamp_inscatter(medium, origin, rays, lengths, beta, lamp, time, maps=lamp_maps)
+        emissive = isinstance(lamp, EmissiveSurface)
+        maps = single[emissive]
+        light = lamp_inscatter(medium, origin, rays, lengths, beta, lamp, time, maps=maps, map_tolerance=tolerance)
         inscatter = inscatter + medium.albedo * light.reshape(*distance.shape, n)
         # In dense media, light scattered more than once spreads a halo around lamps, see `visionsim.medium.halos`
         if medium.multiple_scattering and halo_threshold(medium, lamp, beta):
-            maps = occlusion.lamp_maps if occlusion is not None else None
-            halo = cached_lamp_halo(medium, lamp, beta, lighting.ground_height, maps, time=time)
+            ground, kept = lighting.ground_height, stored[emissive]
+            halo = cached_lamp_halo(medium, lamp, beta, ground, kept, time=time, map_tolerance=tolerance)
             halo_light = halo_inscatter(halo, medium, origin, rays, lengths, beta, time=time)
             inscatter = inscatter + halo_light.reshape(*distance.shape, n)
 

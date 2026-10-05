@@ -196,6 +196,11 @@ _NEGLIGIBLE = 0.01
 and still be left out"""
 
 
+def _lamp_power(lights: dict[str, Any]) -> float:
+    """Total power of the point, spot and area lights of exported lighting, averaged over color channels, in W."""
+    return sum(float(np.mean(lamp["power"])) for kind in ("points", "spots", "areas") for lamp in lights[kind])
+
+
 def _triangles(
     corners: npt.NDArray[np.floating],
 ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], npt.NDArray[np.floating]]:
@@ -2384,13 +2389,16 @@ class BlenderService(rpyc.Service):
         return emission if (emission > 0).any() else None
 
     @require_initialized_service
-    def _emissive_triangles(self) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], list[str]]:
+    def _emissive_triangles(
+        self,
+    ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating], list[str], list[str]]:
         """World-space corners of the triangles of meshes that emit light, of shape (t, 3, 3), their radiance, of shape
-        (t, 3), and the names of their materials."""
+        (t, 3), the names of their materials, and of the objects they belong to, or that instance them."""
         depsgraph = bpy.context.evaluated_depsgraph_get()
         emissions: dict[str, npt.NDArray[np.floating] | None] = {}
         corners: list[npt.NDArray[np.floating]] = []
         radiance: list[npt.NDArray[np.floating]] = []
+        owners: set[str] = set()
         for instance in depsgraph.object_instances:
             obj = instance.object
             owner = instance.parent.original if instance.is_instance and instance.parent else obj.original
@@ -2426,22 +2434,24 @@ class BlenderService(rpyc.Service):
                 if emission is not None and selected.any():
                     corners.append(vertices[triangles[selected]])
                     radiance.append(np.broadcast_to(emission, (int(selected.sum()), 3)))
+                    owners.update((owner.name, obj.original.name))
         names = sorted(name for name, emission in emissions.items() if emission is not None)
         if not corners:
-            return np.zeros((0, 3, 3)), np.zeros((0, 3)), names
-        return np.concatenate(corners), np.concatenate(radiance), names
+            return np.zeros((0, 3, 3)), np.zeros((0, 3)), names, sorted(owners)
+        return np.concatenate(corners), np.concatenate(radiance), names, sorted(owners)
 
     @require_initialized_service
     def _emissive_surfaces(
         self, lamps: int, patches: int, other_power: float = 0.0
-    ) -> tuple[list[dict[str, Any]], list[str]]:
-        """Emissive surfaces of the scene, grouped into lamps, and the names of the materials that emit light, see
-        :meth:`lighting_info <exposed_lighting_info>` and :func:`_emissive_lamps`."""
+    ) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+        """Emissive surfaces of the scene, grouped into lamps, the names of the materials that emit light, and of the
+        objects whose surfaces emit it, or that instance them, see :meth:`lighting_info <exposed_lighting_info>` and
+        :func:`_emissive_lamps`."""
         from mathutils.bvhtree import BVHTree  # type: ignore
 
-        corners, radiance, names = self._emissive_triangles()
+        corners, radiance, names, owners = self._emissive_triangles()
         if not len(corners):
-            return [], names
+            return [], names, owners
         # Light that a triangle emits towards another one doesn't leave the surfaces
         count = len(corners)
         tree = BVHTree.FromPolygons(
@@ -2455,7 +2465,7 @@ class BlenderService(rpyc.Service):
                 count=len(origins),
             )
 
-        return _emissive_lamps(corners, radiance, trace, lamps, patches, other_power=other_power), names
+        return _emissive_lamps(corners, radiance, trace, lamps, patches, other_power=other_power), names, owners
 
     @require_initialized_service
     def exposed_lighting_info(
@@ -2467,7 +2477,8 @@ class BlenderService(rpyc.Service):
         volume factor and common node trees (see :meth:`_light_emission`), as well as the average radiance of the world
         background above the horizon, i.e. the sky (either a constant color or an environment texture). Other world
         shaders, square spots, and the elliptical cones of spots scaled unevenly are not supported, and approximated
-        with a warning. Lighting is captured at the current frame, see :mod:`visionsim.medium` for its usage.
+        with a warning. Lighting is captured at the current frame, see :meth:`save_lighting <exposed_save_lighting>`
+        for lighting that changes over frames, and :mod:`visionsim.medium` for its usage.
 
         Meshes that emit light, through an Emission shader or the emission of a Principled BSDF, possibly mixed or added
         with other shaders, are included as emissive surfaces. Their radiance is the emission's strength times its
@@ -2488,9 +2499,86 @@ class BlenderService(rpyc.Service):
         return self._lighting(emissive_lamps, emissive_patches)[0]
 
     @require_initialized_service
-    def _lighting(self, emissive_lamps: int, emissive_patches: int) -> tuple[dict[str, Any], list[str]]:
-        """Lighting of the scene, see :meth:`lighting_info <exposed_lighting_info>`, and the names of the materials that
-        emit light."""
+    def _lighting(
+        self, emissive_lamps: int, emissive_patches: int, warn: bool = True
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Lighting of the scene at the current frame, see :meth:`lighting_info <exposed_lighting_info>`, and the names
+        of the materials that emit light."""
+        lights = self._lights(warn)
+        # Emissive surfaces too faint next to the other lamps are left out
+        emissive, materials, _ = self._emissive_surfaces(emissive_lamps, emissive_patches, _lamp_power(lights))
+        return lights | {"emissive": emissive}, materials
+
+    @require_initialized_service
+    def _animated_lighting(
+        self, frames: Iterable[int], emissive_lamps: int, emissive_patches: int
+    ) -> tuple[dict[int, dict[str, Any]], list[str]]:
+        """Lighting of the scene at the frames, among the given ones, at which it changes, and the names of the materials
+        that emit light at any of them, see :meth:`save_lighting <exposed_save_lighting>`.
+
+        Lights are exported at every frame, but emissive surfaces only again when the power of the other lamps changes,
+        unless any of the objects that emit light, their parents or their materials are animated, in which case they are
+        exported at every frame too. The current frame is restored afterwards.
+        """
+        current, frames = self.scene.frame_current, list(frames)
+        changes: dict[int, dict[str, Any]] = {}
+        names: set[str] = set()
+        emissive: list[dict[str, Any]] | None = None
+        previous, animated, power = None, False, None
+        try:
+            for frame in frames:
+                self.scene.frame_set(frame)
+                lights = self._lights(warn=False)
+                if emissive is None or animated or _lamp_power(lights) != power:
+                    power = _lamp_power(lights)
+                    surfaces, materials, owners = self._emissive_surfaces(emissive_lamps, emissive_patches, power)
+                    if emissive is None and owners and self._animated(owners, materials):
+                        self.log.info(f"Emissive surfaces are animated, and exported again at all {len(frames)} frames.")
+                        animated = True
+                    emissive = surfaces
+                    names.update(materials)
+                lighting = lights | {"emissive": emissive}
+                if lighting != previous:
+                    changes[int(frame)] = previous = lighting
+        finally:
+            self.scene.frame_set(current)
+        return changes, sorted(names)
+
+    @staticmethod
+    def _animated(objects: Collection[str], materials: Collection[str]) -> bool:
+        """Whether any of these objects, or their parents, or these materials may change over time, as they are
+        animated, driven, constrained or deformed."""
+        deforming = {"ARMATURE", "CLOTH", "SOFT_BODY", "FLUID", "DYNAMIC_PAINT", "OCEAN", "WAVE", "NODES", "SIMULATION"}
+
+        def moves(obj: bpy.types.Object | None) -> bool:
+            while obj is not None:
+                keys = getattr(obj.data, "shape_keys", None)
+                if obj.animation_data or obj.constraints or (keys is not None and keys.animation_data):
+                    return True
+                if any(modifier.type in deforming for modifier in getattr(obj, "modifiers", [])):
+                    return True
+                obj = obj.parent
+            return False
+
+        if any(moves(bpy.data.objects.get(name)) for name in objects):
+            return True
+        found = (bpy.data.materials.get(name) for name in materials)
+        if any(m.animation_data or (m.node_tree and m.node_tree.animation_data) for m in found if m is not None):
+            return True
+        # Materials that don't emit light yet could start to
+        emitters = ("ShaderNodeEmission", "ShaderNodeBsdfPrincipled")
+        return any(
+            m.users
+            and m.node_tree
+            and m.node_tree.animation_data
+            and any(n.bl_idname in emitters for n in m.node_tree.nodes)
+            for m in bpy.data.materials
+        )
+
+    @require_initialized_service
+    def _lights(self, warn: bool = True) -> dict[str, Any]:
+        """Sun, point, spot and area lights of the scene, and its sky, at the current frame, see :meth:`lighting_info
+        <exposed_lighting_info>`, warning about lights that are animated if ``warn``."""
         suns: list[dict[str, Any]] = []
         points: list[dict[str, Any]] = []
         spots: list[dict[str, Any]] = []
@@ -2500,7 +2588,7 @@ class BlenderService(rpyc.Service):
             if obj.type != "LIGHT" or obj.hide_render:
                 continue
             light = obj.data
-            if obj.animation_data or light.animation_data:
+            if warn and (obj.animation_data or light.animation_data):
                 self.log.warning(f"Light '{obj.name}' is animated, only its state at the current frame is saved.")
 
             scale = light.energy * 2 ** getattr(light, "exposure", 0.0) * getattr(light, "volume_factor", 1.0)
@@ -2552,11 +2640,7 @@ class BlenderService(rpyc.Service):
             else:
                 self.log.warning(f"{light.type.title()} light '{obj.name}' is not supported and will be ignored.")
 
-        # Emissive surfaces too faint next to the other lamps are left out
-        other_power = sum(float(np.mean(lamp["power"])) for lamp in points + spots + areas)
-        emissive, materials = self._emissive_surfaces(emissive_lamps, emissive_patches, other_power)
-        lighting = {"sky": self._world_radiance(), "suns": suns, "points": points, "spots": spots, "areas": areas}
-        return lighting | {"emissive": emissive}, materials
+        return {"sky": self._world_radiance(), "suns": suns, "points": points, "spots": spots, "areas": areas}
 
     @require_initialized_service
     def exposed_save_lighting(
@@ -2564,8 +2648,16 @@ class BlenderService(rpyc.Service):
         path: str | os.PathLike | None = None,
         emissive_lamps: int = EMISSIVE_LAMPS,
         emissive_patches: int = EMISSIVE_PATCHES,
+        frames: Iterable[int] | None = None,
     ) -> None:
         """Save the lighting of the scene, as returned by :meth:`lighting_info <exposed_lighting_info>`, to a JSON file.
+
+        Given frames, such as those that are rendered, the lighting of the first of them is saved, and if the lighting
+        changes over them, e.g. as lights move or their power changes, so is the lighting of each frame at which it
+        changes, to ``animated-<name>`` next to the file, see :class:`AnimatedLighting
+        <visionsim.medium.model.AnimatedLighting>`. Emissive surfaces are exported again at every frame only if any of
+        the objects that emit light, their parents or their materials are animated, and their meshes are assumed not
+        to deform otherwise.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the JSON file. Defaults to ``lighting.json`` in the
@@ -2575,12 +2667,24 @@ class BlenderService(rpyc.Service):
                 :data:`EMISSIVE_LAMPS`.
             emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
                 Defaults to :data:`EMISSIVE_PATCHES`.
+            frames (Iterable[int] | None, optional): Frames whose lighting is saved. Defaults to None, i.e. only the
+                current frame's.
         """
         path = Path(str(path)) if path else self.root_path / "lighting.json"
         path.parent.mkdir(parents=True, exist_ok=True)
+        animated = path.with_name(f"animated-{path.name}")
 
+        frames = [int(frame) for frame in frames] if frames is not None else []
+        changes = self._animated_lighting(frames, emissive_lamps, emissive_patches)[0] if frames else {}
         with open(path, "w") as f:
-            json.dump(self.exposed_lighting_info(emissive_lamps, emissive_patches), f, indent=2)
+            first = changes[min(changes)] if changes else self.exposed_lighting_info(emissive_lamps, emissive_patches)
+            json.dump(first, f, indent=2)
+        if len(changes) > 1:
+            with open(animated, "w") as f:
+                json.dump({"frames": changes}, f, indent=2)
+        elif animated.exists():
+            # Lighting saved before, which changed over other frames
+            animated.unlink()
 
     @contextmanager
     def _transparent(self, names: Collection[str]) -> Iterator[None]:
@@ -2662,6 +2766,8 @@ class BlenderService(rpyc.Service):
         lamp_resolution: int = 1024,
         emissive_lamps: int = EMISSIVE_LAMPS,
         emissive_patches: int = EMISSIVE_PATCHES,
+        frames: Iterable[int] | None = None,
+        lamp_spacing: float = 0.1,
     ) -> None:
         """Render and save shadow maps of the scene, through which its objects cast shadows onto a participating medium.
 
@@ -2669,10 +2775,13 @@ class BlenderService(rpyc.Service):
         sun, and along the central direction of each cell of the sky, which is split into bands of elevation, each
         split into equal ranges of azimuth. Maps span the box that contains these objects. The distance to the first
         object in every direction around each lamp (point, spot and area lights, and groups of emissive surfaces, see
-        :meth:`lighting_info <exposed_lighting_info>`) is also rendered, in equirectangular maps, through which emissive
-        surfaces are seen as if they were transparent, as they don't hide their own light. All maps are saved to a
-        ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. They are captured at the current
-        frame, so objects should be static. Render settings, the camera and the compositor are restored afterwards.
+        :meth:`lighting_info <exposed_lighting_info>`) is also rendered, in equirectangular maps, those of emissive
+        surfaces seeing through them as if they were transparent, as they don't hide their own light. All maps are saved
+        to a ``.npz`` file, see :mod:`visionsim.medium.occlusion` for how they are used. Maps are captured at the
+        current frame, or given frames, at the first of them, but for lamps that move over them, whose maps are rendered
+        at the frames from which they move further than ``lamp_spacing`` from where their maps were rendered, as
+        lighting is saved by :meth:`save_lighting <exposed_save_lighting>`. Objects should be static otherwise. Render
+        settings, the camera, the current frame and the compositor are restored afterwards.
 
         Args:
             path (str | os.PathLike | None, optional): Path of the ``.npz`` file. Defaults to ``occlusion.npz`` in the
@@ -2693,6 +2802,10 @@ class BlenderService(rpyc.Service):
                 should match that of :meth:`save_lighting <exposed_save_lighting>`. Defaults to :data:`EMISSIVE_LAMPS`.
             emissive_patches (int, optional): Number of patches into which emissive surfaces are split, in total.
                 Defaults to :data:`EMISSIVE_PATCHES`.
+            frames (Iterable[int] | None, optional): Frames over which lamps can move, see :meth:`save_lighting
+                <exposed_save_lighting>`. Defaults to None, i.e. only the current frame.
+            lamp_spacing (float, optional): Distance, in meters, from which a moving lamp gets a new map, rather than
+                casting the shadows of the nearest one. Defaults to 0.1.
 
         Raises:
             ValueError: raised if the number of bands of the sky and of their edges do not match.
@@ -2703,17 +2816,41 @@ class BlenderService(rpyc.Service):
         path = Path(str(path)) if path else self.root_path / "occlusion.npz"
         path.parent.mkdir(parents=True, exist_ok=True)
         edges = np.sin(np.radians(np.asarray(sky_elevations, dtype=float)))
-        lighting, emissive_materials = self._lighting(emissive_lamps, emissive_patches)
-        suns = [np.asarray(sun["direction"], dtype=float) for sun in lighting["suns"]]
+        frames = [int(frame) for frame in frames] if frames is not None else []
+        if frames:
+            changes, emissive_materials = self._animated_lighting(frames, emissive_lamps, emissive_patches)
+        else:
+            lighting, emissive_materials = self._lighting(emissive_lamps, emissive_patches)
+            changes = {self.scene.frame_current: lighting}
+        first = min(changes)
+        suns = [np.asarray(sun["direction"], dtype=float) for sun in changes[first]["suns"]]
         suns = [sun / np.linalg.norm(sun) for sun in suns]
-        # Jobs are rendered in order, the last ones seeing through emissive surfaces
-        jobs = [("sun", sun, sun_resolution, False) for sun in suns]
-        jobs += [("sky", direction, sky_resolution, False) for direction in _sky_cell_directions(edges, sky_cells)]
-        # Area lights shine from their surface, from which the map is rendered just in front
-        lamps = [np.asarray(lamp["position"], dtype=float) for lamp in lighting["points"] + lighting["spots"]]
-        lamps += [np.asarray(a["position"]) + 1e-3 * np.asarray(a["direction"]) for a in lighting["areas"]]
-        jobs += [("lamp", position, lamp_resolution, False) for position in lamps]
-        jobs += [("lamp", np.asarray(e["position"], dtype=float), lamp_resolution, True) for e in lighting["emissive"]]
+        if any(len(lit["suns"]) != len(suns) for lit in changes.values()) or any(
+            np.degrees(
+                np.arccos(np.clip(np.dot(sun, np.asarray(s["direction"]) / np.linalg.norm(s["direction"])), -1, 1))
+            )
+            > 0.1
+            for lit in changes.values()
+            for sun, s in zip(suns, lit["suns"])
+        ):
+            self.log.warning("Suns move over the frames, but cast the shadows of the first frame.")
+        # Jobs are rendered in order, at their frame, the last ones seeing through emissive surfaces
+        jobs = [("sun", sun, sun_resolution, first) for sun in suns]
+        jobs += [("sky", d, sky_resolution, first) for d in _sky_cell_directions(edges, sky_cells)]
+        for kind in ("lamp", "emissive"):
+            # Each lamp gets a map wherever it is further than the spacing from where its maps were rendered
+            placed: dict[int, list[npt.NDArray[np.floating]]] = {}
+            for frame, lit in sorted(changes.items()):
+                # Area lights shine from their surface, from which the map is rendered just in front
+                lamps = [np.asarray(lamp["position"], dtype=float) for lamp in lit["points"] + lit["spots"]]
+                lamps += [np.asarray(a["position"]) + 1e-3 * np.asarray(a["direction"]) for a in lit["areas"]]
+                positions = (
+                    lamps if kind == "lamp" else [np.asarray(e["position"], dtype=float) for e in lit["emissive"]]
+                )
+                for k, position in enumerate(positions):
+                    if all(np.linalg.norm(position - other) > lamp_spacing for other in placed.setdefault(k, [])):
+                        placed[k].append(position)
+                        jobs.append((kind, position, lamp_resolution, frame))
 
         casters, bounds = self._shadow_casters(exclude)
         if not casters:
@@ -2722,7 +2859,8 @@ class BlenderService(rpyc.Service):
         center = bounds.mean(axis=0)
         corners = np.asarray(list(itertools.product(*bounds.T)), dtype=float)
         radius = float(np.linalg.norm(corners - center, axis=1).max())
-        maps: dict[str, list] = {"sun": [], "sky": [], "lamp": []}
+        maps: dict[str, list] = {"sun": [], "sky": [], "lamp": [], "emissive": []}
+        current = self.scene.frame_current
 
         # Render depth only, with a single sample at the center of each texel, and save it instead of the frame
         scene, render, cycles = self.scene, self.scene.render, self.scene.cycles
@@ -2787,11 +2925,13 @@ class BlenderService(rpyc.Service):
 
             with tempfile.TemporaryDirectory() as root, ExitStack() as stack:
                 see_through = False
-                for index, (kind, target, resolution, transparent) in enumerate(jobs):
-                    if transparent and not see_through:
+                for index, (kind, target, resolution, frame) in enumerate(jobs):
+                    if frame != scene.frame_current:
+                        scene.frame_set(frame)
+                    if kind == "emissive" and not see_through:
                         stack.enter_context(self._transparent(emissive_materials))
                         see_through = True
-                    if kind == "lamp":
+                    if kind in ("lamp", "emissive"):
                         # Equirectangular camera looking along +X with +Z up, whose texels map to world directions as
                         # those of environment textures do, at the lamp's position, and whose depth is the distance
                         # to the camera, see `visionsim.medium.occlusion.lamp_visibility`
@@ -2830,6 +2970,8 @@ class BlenderService(rpyc.Service):
             camera_data = camera.data
             bpy.data.objects.remove(camera, do_unlink=True)
             bpy.data.cameras.remove(camera_data)
+            if scene.frame_current != current:
+                scene.frame_set(current)
 
         def arrays(kind: str) -> dict[str, npt.NDArray]:
             depths = [depth for depth, *_ in maps[kind]]
@@ -2847,11 +2989,13 @@ class BlenderService(rpyc.Service):
             **arrays("sun"),
             **arrays("sky"),
             **arrays("lamp"),
+            **arrays("emissive"),
             sun_directions=np.asarray(suns if jobs else [], dtype=float).reshape(-1, 3),
             sky_edges=edges,
             sky_counts=np.asarray(sky_cells if jobs else [0] * len(sky_cells), dtype=int),
             bounds=bounds,
-            frame=scene.frame_current,
+            frame=first,
+            lamp_spacing=lamp_spacing,
         )
 
     @require_initialized_service
