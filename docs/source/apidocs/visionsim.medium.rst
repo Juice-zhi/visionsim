@@ -4,6 +4,14 @@ visionsim.medium package
 Submodules
 ----------
 
+visionsim.medium.halos module
+-----------------------------
+
+.. automodule:: visionsim.medium.halos
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 visionsim.medium.lights module
 ------------------------------
 

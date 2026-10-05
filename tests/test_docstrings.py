@@ -10,7 +10,7 @@ from docstring_parser import parse_from_object
 from visionsim.cli import _cli_modules
 from visionsim.dataset import dataset, models
 from visionsim.interpolate import pose
-from visionsim.medium import lights, model, occlusion, optics, raymarch, render, scattering, surfaces, transient
+from visionsim.medium import halos, lights, model, occlusion, optics, raymarch, render, scattering, surfaces, transient
 from visionsim.simulate import blender, config, install, job, schema
 
 
@@ -68,6 +68,7 @@ def test_output_configs(func, conf):
             dataset,
             models,
             pose,
+            halos,
             lights,
             model,
             occlusion,

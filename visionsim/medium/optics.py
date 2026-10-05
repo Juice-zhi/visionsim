@@ -362,7 +362,7 @@ def light_angles(
     """Range of angles at which a light sees the part of each ray it lights, see :func:`point_light_inscatter`.
 
     Args:
-        origin (torch.Tensor): Ray origin, of shape (3,).
+        origin (torch.Tensor): Ray origin, of shape (3,), or one per ray, of shape (..., 3).
         directions (torch.Tensor): Unit ray directions, of shape (..., 3).
         distance (torch.Tensor): Ray lengths in meters, of shape (...), can be infinite.
         position (torch.Tensor): Position of the light, of shape (3,).
@@ -379,8 +379,8 @@ def light_angles(
         LightAngles: Geometry of the rays as seen from the light.
     """
     offset = position - origin
-    along = directions @ offset
-    closest = ((offset * offset).sum() - along * along).clamp_min(0).sqrt().clamp_min(max(radius, 1e-4))
+    along = (directions * offset).sum(dim=-1)
+    closest = ((offset * offset).sum(dim=-1) - along * along).clamp_min(0).sqrt().clamp_min(max(radius, 1e-4))
     start, end = torch.atan2(-along, closest), torch.atan2(distance - along, closest)
     if axis is None:
         return LightAngles(along, closest, start, end, None)
@@ -434,7 +434,7 @@ def point_light_inscatter(
 
     Args:
         medium (Medium): Participating medium.
-        origin (torch.Tensor): Ray origin, of shape (3,).
+        origin (torch.Tensor): Ray origin, of shape (3,), or one per ray, of shape (..., 3).
         directions (torch.Tensor): Unit ray directions, of shape (..., 3).
         distance (torch.Tensor): Ray lengths in meters, of shape (...), can be infinite.
         position (torch.Tensor): Position of the light, of shape (3,).
@@ -475,11 +475,12 @@ def point_light_inscatter(
         bounds = torch.cat([start[..., None], (theta[..., 1:] + theta[..., :-1]) / 2, end[..., None]], dim=-1)
         bounds = (along[..., None] + closest[..., None] * torch.tan(bounds)).clamp_min(0)
         weights = weights * shadow(torch.minimum(bounds, distance[..., None]))
-    points = origin + s[..., None] * directions[..., None, :]
+    starts = origin[..., None, :] if origin.ndim > 1 else origin
+    points = starts + s[..., None] * directions[..., None, :]
     to_light = position - points
     r = to_light.norm(dim=-1).clamp_min(max(radius, 1e-4))
 
-    tau = optical_depth(medium, origin, directions[..., None, :], s, time=time)
+    tau = optical_depth(medium, starts, directions[..., None, :], s, time=time)
     tau = tau + optical_depth(medium, points, to_light / r[..., None], r, time=time)
     # The light is seen at an angle θ past the point of closest approach, i.e. cos(ray, towards light) = -sin(θ)
     phase = henyey_greenstein(-torch.sin(theta), medium.anisotropy)

@@ -27,6 +27,9 @@ def main(args):
     )
     if args.threads:
         service.scene.render.threads_mode, service.scene.render.threads = "FIXED", args.threads
+    if not args.clamp:
+        # Clamping bright samples biases light scattered more than once near lamps, by default that of indirect light
+        service.scene.cycles.sample_clamp_direct = service.scene.cycles.sample_clamp_indirect = 0.0
     service.scene.cycles.use_adaptive_sampling = False
     service.scene.cycles.seed = args.seed
     if args.width or args.height:
@@ -93,6 +96,9 @@ if __name__ == "__main__":
         help="maximum number of volume scattering events, i.e. 0 for single scattering, defaults to the scene's",
     )
     parser.add_argument("--no-volume-passes", dest="volume_passes", action="store_false", help="only save frames")
+    parser.add_argument(
+        "--no-clamp", dest="clamp", action="store_false", help="don't clamp bright samples, which biases indirect light"
+    )
     parser.add_argument(
         "--light-groups", action="store_true", help="also save the light of suns and of the sky, normals and albedo"
     )

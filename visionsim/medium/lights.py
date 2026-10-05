@@ -208,7 +208,7 @@ def closest_distances(
     """Distance between a point and the closest point of each ray, which end after ``distance`` meters.
 
     Args:
-        origin (torch.Tensor): Ray origin, of shape (3,).
+        origin (torch.Tensor): Ray origin, of shape (3,), or one per ray, of shape (..., 3).
         directions (torch.Tensor): Unit ray directions, of shape (..., 3).
         distance (torch.Tensor): Ray lengths in meters, of shape (...), can be infinite.
         position (torch.Tensor): Point, of shape (3,).
@@ -217,7 +217,7 @@ def closest_distances(
         torch.Tensor: Distances, of shape (...).
     """
     offset = position - origin
-    along = torch.minimum((directions @ offset).clamp_min(0), distance)
+    along = torch.minimum((directions * offset).sum(dim=-1).clamp_min(0), distance)
     return (along[..., None] * directions - offset).norm(dim=-1)
 
 

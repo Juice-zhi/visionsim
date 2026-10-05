@@ -8,6 +8,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from visionsim.medium.halos import cached_lamp_halo, halo_inscatter, halo_threshold
 from visionsim.medium.lights import AREA_LEVELS, AreaLevel, Emitter, area_weights, closest_distances, emitters
 from visionsim.medium.model import AreaLight, HeightFog, Lamp, Lighting, Medium, PointLight, SpotLight
 from visionsim.medium.occlusion import (
@@ -148,7 +149,7 @@ def lamp_inscatter(
 
     Args:
         medium (Medium): Participating medium.
-        origin (torch.Tensor): Ray origin, of shape (3,).
+        origin (torch.Tensor): Ray origin, of shape (3,), or one per ray, of shape (r, 3).
         directions (torch.Tensor): Unit ray directions, of shape (r, 3).
         distance (torch.Tensor): Ray lengths in meters, of shape (r,), can be infinite.
         beta (torch.Tensor): Extinction coefficient per channel, of shape (c,).
@@ -170,23 +171,31 @@ def lamp_inscatter(
     shifted = center + 1e-3 * torch.as_tensor(lamp.direction, **kwargs) if isinstance(lamp, AreaLight) else center
     index = lamp_map_index(maps, shifted)
 
-    def scatter(group: list[Emitter], nodes: int, directions: torch.Tensor, distance: torch.Tensor) -> torch.Tensor:
+    def take(origin: torch.Tensor, rays: torch.Tensor | slice) -> torch.Tensor:
+        # Origins are either shared by all rays, or one per ray, which follow the rays
+        return origin[rays] if origin.ndim > 1 else origin
+
+    def scatter(
+        group: list[Emitter], nodes: int, origin: torch.Tensor, directions: torch.Tensor, distance: torch.Tensor
+    ) -> torch.Tensor:
         size = max(1, int(_CHUNK_ELEMENTS // max(nodes * (8 + 2 * n), 12 * _LAMP_SHADOW_SAMPLES * (index is not None))))
         parts = []
         for i in range(0, len(directions), size):
-            rays, lengths = directions[i : i + size], distance[i : i + size]
+            chunk = slice(i, i + size)
+            starts, rays, lengths = take(origin, chunk), directions[chunk], distance[chunk]
             shadow, seen = None, None
             if maps is not None and index is not None:
-                shadow = lamp_shadow(maps, index, origin, rays, lengths, samples=_LAMP_SHADOW_SAMPLES)
+                shadow = lamp_shadow(maps, index, starts, rays, lengths, samples=_LAMP_SHADOW_SAMPLES)
                 # Rays entirely in the lamp's shadow, such as those of other rooms, receive none of its light
                 if not bool(shadow.lit.all()):
                     seen = shadow.lit.nonzero().squeeze(-1)
                     shadow, rays, lengths = shadow.select(seen), rays[seen], lengths[seen]
+                    starts = take(starts, seen)
             total = rays.new_zeros(len(rays), n)
             for emitter in group if len(rays) else []:
                 light = point_light_inscatter(
                     medium,
-                    origin,
+                    starts,
                     rays,
                     lengths,
                     emitter.position,
@@ -219,7 +228,8 @@ def lamp_inscatter(
     if not isinstance(lamp, AreaLight):
         rays = lit.nonzero().squeeze(-1)
         if len(rays):
-            light = scatter(emitters(lamp, n, **kwargs), _POINT_LIGHT_NODES, directions[rays], distance[rays])
+            group = emitters(lamp, n, **kwargs)
+            light = scatter(group, _POINT_LIGHT_NODES, take(origin, rays), directions[rays], distance[rays])
             result = result.index_copy(0, rays, light)
         return result
 
@@ -227,7 +237,8 @@ def lamp_inscatter(
     grids = [(level.samples, level.nodes) for level in area_levels] + [(1, _POINT_LIGHT_NODES)]
     for (samples, nodes), weight in zip(grids, weights):
         if len(rays := ((weight > 0) & lit).nonzero().squeeze(-1)):
-            light = scatter(emitters(lamp, n, samples, **kwargs), nodes, directions[rays], distance[rays])
+            group = emitters(lamp, n, samples, **kwargs)
+            light = scatter(group, nodes, take(origin, rays), directions[rays], distance[rays])
             result = result.index_add(0, rays, weight[rays, None] * light)
     return result
 
@@ -435,11 +446,16 @@ def apply_medium(
     if occlusion is not None and occlusion.lamp_maps is not None:
         # Single precision is enough to look up the maps of lamps, and faster
         lamp_maps = maps_to(occlusion.lamp_maps, device=device, dtype=torch.float32)
+    rays, lengths = directions.reshape(-1, 3), distance.reshape(-1)
     for lamp in lighting.lamps:
-        light = lamp_inscatter(
-            medium, origin, directions.reshape(-1, 3), distance.reshape(-1), beta, lamp, time, maps=lamp_maps
-        )
+        light = lamp_inscatter(medium, origin, rays, lengths, beta, lamp, time, maps=lamp_maps)
         inscatter = inscatter + medium.albedo * light.reshape(*distance.shape, n)
+        # In dense media, light scattered more than once spreads a halo around lamps, see `visionsim.medium.halos`
+        if medium.multiple_scattering and halo_threshold(medium, lamp, beta):
+            maps = occlusion.lamp_maps if occlusion is not None else None
+            halo = cached_lamp_halo(medium, lamp, beta, lighting.ground_height, maps, time=time)
+            halo_light = halo_inscatter(halo, medium, origin, rays, lengths, beta, time=time)
+            inscatter = inscatter + halo_light.reshape(*distance.shape, n)
 
     # Surfaces are lit through the medium, which dims the light they reflect, but not the light they emit
     surfaces, illumination = radiance[..., :n], None

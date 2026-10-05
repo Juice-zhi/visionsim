@@ -386,7 +386,7 @@ def lamp_shadow(
     Args:
         maps (ShadowMaps): Maps of lamps.
         index (int): Index of the lamp's map, whose origin is the lamp's position.
-        origin (torch.Tensor): Ray origin, of shape (3,).
+        origin (torch.Tensor): Ray origin, of shape (3,), or one per ray, of shape (r, 3).
         directions (torch.Tensor): Unit ray directions, of shape (r, 3).
         distance (torch.Tensor): Ray lengths in meters, of shape (r,), can be infinite.
         samples (int, optional): Number of samples of the visibility along each ray. Defaults to 256.
@@ -400,8 +400,9 @@ def lamp_shadow(
     dtype = maps.depths.dtype
     origin, directions, distance = origin.to(dtype), directions.to(dtype), distance.to(dtype)
     offset = maps.origins[index] - origin
-    along = directions @ offset
-    closest = ((offset * offset).sum() - along * along).clamp_min(0).sqrt().clamp_min(1e-4)
+    along = (directions * offset).sum(dim=-1)
+    closest = ((offset * offset).sum(dim=-1) - along * along).clamp_min(0).sqrt().clamp_min(1e-4)
+    origin = origin[:, None, :] if origin.ndim > 1 else origin
     # Angles stay within ±π/2, which single precision would otherwise round beyond for infinite rays
     limit = math.pi / 2 - 1e-6
     start = torch.atan2(-along, closest).clamp(-limit, limit)

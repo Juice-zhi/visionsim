@@ -27,6 +27,17 @@
       blender -b runs/fog-comparison/variants/fog_point_shadow.blend --python export_occlusion.py -- \\
           runs/fog-comparison/point_shadow/occlusion.npz --exclude Plane
 
+- Halos of lamps: all the light of a point lamp scattered by the fog, in the scene without objects and with a black
+  ground (lit by the lamp of the ``point`` variant, with soft falloff, or by a small sphere light), against Cycles'
+  renders with 32 volume bounces without clamping, which otherwise darkens light scattered more than once near the
+  lamp, into ``runs/fog-comparison/point/{empty,sphere}_noclamp_bounces32``, e.g.::
+
+      blender -b runs/fog-comparison/variants/fog_point_empty.blend --python render_passes.py -- \\
+          runs/fog-comparison/point/empty_noclamp_bounces32 --samples 2048 --frame 255 345 --volume-bounces 32 --no-clamp
+
+  where ``fog_point_empty.blend`` is the ``noobjects`` variant lit by the point light (``lamp_scene.py``) whose ground
+  is black, and ``fog_point_sphere.blend`` the same with a sphere light of radius 2 cm without soft falloff.
+
 Results are saved to ``results/validation.json``.
 """
 
@@ -151,6 +162,26 @@ def main():
             np.savez_compressed(ROOT / lamp / "comparison.npz", ours=ours, theirs=theirs, shadowed=shadowed)
         if (ROOT / lamp / "bounces32").exists():
             results[f"{lamp}_vs_32_bounces"] = {"ratio": float(ours.sum() / fog_light(ROOT / lamp / "bounces32").sum())}
+
+    # Halos of a point lamp, in the scene without objects whose ground is black
+    point = Lighting.model_validate_json((ROOT / "point" / "lighting.json").read_text())
+    empty_depth = np.stack([distances(t)[0] for t in transforms])
+    for name, radius in (("empty", point.points[0].radius), ("sphere", 0.02)):
+        reference = ROOT / "point" / f"{name}_noclamp_bounces32"
+        if not (ROOT / "point" / f"{name}_noclamp_bounces32.log").exists():
+            continue
+        lighting = point.model_copy(update={"points": [point.points[0].model_copy(update={"radius": radius})]})
+        theirs = fog_light(reference)
+        entry = {}
+        for label, multiple in (("single", False), ("halos", True)):
+            ours = in_scattering(
+                medium.model_copy(update={"multiple_scattering": multiple}), lighting, empty_depth, transforms
+            )
+            entry[label] = {
+                "ratio": float(ours.sum() / theirs.sum()),
+                "rel_l1_blurred": float(np.abs(blur(ours) - blur(theirs)).sum() / theirs.sum()),
+            }
+        results[f"{name}_lamp_vs_32_bounces_unclamped"] = entry
 
     (ROOT / "results" / "validation.json").write_text(json.dumps(results, indent=1))
     print(json.dumps(results, indent=1))

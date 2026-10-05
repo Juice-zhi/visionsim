@@ -146,6 +146,15 @@ weight of each node of the quadrature is scaled by the visibility averaged betwe
 node, so that the edges of shadows don't spoil the quadrature, see :func:`lamp_shadow
 <visionsim.medium.occlusion.lamp_shadow>`. Area lights cast the shadows of their center.
 
+In dense media, light from lamps scattered more than once spreads a halo around them, much wider than the glow of light
+scattered once. With ``multiple_scattering``, it is computed on a grid of points around each lamp, spread
+logarithmically in distance from it: at each point, the light scattered once is gathered from directions concentrated
+towards the lamp, where most of it comes from, and scattered again with the phase function. As this light mostly keeps
+going away from the lamp, it is tabulated against the angle between the direction it is scattered towards and the
+direction away from the lamp. Higher orders are iterated by integrating each order along the gathering rays, and later
+ones are extrapolated geometrically at each point, see :mod:`visionsim.medium.halos`. The tables don't depend on the
+camera, so they are computed once per lamp and medium, and integrated along camera rays as light scattered once is.
+
 Surfaces are lit through the medium too: their light is attenuated on its way to them, while the medium's glow lights
 them. Given the normals of surfaces (``normals`` of :func:`apply_medium <visionsim.medium.render.apply_medium>`, which
 ``medium.apply`` reads from renders that include them), the radiance of each surface is scaled by the ratio of the
@@ -192,7 +201,12 @@ Cycles' single scattering overall: 0.6% for a point light, 0.1% for a spot light
 a point light whose light is smoothed by a Light Falloff node, with per-pixel differences of 1% to 2% once Cycles' noise
 is blurred out, the largest right next to the lamps. With a point light right behind a cube, which hides it from the
 camera, objects casting its shadows bring the light scattered by the fog within 0.3% of Cycles', with per-pixel
-differences of 0.9% once blurred, against eleven times too much light without shadows.
+differences of 0.9% once blurred, against eleven times too much light without shadows. With multiple scattering, all the
+light of a point lamp scattered by the fog, in the scene without objects and with a black ground, is within 1.4% of
+Cycles' with 32 volume bounces, and within 5% at any distance from the lamp, with per-pixel differences of 2.5% once
+blurred, against 15% too dark with single scattering only. Note that Cycles clamps indirect light by default (Clamp
+Indirect of 10), which darkens light scattered more than once near bright lamps, by 30% for this lamp: references are
+rendered without clamping (``render_passes.py --no-clamp``).
 
 Surfaces lit through the fog (``validate_surfaces.py``) are within 1% of Cycles' overall, both with single and multiple
 scattering, against 13% too bright in the render without fog for single scattering, with per-pixel differences of 3.5%
@@ -215,8 +229,8 @@ The following are not yet modeled:
 - Shadows of moving objects, as shadow maps are rendered once per scene, and the soft shadows of large lamps, which
   cast the hard shadows of their center.
 - Emissive surfaces lighting the medium, IES profiles and other node trees of lamps, square spot lights, and the
-  elliptical cones of spot lights scaled unevenly. Light from lamps is only scattered once, which misses about 30% of
-  their glow in the dense fog of ``examples/medium``.
+  elliptical cones of spot lights scaled unevenly. Light that surfaces lit by lamps reflect into the medium, which, in
+  ``examples/medium``, adds as much again to the light of a lamp scattered twice near the lit ground.
 - Multiple scattering in media other than a single height fog, and skies whose radiance varies with direction.
 - Multiple scattering near objects, which is overestimated, by about 30% to 60% within 5 m of the objects of
   ``examples/medium``: the medium around objects is itself in their shadow, and so darker than the open medium that
