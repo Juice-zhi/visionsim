@@ -1,0 +1,12 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Category": "",
+	"Description": "visionsim's fog scenes, to compare Unreal's volumetric fog with Cycles",
+	"Plugins": [
+		{"Name": "PythonScriptPlugin", "Enabled": true},
+		{"Name": "EditorScriptingUtilities", "Enabled": true},
+		{"Name": "SequencerScripting", "Enabled": true},
+		{"Name": "MovieRenderPipeline", "Enabled": true}
+	]
+}

@@ -1,0 +1,6 @@
+# Scripts of the acceleration study, archived as they were run: lambdas evaluated within their loop, values unpacked
+# for their side effects, and errors deliberately caught by long-running experiments are left as they are.
+extend = "../../../../pyproject.toml"
+
+[lint]
+extend-ignore = ["B023", "BLE001", "F841", "FA102", "PLC0206", "PLC3002", "RUF059", "SIM115", "SIM401"]

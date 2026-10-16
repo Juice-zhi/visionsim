@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fog Control Panel</title>
+  <meta name="description" content="Switch the terms of VisionSIM's closed-form fog on and off, and see its error against Cycles, its time and example images, computed live.">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M3 21h26M5 16h22M8 11h16" /><circle cx="22" cy="7" r="3" /></svg>
+      <div>
+        <h1>Closed-form fog</h1>
+        <p class="sub">Control panel &middot; <span id="library" class="mono">library</span></p>
+      </div>
+    </div>
+    <div class="bar-controls">
+      <div class="field">
+        <span class="field-label" id="scene-label">Scene</span>
+        <div class="segmented" id="scene" role="radiogroup" aria-labelledby="scene-label"></div>
+      </div>
+      <div class="field">
+        <label class="field-label" for="frame">Frame</label>
+        <select id="frame"></select>
+      </div>
+    </div>
+    <div class="bar-status">
+      <div id="busy" class="busy" aria-live="polite"><span class="led"></span><span class="busy-text">Connecting&hellip;</span></div>
+      <button id="theme" class="ghost icon" type="button" title="Theme: follows the system" aria-label="Switch theme">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5" /><path d="M10 3.5a6.5 6.5 0 0 1 0 13z" /></svg>
+      </button>
+    </div>
+  </header>
+
+  <div id="notice" class="notice" hidden></div>
+
+  <main class="layout">
+    <aside class="controls" id="controls" aria-label="Switches and inputs">
+      <section class="panel presets">
+        <h2 class="panel-title">Presets</h2>
+        <div class="preset-row" id="presets"></div>
+      </section>
+      <div id="groups"></div>
+    </aside>
+
+    <section class="stage" aria-label="Images">
+      <div class="viewer-toolbar">
+        <div class="pair">
+          <label class="field-label" for="image-a">A</label>
+          <select id="image-a"></select>
+          <button id="swap" class="ghost icon" type="button" title="Swap A and B" aria-label="Swap A and B">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 7h11l-3-3M16 13H5l3 3" /></svg>
+          </button>
+          <label class="field-label" for="image-b">B</label>
+          <select id="image-b"></select>
+        </div>
+        <div class="pair">
+          <label class="field-label" for="cycles-spp">Cycles</label>
+          <select id="cycles-spp"></select>
+        </div>
+      </div>
+
+      <figure class="viewer" id="viewer">
+        <canvas id="canvas" width="320" height="180" aria-label="A and B images, split by the wipe"></canvas>
+        <div class="wipe" id="wipe-line" aria-hidden="true"><span class="wipe-handle"></span></div>
+        <span class="tag tag-a" id="tag-a">A</span>
+        <span class="tag tag-b" id="tag-b">B</span>
+        <div class="crosshair" id="crosshair" hidden></div>
+        <div class="stale" id="stale" hidden></div>
+        <div class="empty" id="empty" hidden></div>
+      </figure>
+
+      <div class="viewer-controls">
+        <div class="slider">
+          <label class="field-label" for="wipe">Wipe</label>
+          <input type="range" id="wipe" min="0" max="1" step="0.001" value="0.5">
+        </div>
+        <div class="slider">
+          <label class="field-label" for="exposure">Exposure</label>
+          <input type="range" id="exposure" min="-6" max="10" step="0.25" value="0">
+          <output id="exposure-value" class="mono">+0.00 EV</output>
+          <button id="auto-exposure" class="ghost small" type="button">Auto</button>
+        </div>
+        <div class="slider">
+          <label class="field-label" for="error-range">Error range</label>
+          <input type="range" id="error-range" min="0.02" max="1" step="0.01" value="0.25">
+          <output id="error-range-value" class="mono">&plusmn;25%</output>
+          <label class="check"><input type="checkbox" id="error-blur"> blur 5&times;5</label>
+        </div>
+      </div>
+
+      <div class="legend" id="error-legend" hidden>
+        <span>too dark</span>
+        <span class="ramp" id="ramp"></span>
+        <span>too bright</span>
+        <span class="legend-note mono" id="legend-note"></span>
+      </div>
+      <p class="readout mono" id="readout">Move over the image to read pixels; drag to move the wipe.</p>
+
+      <section class="panel ablation" id="ablation-panel">
+        <div class="panel-head">
+          <h2 class="panel-title">What each switch does</h2>
+          <p class="panel-note" id="ablation-note"></p>
+        </div>
+        <div class="table-wrap"><table class="numbers" id="ablation"></table></div>
+      </section>
+    </section>
+
+    <aside class="metrics" id="metrics" aria-label="Numbers">
+      <p class="stale-note" id="metrics-stale" role="status" hidden></p>
+      <section class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">Error against Cycles</h2>
+          <div class="segmented small" id="scope" role="radiogroup" aria-label="Frames measured"></div>
+        </div>
+        <div class="table-wrap"><table class="numbers" id="errors"></table></div>
+        <p class="panel-note" id="errors-note"></p>
+      </section>
+      <section class="panel">
+        <h2 class="panel-title">By region</h2>
+        <div class="table-wrap"><table class="numbers" id="regions"></table></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">Under the cursor</h2>
+          <select id="window" class="small" aria-label="Window around the cursor">
+            <option value="1">1 px</option>
+            <option value="9" selected>9&times;9 px</option>
+            <option value="25">25&times;25 px</option>
+          </select>
+        </div>
+        <table class="numbers" id="cursor"></table>
+        <p class="panel-note">From the float16 images in the browser: closed form against the reference.</p>
+      </section>
+      <section class="panel">
+        <h2 class="panel-title">Time</h2>
+        <dl class="facts" id="timing"></dl>
+      </section>
+      <section class="panel">
+        <h2 class="panel-title">Cycles for the same error</h2>
+        <div id="cycles"></div>
+        <figure class="chart" id="chart"></figure>
+      </section>
+      <section class="panel" id="flicker-panel">
+        <h2 class="panel-title">Flicker</h2>
+        <div id="flicker"></div>
+      </section>
+    </aside>
+  </main>
+
+  <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>
