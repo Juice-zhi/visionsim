@@ -21,6 +21,7 @@ from visionsim.medium import (
     apply_medium,
     camera_rays,
     kim_exponent,
+    mean_albedos,
 )
 from visionsim.medium.optics import (
     component_optical_depth,
@@ -247,6 +248,18 @@ def test_sky_quadrature_matches_brute_force(g):
             assert value == pytest.approx(expected, rel=2e-3, abs=1e-6)
 
 
+@pytest.mark.parametrize("n_azimuth", [24, 7])
+def test_folded_sky_quadrature(n_azimuth):
+    """Nodes at opposite azimuths share their elevation, and merging them integrates functions of it alike."""
+    directions = torch.nn.functional.normalize(T(np.random.default_rng(5).normal(size=(20, 3))), dim=-1)
+    elevations, weights = sky_quadrature(directions, 0.8, 8, n_azimuth)
+    folded, folded_weights = sky_quadrature(directions, 0.8, 8, n_azimuth, folded=True)
+    assert folded.shape == (20, 3 * 8 * math.ceil(n_azimuth / 2))
+    for f in (torch.ones_like, lambda mu: torch.exp(-0.7 / mu.clamp_min(1e-300)) * (mu > 0)):
+        expected = (weights * f(elevations)).sum(dim=-1)
+        assert torch.allclose((folded_weights * f(folded)).sum(dim=-1), expected, rtol=1e-12, atol=1e-15)
+
+
 @pytest.mark.parametrize(
     "medium",
     [
@@ -431,7 +444,8 @@ def test_cli_apply_lights_surfaces_through_the_medium(tmp_path):
     lighting = make_render(tmp_path / "render", n=2)
     rng = np.random.default_rng(4)
     frames = Dataset.from_path(tmp_path / "render" / "frames")
-    for name in ("normals", "emission"):
+    names = ("normals", "emission", "diffuse/color", "diffuse/direct", "diffuse/indirect")
+    for name in names:
         transforms = []
         for i, (_, transform) in enumerate(frames):
             path = Path("0000") / f"{i:03}.exr"
@@ -441,28 +455,60 @@ def test_cli_apply_lights_surfaces_through_the_medium(tmp_path):
         Metadata.from_dense_transforms(transforms).save(tmp_path / "render" / name / "transforms.json")
     medium = Medium(extinction=0.1, components=[HeightFog(falloff=3.0)], sun_attenuation=True)
     (tmp_path / "medium.json").write_text(medium.model_dump_json())
-    apply(tmp_path / "render", tmp_path / "fog", tmp_path / "medium.json", device="cpu")
+    maps = {name: Dataset.from_path(tmp_path / "render" / name) for name in names}
+    depths = Dataset.from_path(tmp_path / "render" / "depths")
 
-    normals, emission = (Dataset.from_path(tmp_path / "render" / name) for name in ("normals", "emission"))
-    for i, (radiance, transform) in enumerate(frames):
-        depth = Dataset.from_path(tmp_path / "render" / "depths")[i][0]
-        # Normals are saved in the camera's space, and emitted light isn't dimmed
-        expected = apply_medium(
-            radiance,
-            depth,
-            transform,
-            transform["transform_matrix"],
-            medium,
-            lighting,
-            normals=normals[i][0],
-            normals_space="camera",
-            emission=emission[i][0],
+    def light(i):
+        # The irradiance that surfaces received, π times the sum of the diffuse light passes
+        return np.pi * (maps["diffuse/direct"][i][0] + maps["diffuse/indirect"][i][0])
+
+    # The diffuse light passes measure the light that surfaces received, or else their albedo, and the lighting is kept
+    for output, options, measured in (
+        ("fog", {}, lambda i: {"irradiance": light(i)}),
+        ("albedo", {"irradiance": ()}, lambda i: {"albedo": maps["diffuse/color"][i][0]}),
+    ):
+        apply(tmp_path / "render", tmp_path / output, tmp_path / "medium.json", device="cpu", **options)
+        assert Lighting.model_validate_json((tmp_path / output / "lighting.json").read_text()) == lighting
+        for i, (radiance, transform) in enumerate(frames):
+            # Normals are saved in the camera's space, and emitted light isn't dimmed
+            expected = apply_medium(
+                radiance,
+                depths[i][0],
+                transform,
+                transform["transform_matrix"],
+                medium,
+                lighting,
+                normals=maps["normals"][i][0],
+                normals_space="camera",
+                emission=maps["emission"][i][0],
+                **measured(i),
+            )
+            saved = Dataset.from_path(tmp_path / output / "frames")[i][0]
+            illumination = Dataset.from_path(tmp_path / output / "illumination")[i][0]
+            assert np.allclose(saved, expected.radiance.numpy(), rtol=1e-6, atol=1e-6)
+            assert np.allclose(illumination, expected.illumination.numpy(), rtol=1e-6)
+            assert not np.allclose(illumination, 1)
+
+    # Asked to, the ground, whose albedo the lighting doesn't give, and objects, of no albedo of their own, reflect light
+    # with the mean albedo of the pixels that see them, weighted by the light that their surfaces received
+    apply(tmp_path / "render", tmp_path / "estimated", tmp_path / "medium.json", device="cpu", estimate_albedos=True)
+    seen = [
+        (
+            maps["diffuse/color"][i][0],
+            depths[i][0],
+            t,
+            t["transform_matrix"],
+            maps["diffuse/color"][i][0] * light(i) / np.pi,
         )
-        saved = Dataset.from_path(tmp_path / "fog" / "frames")[i][0]
-        illumination = Dataset.from_path(tmp_path / "fog" / "illumination")[i][0]
-        assert np.allclose(saved, expected.radiance.numpy(), rtol=1e-6, atol=1e-6)
-        assert np.allclose(illumination, expected.illumination.numpy(), rtol=1e-6)
-        assert not np.allclose(illumination, 1)
+        for i, (_, t) in enumerate(frames)
+    ]
+    ground, objects = mean_albedos(seen)
+    assert ground is not None and objects is not None
+    saved = Lighting.model_validate_json((tmp_path / "estimated" / "lighting.json").read_text())
+    assert saved.ground_albedo == pytest.approx(ground, rel=1e-6) and saved.object_albedo == pytest.approx(
+        objects, rel=1e-6
+    )
+    assert saved.model_copy(update={"ground_albedo": lighting.ground_albedo, "object_albedo": None}) == lighting
 
     # Without normals, or when asked not to, surfaces keep their light
     apply(tmp_path / "render", tmp_path / "plain", tmp_path / "medium.json", device="cpu", surfaces=False)
@@ -508,3 +554,18 @@ def test_cli_apply_gray_frames(tmp_path):
     frame, transform = Dataset.from_path(tmp_path / "fog" / "frames")[0]
     assert frame.shape == (5, 7, 3) and transform["c"] == 3
     assert not np.allclose(frame[..., 0], frame[..., 2])  # extinction depends on wavelength
+
+
+def test_cli_apply_at_a_lower_resolution(tmp_path):
+    """The medium can be added at a lower resolution and upsampled, with the exact transmittance of every pixel."""
+    make_render(tmp_path / "render", n=1)
+    medium = Medium(extinction=0.1, components=[HeightFog(falloff=3.0)], sun_attenuation=True)
+    (tmp_path / "medium.json").write_text(medium.model_dump_json())
+    apply(tmp_path / "render", tmp_path / "full", tmp_path / "medium.json", device="cpu")
+    apply(tmp_path / "render", tmp_path / "half", tmp_path / "medium.json", device="cpu", factor=2)
+    full, half = (
+        {name: Dataset.from_path(tmp_path / output / name)[0][0] for name in ("transmittance", "inscatter")}
+        for output in ("full", "half")
+    )
+    assert np.array_equal(half["transmittance"], full["transmittance"])
+    assert 0 < np.abs(half["inscatter"] - full["inscatter"]).sum() < 0.05 * np.abs(full["inscatter"]).sum()

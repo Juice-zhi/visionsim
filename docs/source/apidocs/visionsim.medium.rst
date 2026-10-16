@@ -52,6 +52,14 @@ visionsim.medium.raymarch module
    :show-inheritance:
    :undoc-members:
 
+visionsim.medium.reflections module
+-----------------------------------
+
+.. automodule:: visionsim.medium.reflections
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
 visionsim.medium.render module
 ------------------------------
 
@@ -80,6 +88,14 @@ visionsim.medium.transient module
 ---------------------------------
 
 .. automodule:: visionsim.medium.transient
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+visionsim.medium.upsampling module
+----------------------------------
+
+.. automodule:: visionsim.medium.upsampling
    :members:
    :show-inheritance:
    :undoc-members:

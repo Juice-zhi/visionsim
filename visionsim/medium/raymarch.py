@@ -20,7 +20,7 @@ from visionsim.medium.model import HeightFog, Lighting, Medium
 from visionsim.medium.optics import density, henyey_greenstein, sky_quadrature
 from visionsim.medium.optics import optical_depth as segment_optical_depth
 from visionsim.medium.render import _SKY_NODES, RGB_WAVELENGTHS, MediumResult, _by_pixels, _per_channel, camera_rays
-from visionsim.medium.scattering import elevation_source
+from visionsim.medium.scattering import azimuthal_sources, elevation_source, relative_azimuths
 
 
 def _sun_transmittance(
@@ -81,7 +81,8 @@ def ray_march_medium(
     form, since marching towards every direction would be prohibitively expensive, light scattered more than once
     is interpolated from the same table, and light from point lights is attenuated in closed form towards them.
     Objects do not cast shadows onto the medium, unlike with the ``occlusion`` of :func:`apply_medium
-    <visionsim.medium.render.apply_medium>`.
+    <visionsim.medium.render.apply_medium>`, and the light of lamps scattered more than once or reflected by surfaces
+    is left out.
 
     Args:
         radiance (npt.ArrayLike | torch.Tensor): Linear radiance of the scene without the medium, of shape (h, w, c).
@@ -132,8 +133,10 @@ def ray_march_medium(
     lit_by_sky = bool((sky != 0).any())
     # When extinction doesn't depend on wavelength, as for fog, light is attenuated the same in every channel
     channels = slice(0, 1) if bool((beta == beta[0]).all()) else slice(None)
-    # Light from the sky, the ground and multiple scattering, which only depends on the rays' elevation
+    # Light from the sky, the ground and multiple scattering, which only depends on the rays' elevation, and for suns'
+    # light scattered more than once, on their azimuth from the sun's
     elevation_light = elevation_source(medium, lighting, beta[channels], n) if medium.sun_attenuation else None
+    azimuthal_light = azimuthal_sources(medium, lighting, beta[channels], n) if medium.sun_attenuation else []
 
     suns = []
     for sun in lighting.suns:
@@ -182,11 +185,15 @@ def ray_march_medium(
                 weight = medium.albedo * emitter.intensity
                 source = source + weight * (phase / (r * r))[..., None] * torch.exp(-depth[..., None] * beta)
 
-            if elevation_light is not None:
+            if elevation_light is not None or azimuthal_light:
                 # Such light only depends on the optical depth of the fog above the sample, i.e. density * falloff
                 fog = medium.components[0]
                 assert isinstance(fog, HeightFog)
-                source = source + elevation_light(elevations, (sigma[..., channels] * fog.falloff)[:, None])[:, 0]
+                above = (sigma[..., channels] * fog.falloff)[:, None]
+                if elevation_light is not None:
+                    source = source + elevation_light(elevations, above)[:, 0]
+                for towards, varying in azimuthal_light:
+                    source = source + varying(elevations, relative_azimuths(directions, towards), above)[:, 0]
 
             step_transmittance = torch.exp(-sigma * step)
             inscatter = inscatter + transmittance * source * (1 - step_transmittance)

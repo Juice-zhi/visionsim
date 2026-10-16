@@ -1,4 +1,6 @@
+import itertools
 import math
+from functools import partial
 
 import numpy as np
 import pytest
@@ -6,7 +8,7 @@ import torch
 from scipy.integrate import quad
 from scipy.special import ellipe
 
-from visionsim.medium import Lighting, Medium, Sun, apply_medium, camera_rays
+from visionsim.medium import Lighting, Medium, Sun, apply_medium, camera_rays, scattering
 from visionsim.medium.lights import AREA_LEVELS, area_radius, area_weights, closest_distances, emitters, spot_falloff
 from visionsim.medium.model import AnimatedLighting, AreaLight, Blob, HeightFog, Homogeneous, PointLight, SpotLight
 from visionsim.medium.optics import (
@@ -19,13 +21,24 @@ from visionsim.medium.optics import (
 )
 from visionsim.medium.render import lamp_inscatter
 from visionsim.medium.scattering import (
+    ElevationTable,
+    _gather_nodes,
+    azimuthal_harmonics,
     azimuthal_phase,
+    cached_camera_tables,
+    cached_multiple_scattering,
+    camera_tables,
     complete_elliptic_e,
+    direct_ground_radiance,
     ground_irradiance,
     ground_source,
+    lookup,
     multiple_scattering,
+    relative_azimuths,
     sky_source,
+    tabulate_along_rays,
 )
+from visionsim.medium.surfaces import cached_surface_tables
 
 
 def T(x):
@@ -56,6 +69,45 @@ def test_azimuthal_phase_matches_quadrature(g):
         cos = a * b + math.sqrt(1 - a * a) * math.sqrt(1 - b * b) * np.cos(phi)
         expected = henyey_greenstein(T(cos), g).mean().item() * 2 * np.pi
         assert azimuthal_phase(T(a), T(b), g).item() == pytest.approx(expected, rel=1e-8)
+
+
+@pytest.mark.parametrize("g", [-0.3, 0.6, 0.9])
+def test_azimuthal_harmonics_match_quadrature(g):
+    a, b = T([0.3, 0.0, -0.7, 0.99, 0.05]), T([0.3, 0.5, 0.2, -0.1, 0.0])
+    harmonics = azimuthal_harmonics(a, b, g, modes=6)
+    assert torch.allclose(harmonics[0], azimuthal_phase(a[:, None], b[None, :], g), rtol=1e-8)
+    phi = (np.arange(200_000) + 0.5) / 200_000 * 2 * np.pi
+    for i, j in [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (0, 3)]:
+        x, y = a[i].item(), b[j].item()
+        phase = henyey_greenstein(T(x * y + math.sqrt(1 - x * x) * math.sqrt(1 - y * y) * np.cos(phi)), g).numpy()
+        for m in range(7):
+            expected = (phase * np.cos(m * phi)).mean() * 2 * np.pi
+            assert harmonics[m, i, j].item() == pytest.approx(expected, rel=1e-6, abs=1e-10)
+
+
+def test_azimuthal_tables_match_exact_integration():
+    # A source that varies with the azimuth of rays and not along them scatters (1 - T) times itself along rays
+    camera, pose = wide_camera()
+    origin, directions, scale = camera_rays(camera, pose)
+    depth = T(np.random.default_rng(8).uniform(0.5, 60, size=(15, 21)))
+    depth[:4] = math.inf
+    distance = torch.where(torch.isinf(depth), depth, depth * scale)
+    fog = FOG.components[0]
+    tau = optical_depth(FOG, origin, directions, distance)[..., None] * FOG.extinction
+    towards = T([0.6, 0.8])
+
+    def source(elevations, azimuths, depth_above):
+        return (2 + torch.cos(azimuths) + elevations**2)[:, None, None].expand(*depth_above.shape[:2], 2)
+
+    depth_above = T([FOG.extinction * fog.density * fog.falloff * math.exp(-origin[2].item() / fog.falloff)])
+    table = tabulate_along_rays(source, depth_above, azimuths=65, towards=towards)
+    assert table.values.shape == (256, 65, 257, 2)
+    azimuths = relative_azimuths(directions, table.towards)
+    result = lookup(table, directions[..., 2], tau, azimuths)
+    expected = (2 + torch.cos(azimuths) + directions[..., 2] ** 2)[..., None] * -torch.expm1(-tau)
+    assert torch.allclose(result, expected.expand_as(result), rtol=2e-3, atol=1e-9)
+    with pytest.raises(ValueError, match="azimuth"):
+        lookup(table, directions[..., 2], tau)
 
 
 def brute_hemisphere(v, g, attenuation, below, n_theta=400, n_phi=800):
@@ -126,6 +178,94 @@ def test_sky_table_matches_exact_integration(g):
 def test_multiple_scattering_vanishes_without_scattering():
     table = multiple_scattering(FOG.model_copy(update={"albedo": 0.0}), LIGHTING, T([0.08]), channels=3)
     assert torch.all(table.values == 0)
+
+
+@pytest.mark.parametrize("extinction,g,rtol", [(0.08, 0.8, 1e-3), (0.4, 0.8, 1e-3), (0.08, 0.0, 1e-3), (4.0, 0.8, 3e-3)])
+def test_multiple_scattering_conserves_energy(extinction, g, rtol):
+    """Without absorption, the light entering the fog from above either leaves it at the top or is absorbed by the
+    ground, which is lit by suns and the sky through the fog, and by the light that the fog scatters."""
+    medium = FOG.model_copy(update={"extinction": extinction, "anisotropy": g})
+    lighting = LIGHTING.model_copy(update={"ground_albedo": (0.4,)})
+    table = multiple_scattering(medium, lighting, T([extinction]), channels=3)
+    omega, weights = _gather_nodes(48, dtype=torch.float64)
+    # Light leaving the top of the fog, the last height: scattered at least once, and reflected by the ground then
+    # attenuated by the whole fog
+    down = omega < 0
+    unscattered = table.ground * torch.exp(-table.depth_ground / omega[down].abs())[:, None]
+    leaving = 2 * math.pi * ((weights * omega.abs())[down][:, None] * (table.gathered[-1, down] + unscattered)).sum(0)
+    absorbed = (1 - 0.4) * math.pi * table.ground / 0.4
+    sun = np.asarray(LIGHTING.suns[0].direction) / np.linalg.norm(LIGHTING.suns[0].direction)
+    entering = 4.0 * sun[2] + math.pi * T(LIGHTING.sky)
+    assert torch.allclose(leaving + absorbed, entering, rtol=rtol)
+    # The fog's glow makes up for much of the light it takes out of sunlight and skylight on their way to the ground
+    direct = direct_ground_radiance(medium, lighting, T([extinction]), 3)
+    assert torch.all(table.ground > 1.2 * direct)
+
+
+def test_light_of_the_ground_scattered_once():
+    """The light of the ground scattered once is part of the light gathered from below, and none without a ground that
+    reflects light."""
+    lighting = LIGHTING.model_copy(update={"ground_albedo": (0.4,)})
+    table = multiple_scattering(FOG, lighting, T([0.08]), channels=3)
+    down = table.directions < 0
+    assert table.from_ground is not None and table.from_ground.shape == table.gathered.shape
+    assert torch.all(table.from_ground[1:, down] > 0) and torch.all(table.from_ground <= table.gathered)
+    dark = multiple_scattering(FOG, LIGHTING, T([0.08]), channels=3)
+    assert dark.from_ground is not None and torch.all(dark.from_ground == 0)
+
+
+def test_multiple_scattering_follows_suns():
+    """Light scattered more than once is brighter towards suns than away from them, and its variations with the
+    azimuth of rays from each sun average out over azimuths."""
+    lighting = LIGHTING.model_copy(update={"ground_albedo": (0.4,)})
+    table = multiple_scattering(FOG, lighting, T([0.08]), channels=3, n_azimuths=65)
+    (sun,) = table.suns
+    expected = np.asarray(LIGHTING.suns[0].direction[:2]) / np.linalg.norm(LIGHTING.suns[0].direction[:2])
+    assert np.allclose(sun.towards.numpy(), expected)
+    # Trapezoidal mean over [0, π]
+    weights = torch.full((65,), 1 / 64, dtype=torch.float64)
+    weights[[0, -1]] /= 2
+    mean = torch.einsum("eahc,a->ehc", sun.values, weights)
+    assert mean.abs().max() < 1e-3 * table.values.abs().max()
+    towards, away = table.values + sun.values[:, 0], table.values + sun.values[:, -1]
+    horizon = slice(100, 156)  # elevations within about 10° of the horizon
+    assert torch.all(towards[horizon, :20] > 1.5 * away[horizon, :20]) and torch.all(away > -1e-9)
+
+
+def test_light_of_suns_scattered_once_arrives_mostly_from_them():
+    """The harmonics of the sun's light scattered once that reaches each height from each gathering direction, over its
+    mean over azimuths, are those of the phase function between the sun and the direction: summed back at any azimuth,
+    they give the phase function, so that this light arrives mostly from directions close to the sun's."""
+    lighting = Lighting(suns=LIGHTING.suns)  # neither the sky nor the ground lights the fog
+    # Enough harmonics that the phase function's, which decrease about as g^m, are exact
+    table = multiple_scattering(FOG, lighting, T([0.08]), channels=1, higher_orders=False, modes=48)
+    (sun,) = table.suns
+    assert sun.once is not None and sun.once.shape == sun.arriving.shape and sun.arriving.abs().max() == 0
+    towards = np.asarray(LIGHTING.suns[0].direction) / np.linalg.norm(LIGHTING.suns[0].direction)
+    phi = torch.linspace(0, math.pi, 7, dtype=torch.float64)
+    modes = torch.arange(1, len(sun.once) + 1, dtype=torch.float64)
+    for h, d in itertools.product((3, 20), range(0, len(table.directions), 7)):
+        mean = table.gathered[h, d, 0]
+        if mean <= 0:
+            continue
+        light = mean + (sun.once[:, h, d, 0, None] * torch.cos(modes[:, None] * phi)).sum(dim=0)
+        mu = float(table.directions[d])
+        cos = mu * towards[2] + math.sqrt(1 - mu**2) * math.hypot(*towards[:2]) * torch.cos(phi)
+        phase = henyey_greenstein(cos, FOG.anisotropy)
+        # Over the mean over azimuths of the phase function
+        expected = phase / (azimuthal_phase(T(mu), T(towards[2]), FOG.anisotropy) / (2 * math.pi))
+        assert torch.allclose(light / mean, expected, rtol=1e-4), (h, d)
+
+
+def test_multiple_scattering_of_several_suns_adds_up():
+    camera, pose = wide_camera()
+    depth = np.random.default_rng(9).uniform(0.5, 60, size=(15, 21))
+    depth[:3] = np.inf
+    medium = FOG.model_copy(update={"multiple_scattering": True})
+    suns = [Sun(direction=(0.4, 0.7, 0.58), irradiance=(4.0,)), Sun(direction=(-0.8, 0.1, 0.3), irradiance=(2.0,))]
+    lightings = [Lighting(suns=s, ground_albedo=(0.4,)) for s in (suns, suns[:1], suns[1:])]
+    both, *each = (apply_medium(np.zeros((15, 21, 3)), depth, camera, pose, medium, x).inscatter for x in lightings)
+    assert torch.allclose(both, each[0] + each[1], rtol=1e-6)
 
 
 def test_multiple_scattering_adds_light():
@@ -395,3 +535,96 @@ def test_animated_lighting():
 def test_multiple_scattering_requires_sun_attenuation():
     with pytest.raises(ValueError, match="sun attenuation"):
         Medium(extinction=0.1, multiple_scattering=True)
+
+
+def test_cached_tables_ignore_lamps():
+    """Light reaching the medium from many directions doesn't depend on lamps, so that lamps that move or change
+    don't recompute it."""
+    lamp = PointLight(position=(0.0, 3.0, 1.0), power=(100.0,))
+    lit = LIGHTING.model_copy(update={"ground_albedo": (0.4,), "points": [lamp]})
+    plain = LIGHTING.model_copy(update={"ground_albedo": (0.4,)})
+    assert cached_multiple_scattering(FOG, lit, T([0.08]), 3) is cached_multiple_scattering(FOG, plain, T([0.08]), 3)
+    assert cached_surface_tables(FOG, lit, T([0.08]), 3) is cached_surface_tables(FOG, plain, T([0.08]), 3)
+
+
+def test_camera_tables_are_kept_for_each_height():
+    """Tables along camera rays only depend on the height of the camera, and are computed once for each."""
+    medium = FOG.model_copy(update={"multiple_scattering": True})
+    lighting = LIGHTING.model_copy(update={"ground_albedo": (0.4,)})
+    fog = medium.components[0]
+    beta = T([medium.extinction])
+
+    def above(height):
+        return beta * fog.density * fog.falloff * math.exp(-(height - fog.base_height) / fog.falloff)
+
+    tables = cached_camera_tables(medium, lighting, beta, 3, above(1.6), (32, 33))
+    assert list(tables) == ["sky", "ground", "scattered", "scattered 0"]
+    again = cached_camera_tables(medium, lighting, beta, 3, above(1.6), (32, 33))
+    assert all(again[name] is table for name, table in tables.items())
+    fresh = camera_tables(medium, lighting, beta, 3, above(1.6), (32, 33))
+    assert all(torch.equal(fresh[name].values, table.values) for name, table in tables.items())
+    higher = cached_camera_tables(medium, lighting, beta, 3, above(2.0), (32, 33))
+    assert not torch.equal(higher["sky"].values, tables["sky"].values)
+    # Summed, as when nothing occludes them
+    combined = cached_camera_tables(medium, lighting, beta, 3, above(1.6), (32, 33), combined=True)
+    assert list(combined) == ["all", "scattered 0"]
+    total = tables["sky"].values + tables["ground"].values + tables["scattered"].values
+    assert torch.allclose(combined["all"].values, total, rtol=1e-12, atol=1e-15)
+    # Without suns or skylight, nothing reaches the medium from many directions
+    night = Lighting(points=[PointLight(position=(0.0, 3.0, 1.0), power=(100.0,))], ground_albedo=(0.4,))
+    assert cached_camera_tables(medium, night, beta, 3, above(1.6), (32, 33)) == {}
+
+
+@pytest.mark.parametrize("at_once", [False, True])
+@pytest.mark.parametrize("azimuth_axis", [False, True])
+def test_lookup_of_each_corner(azimuth_axis, at_once, monkeypatch):
+    """The corners of the table around each ray are interpolated at once, as on a GPU, as each of them in turn."""
+    monkeypatch.setattr(scattering, "_interpolate_rows", partial(scattering._interpolate_rows, at_once=at_once))
+    rng = np.random.default_rng(4)
+    shape = (16, 9, 17, 2) if azimuth_axis else (16, 17, 2)
+    table = ElevationTable(T(rng.uniform(size=shape)), T([0.3]), T([0.6, 0.8]) if azimuth_axis else None)
+    directions_z = T(rng.uniform(-1, 1, size=(50, 3)))
+    depth = T(rng.uniform(0, 2, size=(50, 3, 1)))
+    azimuths = T(rng.uniform(0, math.pi, size=(50, 3))) if azimuth_axis else None
+
+    # Interpolation between the two (or four) rows of the table around each ray, one after another
+    n_elevation, *n_azimuth, n_depth, channels = shape
+    v = directions_z[..., None]
+    y_max = torch.where(v > 0, -torch.expm1(-table.depth_above / torch.where(v > 0, v, 1.0)), 1.0)
+    x = (-torch.expm1(-depth) / y_max).clamp(0, 1).expand(50, 3, channels)
+    fi = (torch.asinh(directions_z * math.sinh(3.0)) / 3.0 + 1) / 2 * (n_elevation - 1)
+    i = fi.floor().clamp(0, n_elevation - 2).long()
+    wi = (fi - i)[..., None]
+    j = (x * (n_depth - 1)).floor().clamp(0, n_depth - 2).long()
+    wj = x * (n_depth - 1) - j
+    values = table.values.reshape(-1, n_depth, channels)
+    rows, weights = [i, i + 1], [1 - wi, wi]
+    if azimuths is not None:
+        fa = azimuths / math.pi * (n_azimuth[0] - 1)
+        a = fa.floor().clamp(0, n_azimuth[0] - 2).long()
+        wa = (fa - a)[..., None]
+        rows = [row * n_azimuth[0] + a + da for row in rows for da in (0, 1)]
+        weights = [weight * w for weight in weights for w in (1 - wa, wa)]
+    ch = torch.arange(channels)
+    expected = torch.zeros_like(wj)
+    for row, weight in zip(rows, weights):
+        near = values[row[..., None], j, ch]
+        expected = expected + weight * (near + wj * (values[row[..., None], j + 1, ch] - near))
+    assert torch.equal(lookup(table, directions_z, depth, azimuths), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_rows_gathered_at_once_on_a_gpu(dtype):
+    """On a GPU, where the rows of a table around each ray are gathered at once, they add up as each of them in turn."""
+    rng = np.random.default_rng(7)
+    kwargs = {"dtype": dtype, "device": "cuda"}
+    values = torch.as_tensor(rng.uniform(size=(300, 65, 3)), **kwargs)
+    n = 100_000
+    for k in (2, 4):
+        rows = [torch.as_tensor(rng.integers(0, 300, size=n), device="cuda") for _ in range(k)]
+        weights = [torch.as_tensor(rng.uniform(size=n), **kwargs) for _ in range(k)]
+        index = torch.as_tensor(rng.integers(0, 64, size=(n, 3)), device="cuda")
+        fraction = torch.as_tensor(rng.uniform(size=(n, 3)), **kwargs)
+        args = (values, rows, weights, index, fraction)
+        assert torch.equal(scattering._interpolate_rows(*args), scattering._interpolate_rows(*args, at_once=False))

@@ -6,15 +6,25 @@ depth and linear radiance of the scene. The medium is described by a small set o
 computed in closed form, which yields a unique, noise-free solution that all sensor emulators can share, including
 active sensors whose time-resolved measurements are given by :func:`flash_transient`. Objects can cast shadows onto
 the medium, through shadow maps of the scene loaded with :func:`load_occlusion`, and the shadows traced along the
-rays of a frame can be reused for several media (:func:`trace_shadows`). Given the normals of surfaces, surfaces are
-lit through the medium too (:mod:`visionsim.medium.surfaces`). The same model can also be integrated by ray marching
-(:func:`ray_march_medium`), which serves as a baseline.
+rays of a frame can be reused for several media (:func:`trace_shadows`). Given the normals of surfaces, and optionally
+the light that the surface of each pixel received, measured by its irradiance or its albedo, surfaces are lit through
+the medium too (:mod:`visionsim.medium.surfaces`), and the mean albedos with which the ground and objects reflect light
+into the medium can be estimated from the albedo of the pixels that see them (:func:`mean_albedos`). The same model can
+also be integrated by ray marching (:func:`ray_march_medium`), which serves as a baseline. Most of the time can be
+saved by adding the medium at a lower resolution, whose light is upsampled to every pixel along with the exact
+transmittance of each pixel (:func:`apply_medium_upsampled`), and each optional term of the model can be turned off, to
+save time or to see what it does (:class:`Effects`, with presets in :data:`EFFECT_PRESETS`).
 """
 
 from visionsim.medium.model import (
+    EFFECT_GIVEN,
+    EFFECT_GROUPS,
+    EFFECT_INPUTS,
+    EFFECT_PRESETS,
     AnimatedLighting,
     AreaLight,
     Blob,
+    Effects,
     EmissiveSurface,
     HeightFog,
     Homogeneous,
@@ -27,14 +37,27 @@ from visionsim.medium.model import (
 )
 from visionsim.medium.occlusion import Occlusion, Shadows, load_occlusion
 from visionsim.medium.raymarch import ray_march_medium
-from visionsim.medium.render import RGB_WAVELENGTHS, MediumResult, apply_medium, camera_rays, trace_shadows
+from visionsim.medium.render import (
+    RGB_WAVELENGTHS,
+    MediumResult,
+    apply_medium,
+    camera_rays,
+    mean_albedos,
+    trace_shadows,
+)
 from visionsim.medium.transient import Flash, Transient, capture_histogram, estimate_distance, flash_transient
+from visionsim.medium.upsampling import apply_medium_upsampled
 
 __all__ = [
+    "EFFECT_GIVEN",
+    "EFFECT_GROUPS",
+    "EFFECT_INPUTS",
+    "EFFECT_PRESETS",
     "RGB_WAVELENGTHS",
     "AnimatedLighting",
     "AreaLight",
     "Blob",
+    "Effects",
     "EmissiveSurface",
     "Flash",
     "HeightFog",
@@ -49,12 +72,14 @@ __all__ = [
     "Sun",
     "Transient",
     "apply_medium",
+    "apply_medium_upsampled",
     "camera_rays",
     "capture_histogram",
     "estimate_distance",
     "flash_transient",
     "kim_exponent",
     "load_occlusion",
+    "mean_albedos",
     "ray_march_medium",
     "trace_shadows",
 ]

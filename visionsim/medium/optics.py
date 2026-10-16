@@ -32,7 +32,7 @@ def _per_channel(values: Sequence[float], n: int, name: str, **kwargs) -> torch.
 def _exprel(x: torch.Tensor) -> torch.Tensor:
     """Numerically stable ``(1 - exp(-x)) / x``, which tends to one as x tends to zero."""
     small = x.abs() < 1e-4
-    safe = torch.where(small, torch.ones_like(x), x)
+    safe = torch.where(small, 1.0, x)
     return torch.where(small, 1 - x / 2 + x * x / 6, -torch.expm1(-safe) / safe)
 
 
@@ -49,6 +49,24 @@ def henyey_greenstein(cos_theta: torch.Tensor, g: float) -> torch.Tensor:
         torch.Tensor: Phase function value, in 1/sr, which integrates to one over the sphere.
     """
     return (1 - g * g) / (4 * math.pi * (1 + g * g - 2 * g * cos_theta).clamp_min(1e-12) ** 1.5)
+
+
+def similarity_extinction(medium: Medium, extinction: torch.Tensor) -> torch.Tensor:
+    """Extinction reduced by the similarity relation of radiative transfer, ``1 - albedo · g`` times it.
+
+    In a medium that scatters light forward, such as fog, much of the light it takes out of a beam is scattered in
+    about the same direction, and keeps going: replacing the forward part of the phase function by light that goes on
+    unscattered, the beam is attenuated with this reduced extinction, which counts the light scattered forward on its
+    way, as light scattered more than once.
+
+    Args:
+        medium (Medium): Participating medium, whose albedo and anisotropy reduce the extinction.
+        extinction (torch.Tensor): Extinction coefficient, of any shape.
+
+    Returns:
+        torch.Tensor: Reduced extinction coefficient, of the same shape.
+    """
+    return extinction * (1 - medium.albedo * medium.anisotropy)
 
 
 def density(medium: Medium, points: torch.Tensor, time: float = 0.0) -> torch.Tensor:
@@ -113,10 +131,10 @@ def height_fog_optical_depth(
     """
     k = component.density * torch.exp(-(origin[..., 2] - component.base_height) / component.falloff)
     dir_z = directions[..., 2]
-    x = torch.where(dir_z == 0, torch.zeros_like(distance), distance * dir_z / component.falloff)
+    x = torch.where(dir_z == 0, 0.0, distance * dir_z / component.falloff)
     small = x.abs() < 1e-4
-    safe_z = torch.where(small, torch.ones_like(dir_z), dir_z)
-    safe_x = torch.where(small, torch.ones_like(x), x)
+    safe_z = torch.where(small, 1.0, dir_z)
+    safe_x = torch.where(small, 1.0, x)
     return k * torch.where(small, distance * (1 - x / 2 + x * x / 6), component.falloff / safe_z * -torch.expm1(-safe_x))
 
 
@@ -229,7 +247,7 @@ def _hg_inverse_cdf(xi: torch.Tensor, g: float) -> torch.Tensor:
 
 
 def sky_quadrature(
-    directions: torch.Tensor, g: float, n_angle: int = 16, n_azimuth: int = 24
+    directions: torch.Tensor, g: float, n_angle: int = 16, n_azimuth: int = 24, folded: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quadrature of the phase function over the sky, i.e. the directions above the horizon.
 
@@ -248,10 +266,14 @@ def sky_quadrature(
         n_azimuth (int, optional): Number of azimuthal nodes. Defaults to 24. With these defaults, the relative
             error is below 0.1% even for strongly forward scattering media (g = 0.95) seen near the horizon, or for
             skylight attenuated by an optical depth of up to 5 (vertically) before being scattered.
+        folded (bool, optional): If true, the nodes at opposite azimuths around ``v``, which have the same elevation,
+            are merged into one, whose weight is the sum of theirs, which halves the nodes of functions of the
+            elevation. Defaults to False.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]: The elevation ``ω_z`` of each node and its weight, both of shape
-        (..., 3 * n_angle * n_azimuth). The weights sum to the fraction of the phase function above the horizon.
+        (..., 3 * n_angle * n_azimuth), or (..., 3 * n_angle * ceil(n_azimuth / 2)) when folded. The weights sum to the
+        fraction of the phase function above the horizon.
     """
     kwargs = {"dtype": directions.dtype, "device": directions.device}
     t, w = (torch.as_tensor(a, **kwargs) for a in np.polynomial.legendre.leggauss(n_angle))
@@ -279,6 +301,13 @@ def sky_quadrature(
     psi = psi_max[..., None] * s
     mu = cos_gamma[..., None] * v_z[..., None] + sin_gamma[..., None] * torch.cos(psi) * rho[..., None]
     weights = xi_weights[..., None] * psi_max[..., None] * b / (2 * math.pi)
+    if folded:
+        # Azimuthal nodes are symmetric about zero, so that the elevation of the nodes from the middle one on is that of
+        # their opposite, whose weight is added to theirs
+        half = n_azimuth // 2
+        mu = mu[..., half:]
+        opposite = weights[..., n_azimuth - half :] + weights[..., :half].flip(-1)
+        weights = torch.cat([weights[..., half : n_azimuth - half], opposite], dim=-1)
     return mu.flatten(-2).clamp_min(0), weights.flatten(-2)
 
 
