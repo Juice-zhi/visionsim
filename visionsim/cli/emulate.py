@@ -530,7 +530,8 @@ def aspc(
         sensor_size: pixel dimensions of the SPAD array (e.g., [height, width]).
         sensor_pixel_pitch: physical distance between the centers of adjacent pixels. Given in micrometer.
         sensor_f_number: the F-number (focal ratio) determining the optical aperture of the sensor.
-        sensor_fov: the angular field of view of the camera sensor. Given in degree.
+        sensor_fov: the angular field of view of the camera sensor. Given in degree. It must be the field of view
+            of the rendered frames, whose intrinsics are checked against it.
         sensor_falloff: how much less light a pixel at an angle theta to the optical axis collects than one on the
             axis: "cos4" (the default, the camera equation of a sensor behind a lens: the pixel's solid angle,
             cos^3(theta), times the foreshortened aperture, cos(theta)), "cos3" (the pixel's solid angle only) or

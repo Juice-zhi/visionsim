@@ -37,6 +37,10 @@ DEPTH_CUTOFF = 1e9
 # c / (2 * pulse_repetition), so that a value equal to that range is not rejected because of floating-point rounding.
 MAX_DEPTH_RTOL = 1e-6
 
+# Relative tolerance when checking the intrinsics of a dataset item against those of the sensor's field of view (see
+# preproc_frames). A focal length off by 1e-3 changes a field of view of 60 deg by 0.05 deg.
+INTRINSICS_RTOL = 1e-3
+
 # Accepted values of preproc_frames' depth_type. "planar_z" is the distance along the optical axis, which is what
 # Blender's Z pass (a rendered depths/ directory) holds, and "range" is the distance along each pixel's ray.
 DEPTH_TYPES = ("planar_z", "range")
@@ -276,20 +280,64 @@ def _normals_to_camera_frame(normals: np.ndarray, transform: Any, normal_type: s
     return normals @ rotation @ rotation
 
 
-def _frame_intrinsics(transform: Any, shape: tuple[int, ...], sensor_config: dict) -> tuple[float, float, float, float]:
-    """Returns the pinhole intrinsics ``(fl_x, fl_y, cx, cy)``, in pixels, of a frame of shape ``(H, W)``.
+def _item_transform(frame: Any) -> Any:
+    """The transform of a ``(data, transform)`` item of a ``Dataset``, or None for an array or tensor."""
+    return frame[1] if isinstance(frame, (tuple, list)) and len(frame) == 2 else None
 
-    They are taken from the frame's transform when it has them (a dataset item), and otherwise from the emulated
-    sensor, whose field of view the frame is resized to.
+
+def _item_intrinsics(
+    transform: Any, shape: tuple[int, ...], sensor_config: dict, name: str = "depth"
+) -> tuple[float, float, float, float] | None:
+    """Returns the pinhole intrinsics ``(fl_x, fl_y, cx, cy)``, in pixels, of a frame of shape ``(H, W)`` from its
+    transform, or None if the transform has none (an array, or a dataset item without intrinsics).
+
+    The emulator resizes every frame to the sensor, and weights each pixel by its off-axis falloff and incidence cosine
+    along the rays of the sensor's field of view (:meth:`~visionsim.emulate.aspc.sensors.SensorBase.frame_intrinsics`),
+    so a frame must span that field of view: its intrinsics must be the sensor's, scaled to the frame, to within a
+    relative INTRINSICS_RTOL.
+
+    Raises:
+        ValueError: if the transform's size is not the frame's, or its intrinsics are not those of the sensor.
     """
-    if isinstance(transform, dict) and all(transform.get(k) is not None for k in ("fl_x", "fl_y", "cx", "cy")):
-        if transform.get("h") is not None and transform.get("w") is not None:
-            if (int(transform["h"]), int(transform["w"])) != tuple(shape):
-                raise ValueError(
-                    f"Depth frame of shape {tuple(shape)} does not match the size (h={transform['h']}, "
-                    f"w={transform['w']}) of its transform, so the transform's intrinsics do not apply to it."
-                )
-        return float(transform["fl_x"]), float(transform["fl_y"]), float(transform["cx"]), float(transform["cy"])
+    if not (isinstance(transform, dict) and all(transform.get(k) is not None for k in ("fl_x", "fl_y", "cx", "cy"))):
+        return None
+    h, w = shape
+    if transform.get("h") is not None and transform.get("w") is not None:
+        if (int(transform["h"]), int(transform["w"])) != (h, w):
+            raise ValueError(
+                f"{name.capitalize()} frame of shape {(h, w)} does not match the size (h={transform['h']}, "
+                f"w={transform['w']}) of its transform, so the transform's intrinsics do not apply to it."
+            )
+    intrinsics = float(transform["fl_x"]), float(transform["fl_y"]), float(transform["cx"]), float(transform["cy"])
+
+    # Imported here since the sensors module imports this one
+    from visionsim.emulate.aspc.sensors import SPADSensor
+
+    sensor = SPADSensor(**sensor_config)
+    expected = sensor.frame_intrinsics((h, w))
+    if not np.allclose(intrinsics, expected, rtol=INTRINSICS_RTOL, atol=0):
+        fov_x = math.degrees(2 * math.atan(w / 2 / intrinsics[0]))
+        fov_y = math.degrees(2 * math.atan(h / 2 / intrinsics[1]))
+        raise ValueError(
+            f"The intrinsics (fl_x, fl_y, cx, cy) = ({', '.join(f'{v:.6g}' for v in intrinsics)}) of the {h}x{w} "
+            f"{name} frame, a field of view of {fov_x:.4g} x {fov_y:.4g} deg, are not those of the sensor's field of "
+            f"view of {sensor.fov_x.magnitude:.4g} x {sensor.fov_y.magnitude:.4g} deg at that size, "
+            f"({', '.join(f'{v:.6g}' for v in expected)}). The emulator gives each pixel the falloff and incidence "
+            "cosine of the sensor's rays, so a frame must span the sensor's field of view, centered on its optical "
+            "axis: set sensor.fov to the field of view of the render."
+        )
+    return intrinsics
+
+
+def _frame_intrinsics(transform: Any, shape: tuple[int, ...], sensor_config: dict) -> tuple[float, float, float, float]:
+    """Returns the pinhole intrinsics ``(fl_x, fl_y, cx, cy)``, in pixels, of a depth frame of shape ``(H, W)``.
+
+    They are taken from the frame's transform when it has them (a dataset item, checked against the sensor by
+    :func:`_item_intrinsics`), and otherwise from the emulated sensor, whose field of view the frame is resized to.
+    """
+    intrinsics = _item_intrinsics(transform, shape, sensor_config)
+    if intrinsics is not None:
+        return intrinsics
 
     # Imported here since the sensors module imports this one
     from visionsim.emulate.aspc.sensors import SPADSensor
@@ -319,6 +367,12 @@ def preproc_frames(
       ``fl_x, fl_y, cx, cy`` of the item's transform, or, for a frame without them, those of the sensor in
       ``config``, scaled to the frame's resolution (the frame then spans the sensor's field of view).
     - ``"range"``: range, used as is.
+
+    Every frame is resized to the sensor, and the emulator gives each pixel the off-axis falloff and incidence cosine
+    of the sensor's field of view, so the frames must span that field of view. An item whose transform has intrinsics
+    (depth, albedo or ambient) must therefore have the sensor's, scaled to its resolution, to within a relative
+    INTRINSICS_RTOL: a render with another field of view, or with its principal point off the center, raises a
+    ValueError, as does a transform whose size is not that of its frame.
 
     Depths that are not finite, not positive, or at least DEPTH_CUTOFF (rays that miss every object) are set to 0,
     which the histogrammer treats as no laser return.
@@ -379,15 +433,19 @@ def preproc_frames(
     # Missed rays and invalid depths become 0 (no return), see DEPTH_CUTOFF
     depth_img = np.where(np.isfinite(depth_img) & (depth_img > 0) & (depth_img < DEPTH_CUTOFF), depth_img, 0.0)
 
-    # Planar depth to range, with the intrinsics of the frame at its own resolution (before resizing)
+    # Planar depth to range, with the intrinsics of the frame at its own resolution (before resizing). A dataset item's
+    # intrinsics must be the sensor's whatever the depth type, as the falloff and incidence cosine use the sensor's
+    transform = _item_transform(depth_frame)
     if depth_type == "planar_z":
-        transform = depth_frame[1] if isinstance(depth_frame, (tuple, list)) and len(depth_frame) == 2 else None
         depth_img = planar_depth_to_range(depth_img, *_frame_intrinsics(transform, depth_img.shape, config["sensor"]))
+    else:
+        _item_intrinsics(transform, depth_img.shape, config["sensor"])
 
     # 3. Process Albedo Frame (Diffuse Color Pass)
     raw_albedo = _to_numpy(albedo_frame)
     if raw_albedo.ndim == 3:
         raw_albedo = raw_albedo[:, :, 0]
+    _item_intrinsics(_item_transform(albedo_frame), raw_albedo.shape, config["sensor"], "albedo")
 
     if np.issubdtype(raw_albedo.dtype, np.integer):
         albedo_img = raw_albedo.astype(np.float32) / 255.0
@@ -398,6 +456,7 @@ def preproc_frames(
     raw_ambient = _to_numpy(ambient_frame)
     if raw_ambient.ndim == 3:
         raw_ambient = raw_ambient[:, :, 0]
+    _item_intrinsics(_item_transform(ambient_frame), raw_ambient.shape, config["sensor"], "ambient")
 
     if np.issubdtype(raw_ambient.dtype, np.integer):
         ambient_img = raw_ambient.astype(np.float32) / 255.0
@@ -446,6 +505,9 @@ def preproc_normals(
     Normals are scaled to unit length, and normals that are zero or not finite (rays that miss every object) are set
     to 0, for which the emulator gives no laser return.
 
+    The emulator takes each pixel's incidence cosine along the rays of the sensor's field of view, so an item whose
+    transform has intrinsics must have the sensor's, as in :func:`preproc_frames`, or a ValueError is raised.
+
     Returns:
         A dimensionless quantity holding a float64 tensor of shape ``(H, W, 3)`` at the sensor's size.
     """
@@ -466,6 +528,8 @@ def preproc_normals(
         raw_normals = np.repeat(raw_normals, 3, axis=-1)
     if raw_normals.ndim != 3 or raw_normals.shape[-1] < 3:
         raise ValueError(f"Expected a normal frame of shape (H, W, 3), got shape {raw_normals.shape}.")
+    # The incidence cosine is taken along the sensor's rays, see preproc_frames
+    _item_intrinsics(transform, raw_normals.shape[:2], config["sensor"], "normal")
 
     normals = _normals_to_camera_frame(raw_normals[..., :3], transform, normal_type)
 

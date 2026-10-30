@@ -341,6 +341,21 @@ class TestPreprocNormals:
         with pytest.raises(ValueError, match="transform_matrix"):
             self._normals(frame, normal_type=normal_type)
 
+    @pytest.mark.parametrize("scale", [1.0, 2.0], ids=["sensor", "half-the-field-of-view"])
+    def test_item_must_span_the_sensors_field_of_view(self, scale):
+        """The incidence cosine follows the rays of the sensor's field of view; a normal frame of another field of
+        view was accepted, and got the cosines of the sensor's."""
+        config = _config(size=(self.H, self.W))
+        fl_x, fl_y, cx, cy = SPADSensor(**config["sensor"]).frame_intrinsics()
+        k = {"fl_x": scale * fl_x, "fl_y": scale * fl_y, "cx": cx, "cy": cy, "h": self.H, "w": self.W}
+        camera = _random_unit_vectors((self.H, self.W), seed=13)
+        item = (camera, {"transform_matrix": POSE, **k})
+        if scale == 1.0:
+            np.testing.assert_allclose(self._normals(item, config, normal_type="camera"), camera, atol=1e-12)
+        else:
+            with pytest.raises(ValueError, match="normal frame, .* not those of the sensor's field of view"):
+                self._normals(item, config, normal_type="camera")
+
     @pytest.mark.parametrize("normal_type", ["Camera", "opengl", "world_space", "", None])
     def test_unknown_normal_type_raises(self, normal_type):
         with pytest.raises(ValueError, match="normal_type"):

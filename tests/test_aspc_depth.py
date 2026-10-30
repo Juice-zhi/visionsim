@@ -15,6 +15,7 @@ from visionsim.emulate.aspc.emulator import ASPCEmulator
 from visionsim.emulate.aspc.sensors import SPADSensor
 from visionsim.emulate.aspc.utils import (
     DEPTH_CUTOFF,
+    INTRINSICS_RTOL,
     planar_depth_to_range,
     prepare_config,
     preproc_frames,
@@ -32,6 +33,15 @@ def _intrinsics(h, w, fov_deg):
     return {"fl_x": fl, "fl_y": fl, "cx": w / 2, "cy": h / 2, "h": h, "w": w}
 
 
+# Intrinsics of 9 x 12 renders that do not span the field of view of a 60 deg sensor of square pixels
+MISMATCHED = {
+    "narrower": _intrinsics(9, 12, 30.0),
+    "wider": _intrinsics(9, 12, 61.0),
+    "principal-point": {**_intrinsics(9, 12, 60.0), "cx": 3.5, "cy": 2.5},
+    "fl_y": {**_intrinsics(9, 12, 60.0), "fl_y": _intrinsics(9, 12, 60.0)["fl_y"] * (1 + 2 * INTRINSICS_RTOL)},
+}
+
+
 def _depth_item(z, intrinsics):
     """A depths/ item as a Dataset returns it: the (H, W, 1) float32 EXR data and its transform."""
     return z.astype(np.float32)[..., np.newaxis], {"file_path": "depths/0000.exr", **intrinsics}
@@ -46,8 +56,11 @@ def _true_range(z, intrinsics):
     return np.linalg.norm(np.stack([x, y, z], axis=-1), axis=-1)
 
 
-def _config(size, fov=(60.0, 60.0)):
-    """Emulator config with 1.25 mm bins, a short pulse and no ambient light."""
+def _config(size, fov=60.0):
+    """Emulator config with 1.25 mm bins, a short pulse and no ambient light.
+
+    A scalar fov is the horizontal field of view of square pixels, as in _intrinsics; a tuple sets both.
+    """
     fov = [f * ureg.degree for f in fov] if isinstance(fov, tuple) else fov * ureg.degree
     return {
         "histogrammer": {
@@ -194,27 +207,53 @@ class TestPreprocFramesDepthType:
         np.testing.assert_allclose(depth_qty.magnitude.numpy(), _true_range(z.astype(np.float64), k), rtol=1e-12)
 
     def test_transform_intrinsics_are_used_over_the_sensor(self):
-        # A 40 deg render with its principal point shifted to pixel (2, 3), emulated by a 70 deg sensor
+        # Intrinsics within INTRINSICS_RTOL of the sensor's still convert the depth exactly as it was rendered
         h, w = 9, 12
-        k = {**_intrinsics(h, w, 40.0), "cx": 3.5, "cy": 2.5}
+        k = _intrinsics(h, w, 60.0)
+        k = {**k, "fl_x": k["fl_x"] * (1 + INTRINSICS_RTOL / 2), "cy": k["cy"] * (1 - INTRINSICS_RTOL / 2)}
         z = np.full((h, w), Z0)
-        r = self._depth(_depth_item(z, k), _config((h, w), fov=(70.0, 70.0))).magnitude.numpy()
+        r = self._depth(_depth_item(z, k), _config((h, w))).magnitude.numpy()
 
         np.testing.assert_allclose(r, _true_range(z, k), rtol=1e-12)
-        assert np.unravel_index(r.argmin(), r.shape) == (2, 3)
-        assert r[2, 3] == Z0
+        assert not np.allclose(r, _true_range(z, _intrinsics(h, w, 60.0)), rtol=1e-9, atol=0)
 
     def test_transform_without_size_is_used(self):
         h, w = 9, 12
         k = {key: v for key, v in _intrinsics(h, w, 50.0).items() if key not in ("h", "w")}
         z = np.full((h, w), Z0)
-        r = self._depth(_depth_item(z, k), _config((h, w))).magnitude.numpy()
+        r = self._depth(_depth_item(z, k), _config((h, w), fov=50.0)).magnitude.numpy()
         np.testing.assert_allclose(r, _true_range(z, k), rtol=1e-12)
 
     def test_transform_of_another_size_raises(self):
         k = _intrinsics(9, 12, 60.0)
         with pytest.raises(ValueError, match="does not match"):
             self._depth(_depth_item(np.full((8, 12), Z0), k), _config((8, 12)))
+
+    @pytest.mark.parametrize("depth_type", ["planar_z", "range"])
+    @pytest.mark.parametrize("name", list(MISMATCHED))
+    def test_transform_of_another_field_of_view_raises(self, name, depth_type):
+        """The falloff and the incidence cosine follow the rays of the sensor's field of view. A 30 deg render on a
+        60 deg sensor was accepted, and its pixels got the falloff and incidence cosines of the 60 deg rays."""
+        with pytest.raises(ValueError, match="not those of the sensor's field of view"):
+            self._depth(_depth_item(np.full((9, 12), Z0), MISMATCHED[name]), _config((9, 12)), depth_type=depth_type)
+
+    @pytest.mark.parametrize("frame", ["albedo", "ambient"])
+    def test_albedo_or_ambient_of_another_field_of_view_raises(self, frame):
+        h, w = 9, 12
+        frames = {"albedo": np.ones((h, w)), "ambient": np.zeros((h, w))}
+        frames[frame] = (frames[frame][..., None], {"file_path": f"{frame}/0000.exr", **MISMATCHED["narrower"]})
+        with pytest.raises(ValueError, match=f"{frame} frame"):
+            preproc_frames(np.full((h, w), Z0), frames["albedo"], frames["ambient"], _config((h, w)))
+
+    def test_transform_of_the_same_field_of_view_at_another_resolution_is_used(self):
+        """Guard: a render at twice the sensor's resolution spans the sensor's field of view."""
+        k = _intrinsics(18, 24, 60.0)
+        z = np.random.default_rng(5).uniform(0.2, 1.2, (18, 24))
+        r = self._depth(_depth_item(z, k), _config((9, 12))).magnitude
+
+        full = torch.from_numpy(_true_range(z.astype(np.float32).astype(np.float64), k))
+        expected = F.interpolate(full[None, None], size=(9, 12), mode="nearest")[0, 0]
+        np.testing.assert_allclose(r.numpy(), expected.numpy(), rtol=1e-12)
 
     @pytest.mark.parametrize(
         "wrap",
@@ -300,25 +339,27 @@ class TestPreprocFramesDepthType:
 class TestRangeInTheEmulator:
     @pytest.mark.parametrize("theta_deg", [15.0, 30.0])
     def test_off_axis_pixel_bins_and_falls_off_with_its_range(self, theta_deg):
-        # One pixel whose center is theta_deg off the optical axis, at planar depth Z0
+        # Two pixels whose centers are theta_deg left and right of the optical axis, at planar depth Z0: a 1 x 2
+        # sensor whose field of view is 2 * atan(2 * tan(theta)) wide and 2 * theta high
         theta = np.radians(theta_deg)
-        k = {"fl_x": 1.0, "fl_y": 1.0, "cx": 0.5 - np.tan(theta), "cy": 0.5, "h": 1, "w": 1}
-        config = _config((1, 1))
-        ones = np.ones((1, 1))
-        depth_qty, albedo_qty, _ = preproc_frames(_depth_item(np.full((1, 1), Z0), k), ones, 0 * ones, config)
+        fl = 0.5 / np.tan(theta)
+        k = {"fl_x": fl, "fl_y": fl, "cx": 1.0, "cy": 0.5, "h": 1, "w": 2}
+        config = _config((1, 2), fov=(np.degrees(2 * np.arctan(1 / fl)), 2 * theta_deg))
+        ones = np.ones((1, 2))
+        depth_qty, albedo_qty, _ = preproc_frames(_depth_item(np.full((1, 2), Z0), k), ones, 0 * ones, config)
         t = _transient(depth_qty, albedo_qty, config)
 
         rng = Z0 / np.cos(theta)  # 0.5176 m at 15 deg (bin 414), 0.5774 m at 30 deg (bin 461); Z0 is bin 400
         assert np.flatnonzero(t).tolist() == [int(np.floor(rng / BIN_M))]
 
         # The planar depth taken as range would be brighter by 1 / cos^2(theta)
-        z_qty, z_albedo, _ = preproc_frames(np.full((1, 1), Z0), ones, 0 * ones, config, depth_type="range")
+        z_qty, z_albedo, _ = preproc_frames(np.full((1, 2), Z0), ones, 0 * ones, config, depth_type="range")
         t_z = _transient(z_qty, z_albedo, config)
         assert np.flatnonzero(t_z).tolist() == [int(np.floor(Z0 / BIN_M))]
         assert t.sum() / t_z.sum() == pytest.approx(np.cos(theta) ** 2, rel=1e-6)
 
         # And the same as the true range given as range
-        r_qty, r_albedo, _ = preproc_frames(np.full((1, 1), rng), ones, 0 * ones, config, depth_type="range")
+        r_qty, r_albedo, _ = preproc_frames(np.full((1, 2), rng), ones, 0 * ones, config, depth_type="range")
         np.testing.assert_allclose(t, _transient(r_qty, r_albedo, config), rtol=1e-6)
 
     def test_plane_covers_the_bins_of_its_ranges(self):
@@ -388,3 +429,15 @@ class TestCliDepths:
 
         as_range = emulator.process_frame(ureg.Quantity(torch.from_numpy(z), "meter"), albedo, ambient)
         assert not np.allclose(hist, as_range, rtol=1e-2)
+
+    def test_cli_raises_when_the_render_has_another_field_of_view(self, tmp_path):
+        """A 30 deg render emulated by a 60 deg sensor got the falloff and incidence cosines of 60 deg."""
+        from visionsim.cli.emulate import aspc as aspc_cli
+
+        n = self.N
+        k = _intrinsics(n, n, 30.0)
+        self._write_dataset(tmp_path / "in" / "depths", np.full((n, n, 1), Z0, np.float32), k)
+        self._write_dataset(tmp_path / "in" / "diffuse" / "color", np.ones((n, n, 3), np.float32), k)
+        self._write_dataset(tmp_path / "in" / "frames", np.zeros((n, n, 3), np.float32), k)
+        with pytest.raises(ValueError, match="set sensor.fov to the field of view of the render"):
+            aspc_cli(input_dir=tmp_path / "in", output_dir=tmp_path / "out", **self.ARGS)
