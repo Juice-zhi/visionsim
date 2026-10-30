@@ -39,14 +39,14 @@ class Detector:
         parsed_fov_list: list[list[float]]
         if isinstance(pixel_fov_list, (str, Path)):
             path = Path(pixel_fov_list)
-            if path.exists():
-                raw_data = np.loadtxt(path, dtype=np.float32).tolist()
-                if isinstance(raw_data, list) and len(raw_data) > 0 and isinstance(raw_data[0], (float, int)):
-                    parsed_fov_list = [raw_data]
-                else:
-                    parsed_fov_list = raw_data
+            if not path.exists():
+                # A mistyped path must not silently replace the zones with the full frame
+                raise FileNotFoundError(f"pixel_fov_list file '{path}' does not exist.")
+            raw_data = np.loadtxt(path, dtype=np.float32).tolist()
+            if isinstance(raw_data, list) and len(raw_data) > 0 and isinstance(raw_data[0], (float, int)):
+                parsed_fov_list = [raw_data]
             else:
-                parsed_fov_list = [[0.0, 1.0, 0.0, 1.0]]
+                parsed_fov_list = raw_data
         elif pixel_fov_list is None:
             parsed_fov_list = [[0.0, 1.0, 0.0, 1.0]]
         else:
