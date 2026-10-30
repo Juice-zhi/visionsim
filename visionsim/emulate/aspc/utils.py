@@ -33,8 +33,8 @@ irradiance_photons = ureg.count / ureg.meter**2
 # like non-finite and non-positive depths, are treated as no laser return instead of a surface to bin.
 DEPTH_CUTOFF = 1e9
 
-# Relative tolerance when checking max_depth against the unambiguous range c / (2 * pulse_repetition), so that a
-# max_depth equal to that range is not rejected because of floating-point rounding.
+# Relative tolerance when checking max_depth, or the histogram's window, against the unambiguous range
+# c / (2 * pulse_repetition), so that a value equal to that range is not rejected because of floating-point rounding.
 MAX_DEPTH_RTOL = 1e-6
 
 # Accepted values of preproc_frames' depth_type. "planar_z" is the distance along the optical axis, which is what
@@ -95,6 +95,35 @@ def watts2photons(watts, t, wavelength):
     energy = watts * t
     photon_energy = h * c / wavelength
     return energy / photon_energy
+
+
+def histogram_bin_width(n_bins: int, pulse_repetition: Quantity, bin_width: Quantity | None = None) -> Quantity:
+    """Returns the width of a histogram bin as a one-way distance (c * t / 2), in meters.
+
+    It is ``bin_width`` when given, and otherwise one laser period, the unambiguous range
+    ``c / (2 * pulse_repetition)``, divided into ``n_bins`` bins. The histogram's window, ``n_bins * bin_width``, may be
+    shorter than one laser period, in which case returns that arrive after it are not recorded, but not longer, since
+    it would then also record the returns of the next pulse.
+
+    Raises:
+        ValueError: if ``bin_width`` is not positive, or if the window exceeds one laser period.
+    """
+    period = tof2depth(1 / pulse_repetition).to(ureg.meter)
+    if bin_width is None:
+        return period / n_bins
+
+    bin_width_m = bin_width.to(ureg.meter)
+    if not bin_width_m.magnitude > 0:
+        raise ValueError(f"bin_width must be positive, got {bin_width}.")
+
+    window = n_bins * bin_width_m
+    if window > period * (1 + MAX_DEPTH_RTOL):
+        raise ValueError(
+            f"The histogram window, n_bins x bin_width = {n_bins} x {bin_width_m:~P} = {window:.6g~P}, exceeds one "
+            f"laser period, c / (2 * pulse_repetition) = {period:.6g~P} at {pulse_repetition:.6g~P}. Use fewer or "
+            "narrower bins, or a lower pulse_repetition."
+        )
+    return bin_width_m
 
 
 @ureg.wraps(ureg.radian, (ureg.meter, ureg.meter))
@@ -284,6 +313,10 @@ def preproc_frames(
 
     Depths that are not finite, not positive, or at least DEPTH_CUTOFF (rays that miss every object) are set to 0,
     which the histogrammer treats as no laser return.
+
+    ``histogrammer.max_depth`` in ``config``, the largest depth expected in the scene, is optional. When set, it must
+    not exceed the unambiguous range ``c / (2 * pulse_repetition)``, and it is the depth of the value 255 of an 8-bit
+    depth image, which needs it.
     """
     if depth_type not in DEPTH_TYPES:
         raise ValueError(f"Unknown depth_type {depth_type!r}, expected one of {DEPTH_TYPES}.")
@@ -298,17 +331,19 @@ def preproc_frames(
     tmax = (1.0 / pulse_rep).to(ureg.second)
     max_resolvable_depth = (tmax * (c * ureg.meter / ureg.second) / 2).to(ureg.meter)
 
-    scale_depth = config["histogrammer"]["max_depth"]
-    if not hasattr(scale_depth, "to"):
-        scale_depth = scale_depth * ureg.meter
-    else:
-        scale_depth = scale_depth.to(ureg.meter)
+    max_depth = None
+    scale_depth = config.get("histogrammer", {}).get("max_depth")
+    if scale_depth is not None:
+        if not hasattr(scale_depth, "to"):
+            scale_depth = scale_depth * ureg.meter
+        else:
+            scale_depth = scale_depth.to(ureg.meter)
 
-    if scale_depth > max_resolvable_depth * (1 + MAX_DEPTH_RTOL):
-        raise ValueError(
-            f"histogrammer.max_depth ({scale_depth}) exceeds max resolvable depth ({max_resolvable_depth})."
-        )
-    max_depth = scale_depth.magnitude
+        if scale_depth > max_resolvable_depth * (1 + MAX_DEPTH_RTOL):
+            raise ValueError(
+                f"histogrammer.max_depth ({scale_depth}) exceeds max resolvable depth ({max_resolvable_depth})."
+            )
+        max_depth = scale_depth.magnitude
 
     def _to_numpy(frame):
         # Dataset.__getitem__ returns (data, transform); image array is at index 0
@@ -326,6 +361,8 @@ def preproc_frames(
         raw_depth = raw_depth[:, :, 0]
 
     if np.issubdtype(raw_depth.dtype, np.integer):
+        if max_depth is None:
+            raise ValueError("An 8-bit depth image needs histogrammer.max_depth, the depth of its value 255.")
         depth_img = raw_depth.astype(np.float32) / 255.0 * float(max_depth)
     else:
         depth_img = raw_depth.astype(np.float32)
@@ -442,6 +479,7 @@ def _validate_config(config: dict) -> None:
         ("histogrammer", "min_depth"): ureg.meter.dimensionality,
         ("histogrammer", "max_depth"): ureg.meter.dimensionality,
         ("histogrammer", "bin_width"): ureg.meter.dimensionality,
+        ("histogrammer", "time_offset"): ureg.second.dimensionality,
         ("histogrammer", "dead_time"): ureg.second.dimensionality,
         ("active_source", "pulsed_laser", "wavelength"): ureg.meter.dimensionality,
         ("active_source", "pulsed_laser", "pulse_repetition"): ureg.hertz.dimensionality,
@@ -497,14 +535,11 @@ def _validate_config(config: dict) -> None:
         if max_depth is not None and max_depth > max_resolvable_depth * (1 + MAX_DEPTH_RTOL):
             errors.append(f"Max depth ({max_depth}) exceeds max resolvable depth ({max_resolvable_depth}).")
 
-        if n_bins is not None and bin_width is not None:
-            implied_bw = max_resolvable_depth / n_bins
-            ratio = (bin_width / implied_bw).to(ureg.dimensionless).magnitude
-            if not np.isclose(ratio, 1.0, rtol=5e-2):
-                errors.append(
-                    f"Configured bin_width ({bin_width}) contradicts implied bin width ({implied_bw:.6f~P}) "
-                    f"from pulse_repetition ({pulse_rep}) and n_bins ({n_bins})."
-                )
+        if n_bins is not None:
+            try:
+                histogram_bin_width(n_bins, pulse_rep, bin_width)
+            except ValueError as err:
+                errors.append(str(err))
 
     if errors:
         raise ValueError("Invalid configuration:\n - " + "\n - ".join(errors))
@@ -607,6 +642,7 @@ def _build_config(
         "max_depth": ("histogrammer", "max_depth"),
         "n_bins": ("histogrammer", "n_bins"),
         "bin_width": ("histogrammer", "bin_width"),
+        "time_offset": ("histogrammer", "time_offset"),
         "pixel_fov_list": ("histogrammer", "pixel_fov_list"),
         "vignette": ("histogrammer", "vignette"),
         "n_pulses": ("histogrammer", "n_pulses"),
@@ -639,6 +675,7 @@ def _build_config(
         "min_depth": "meters",
         "max_depth": "meters",
         "bin_width": "meters",
+        "time_offset": "nanoseconds",
         "dead_time": "nanoseconds",
         "active_wavelength": "nanometers",
         "active_pulse_repetition": "megahertz",
@@ -692,9 +729,11 @@ def prepare_config(user_args: dict, config_file: Path | str | None = None) -> di
     DEFAULT_CONFIG = {
         "histogrammer": {
             "min_depth": 0 * ureg.meters,
-            "max_depth": 10 * ureg.meters,
+            # Unset: no depth limit to check, and the histogram spans one laser period in n_bins bins
+            "max_depth": None,
             "n_bins": 672,
-            "bin_width": tof2depth(1 / (10 * ureg.megahertz)) / 672,
+            "bin_width": None,
+            "time_offset": 0 * ureg.nanoseconds,
             "pixel_fov_list": [[0, 1.0, 0, 1.0]],
             "vignette": False,
             "n_pulses": 10000,

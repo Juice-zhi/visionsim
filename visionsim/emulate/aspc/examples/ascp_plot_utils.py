@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib import patches
+from scipy.constants import c as speed_of_light
 
 plt.style.use("seaborn-v0_8-paper")
 
@@ -21,14 +22,40 @@ plt.rcParams.update(
 )
 
 
+def bin_to_range(bins, bin_width, time_offset=0.0):
+    """Range in meters at the start of histogram bin(s) ``bins``, the inverse of the emulator's binning.
+
+    A return at range r lands in bin ``floor((r + c * time_offset / 2) / bin_width)``, so bin k starts at range
+    ``k * bin_width - c * time_offset / 2``. ``bin_width`` is a one-way distance in meters and ``time_offset`` a time in
+    seconds, each a float or a Pint quantity (see ``HistConfig``).
+    """
+    bin_width_m = bin_width.to("meter").magnitude if hasattr(bin_width, "to") else bin_width
+    time_offset_s = time_offset.to("second").magnitude if hasattr(time_offset, "to") else time_offset
+    return np.asarray(bins) * bin_width_m - speed_of_light * time_offset_s / 2
+
+
 def plot_spad_sensor_grid(
-    histogrammer, fov_masks, grid_shape, albedo_frame, depth_frame, transients, arrival_rates, ewh_list, save_path=None
+    histogrammer,
+    fov_masks,
+    grid_shape,
+    albedo_frame,
+    depth_frame,
+    transients,
+    arrival_rates,
+    ewh_list,
+    save_path=None,
+    bin_width=None,
+    time_offset=None,
 ):
     """
     Visualizes SPAD data and saves three distinct plots:
     1. Reconstruction: Ground Truth vs Simulator Estimate
     2. Overlay: Sensor Grid over Ground Truth Albedo/Depth
     3. Waveforms: Transient Response vs Generated Histogram (EWH)
+
+    The peak bin of each histogram is mapped to a range with :func:`bin_to_range`, using ``bin_width`` and
+    ``time_offset``, which default to the histogrammer's. A histogrammer without a bin_width divides one laser period
+    into its bins, so pass ``bin_width=detector.get_bin_width(emitter)`` for it.
     """
     rows, cols = grid_shape
 
@@ -115,14 +142,21 @@ def plot_spad_sensor_grid(
     depth_map_est = np.zeros((rows, cols))
     depth_map_gt = np.zeros((rows, cols))
 
-    # Calculate bin width
-    max_depth_val = histogrammer.max_depth
-    if hasattr(max_depth_val, "magnitude"):
-        max_depth_val = max_depth_val.magnitude
-    bin_dist_m = max_depth_val / histogrammer.n_bins
+    # Bin width and time offset of the histograms, as used by the emulator (max_depth does not set the bins)
+    if bin_width is None:
+        bin_width = getattr(histogrammer, "bin_width", None)
+    if bin_width is None:
+        raise ValueError(
+            "The histogrammer has no bin_width, so its bins divide one laser period: pass "
+            "bin_width=detector.get_bin_width(emitter)."
+        )
+    if time_offset is None:
+        time_offset = getattr(histogrammer, "time_offset", 0.0)
+    bin_dist_m = float(bin_to_range(1, bin_width))
+    offset_dist_m = -float(bin_to_range(0, bin_width, time_offset))
 
     print("bin_dist_m: ", bin_dist_m)
-    print("max_depth_val m", max_depth_val)
+    print("time offset m", offset_dist_m)
 
     # Fill maps
     for r in range(rows):
@@ -134,7 +168,7 @@ def plot_spad_sensor_grid(
                 peak_bin = np.argmax(ewh_data[idx])
                 # Filter: Only estimate depth if there are photons
                 if np.sum(ewh_data[idx]) > 0:
-                    depth_map_est[r, c] = (peak_bin) * bin_dist_m
+                    depth_map_est[r, c] = bin_to_range(peak_bin, bin_width, time_offset)
 
             # Ground Truth
             if idx < len(fov_masks):
@@ -158,14 +192,8 @@ def plot_spad_sensor_grid(
     fig_maps, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     fig_maps.suptitle(f"Reconstruction{scenario_name}", fontsize=16)
 
-    num_bins = transients.shape[-1]
-    depth_max = depth_map_gt.max()
-
-    # Calculate the physical size/depth width of a single temporal bin
-    bin_size = depth_max / num_bins
-
-    # Divide by bin size, truncate to integer to group them, then multiply back
-    depth_image_quantized = (depth_map_gt / bin_size).astype(np.int32) * bin_size
+    # Quantize the ground truth to the start of its histogram bin, like the estimate
+    depth_image_quantized = bin_to_range(np.floor((depth_map_gt + offset_dist_m) / bin_dist_m), bin_width, time_offset)
 
     im1 = ax1.imshow(depth_image_quantized, cmap="turbo", interpolation="nearest", vmin=vmin_depth, vmax=vmax_depth)
     ax1.set_title("Ground Truth (Ideal)")

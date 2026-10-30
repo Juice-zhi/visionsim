@@ -75,6 +75,10 @@ class ASPCEmulator:
         self.device = torch.device(device) if isinstance(device, str) else device
         self.detector, self.emitter, self.scene = _build_lidar(config, device=self.device)
 
+        # Check the histogram's window against the laser period now, rather than at the first frame
+        if self.emitter is not None:
+            self.detector.get_bin_width(self.emitter)
+
     def process_frame(
         self,
         depth_frame: Quantity | torch.Tensor,

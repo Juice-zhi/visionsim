@@ -14,8 +14,10 @@ from visionsim.emulate.aspc.emitter import PulsedLaser
 from visionsim.emulate.aspc.histogrammers import HistogrammerBase
 from visionsim.emulate.aspc.sensors import SPADSensor
 from visionsim.emulate.aspc.utils import (
+    histogram_bin_width,
     incidence_cosine,
     irradiance_photons,
+    tof2depth,
     ureg,
     radiance_photons,
 )
@@ -39,6 +41,9 @@ class Detector:
     Frames passed to the detector span the sensor's field of view, and each pixel is weighted by the sensor's
     ``falloff`` (see :class:`~visionsim.emulate.aspc.sensors.SensorBase`). A zone's transient is the mean of its
     pixels', i.e. photons per pixel of the zone.
+
+    The histogram has the histogrammer's ``n_bins`` bins of ``bin_width`` (see :meth:`get_bin_width`), starting
+    ``time_offset`` before the laser pulse (see :class:`~visionsim.emulate.aspc.histogrammers.HistConfig`).
     """
 
     def __init__(
@@ -160,6 +165,43 @@ class Detector:
 
         return torch.concat(mask_list)
 
+    def get_bin_width(self, emitter: PulsedLaser) -> Quantity:
+        """Returns the histogram's bin width as a one-way distance (c * t / 2), in meters.
+
+        It is the histogrammer's ``bin_width`` if set, and otherwise one laser period divided into ``n_bins`` bins, see
+        :func:`~visionsim.emulate.aspc.utils.histogram_bin_width`. It sets the bins of the returns, the sampling of the
+        pulse shape and the dead time in bins; the photons per laser cycle follow from the repetition rate.
+
+        Raises:
+            ValueError: if the histogram's window, ``n_bins * bin_width``, exceeds one laser period, or if a
+                free-running SPAD with dead time has a window shorter than the period. Such a SPAD also detects
+                photons between the end of the window and the next pulse, which is not simulated.
+        """
+        bin_width = histogram_bin_width(
+            self.histogrammer.n_bins, emitter.pulse_repetition, getattr(self.histogrammer, "bin_width", None)
+        )
+
+        if getattr(self.histogrammer, "free_running", False) and self._get_dead_time_bins(bin_width) > 0:
+            period = emitter.max_resolvable_depth.to(ureg.meter)
+            # Like the dead time, the period is simulated in whole bins
+            if round((period / bin_width).to(ureg.dimensionless).magnitude) > self.histogrammer.n_bins:
+                raise ValueError(
+                    f"A free-running SPAD with dead time needs a histogram window of one laser period, got "
+                    f"n_bins x bin_width = {self.histogrammer.n_bins * bin_width:.6g~P} for a period of "
+                    f"{period:.6g~P}. Set free_running to False (a SPAD re-armed at every laser cycle), or leave "
+                    "bin_width unset."
+                )
+        return bin_width
+
+    def _get_time_offset(self) -> Quantity:
+        """The histogrammer's ``time_offset`` as a one-way distance (c * t / 2), in meters."""
+        time_offset = getattr(self.histogrammer, "time_offset", None)
+        return 0.0 * ureg.meter if time_offset is None else tof2depth(time_offset).to(ureg.meter)
+
+    def _get_dead_time_bins(self, bin_width: Quantity) -> int:
+        """The histogrammer's ``dead_time`` in whole bins of ``bin_width``."""
+        return int(np.round((tof2depth(self.histogrammer.dead_time) / bin_width).to(ureg.dimensionless).magnitude))
+
     def _get_falloff(self, shape: tuple[int, ...]) -> torch.Tensor:
         """The sensor's off-axis falloff for frames of shape ``(..., H, W)``."""
         h, w = shape[-2:]
@@ -252,7 +294,10 @@ class Detector:
         """Calculates spatial-temporal transients over laser ToF bins.
 
         ``depth_frame`` is each pixel's range (the distance along its ray, not planar depth), which sets both its bin
-        and its 1 / range^2 falloff. See :func:`~visionsim.emulate.aspc.utils.planar_depth_to_range`.
+        and its 1 / range^2 falloff. See :func:`~visionsim.emulate.aspc.utils.planar_depth_to_range`. A return at
+        range r arrives ``2 * r / c + time_offset`` after the start of the histogram's window, modulo one laser period,
+        and lands in one of its ``n_bins`` bins of :meth:`get_bin_width`, or, if it arrives after the window, is not
+        recorded (see :meth:`~visionsim.emulate.aspc.histogrammers.HistogrammerBase.calculate_transients`).
 
         ``normal_frame`` holds each pixel's surface normal in the camera frame (+X right, +Y up, looking along -Z),
         with shape ``(..., H, W, 3)``, as :func:`~visionsim.emulate.aspc.utils.preproc_normals` returns it. The laser
@@ -264,6 +309,7 @@ class Detector:
         each pixel already carries its own solid angle; with ``falloff="none"`` each zone is rescaled by
         :func:`~visionsim.emulate.aspc.utils.get_irradiance_with_fov`, as before.
         """
+        bin_width = self.get_bin_width(emitter)
         if normal_frame is None:
             _log_without_normals()
 
@@ -290,12 +336,14 @@ class Detector:
             offsets=offsets,
             fov_masks=fov_masks,
             gt_ntime_bins=self.histogrammer.n_bins,
-            max_depth=emitter.max_resolvable_depth.magnitude,
+            max_depth=emitter.max_resolvable_depth.to(ureg.meter).magnitude,
             sensor_fov=self.sensor.fov if rescale_zones else None,
             pixel_fov_list=self.pixel_fov_list,
             w=self.sensor.w,
             h=self.sensor.h,
             omega=self.sensor.omega if rescale_zones else None,
+            bin_width=bin_width.magnitude,
+            time_offset=self._get_time_offset().magnitude,
         )
 
         self.transients = transients
@@ -303,22 +351,15 @@ class Detector:
         return transients, ambient_offsets
 
     def get_arrival_rates(self, emitter: PulsedLaser) -> torch.Tensor:
-        """Convolves transients with IRF pulse kernel and adds background offset noise."""
+        """Convolves transients with IRF pulse kernel and adds background offset noise.
+
+        The pulse shape is sampled at the histogram's bin width, :meth:`get_bin_width`. Since the transients only hold
+        the returns that arrive in the histogram's window, the pulse of a return just outside it does not reach it.
+        """
         if self.transients is None:
             raise RuntimeError("Transients not computed. Call get_transients() first.")
 
-        bin_width = emitter.max_resolvable_depth / self.histogrammer.n_bins
-
-        configured = getattr(self.histogrammer, "bin_width", None)
-        if configured is not None:
-            ratio = (configured / bin_width).to(ureg.dimensionless).magnitude
-            if not np.isclose(ratio, 1.0, rtol=5e-2):
-                raise ValueError(
-                    f"Configured histogrammer.bin_width ({configured}) disagrees with "
-                    f"implied bin width ({bin_width}) from laser pulse_repetition and n_bins."
-                )
-
-        _, irf = emitter.get_kernel(bin_width, normalize="sum")
+        _, irf = emitter.get_kernel(self.get_bin_width(emitter), normalize="sum")
         irf_tensor = torch.tensor(irf, dtype=torch.float32, device=self.device)
 
         arrival_rates = self.histogrammer.calculate_arrival_rates(
@@ -329,17 +370,12 @@ class Detector:
         return arrival_rates
 
     def get_ewh(self, emitter: PulsedLaser) -> list[torch.Tensor]:
-        """Simulates SPAD Equi-Width Histogram (EWH) output."""
+        """Simulates SPAD Equi-Width Histogram (EWH) output. The dead time is rounded to whole bins of
+        :meth:`get_bin_width`."""
         if self.arrival_rates is None:
             raise RuntimeError("Arrival rates not computed. Call get_arrival_rates() first.")
 
-        dead_time_bins = int(
-            np.round(
-                self.histogrammer.dead_time.to(ureg.second).magnitude
-                * self.histogrammer.n_bins
-                * emitter.pulse_repetition.to(ureg.hertz).magnitude
-            )
-        )
+        dead_time_bins = self._get_dead_time_bins(self.get_bin_width(emitter))
 
         ewh_list = self.histogrammer.simulate_ewh(
             arrival_rates=self.arrival_rates,

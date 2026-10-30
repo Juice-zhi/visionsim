@@ -428,6 +428,7 @@ def aspc(
     max_depth: float | None = None,
     n_bins: int | None = None,
     bin_width: float | None = None,
+    time_offset: float | None = None,
     pixel_fov_list: Path | None = None,
     vignette: bool | None = None,
     n_pulses: int | None = None,
@@ -484,15 +485,24 @@ def aspc(
         input_dir: directory containing the input rendered frames and depth maps, and optionally normal maps.
         output_dir: directory in which to save the simulated SP LiDAR data.
         config_file: path to an optional YAML configuration file for the simulation parameters.
-        min_depth: minimum resolvable depth for the histogram. Given in meters.
-        max_depth: maximum resolvable depth for the histogram. Given in meters.
-        n_bins: total number of temporal bins in the histogram.
-        bin_width: spatial width of each individual histogram bin. Given in meters.
+        min_depth: smallest depth expected in the scene. It is only checked (at least 0 and below max_depth) and does
+            not change the histogram. Given in meters.
+        max_depth: largest depth expected in the scene, unset by default. It must not exceed the unambiguous range
+            c / (2 * pulse repetition), and is the depth of the value 255 of an 8-bit depth image. It does not set
+            the histogram's range, which is n_bins bins of bin_width from the start of the window. Given in meters.
+        n_bins: number of bins in the histogram.
+        bin_width: width of each histogram bin, as a one-way distance (c * t / 2). The window, n_bins * bin_width,
+            must fit in one laser period, and returns that arrive after it are not recorded. By default, one laser
+            period is divided into n_bins bins. Given in meters.
+        time_offset: time from the start of the histogram window to the laser pulse. A return at range r lands in
+            bin floor((2 * r / c + time_offset) / bin duration), so time zero is at bin time_offset / bin duration; a
+            negative value opens the window after the pulse. Given in nanoseconds.
         pixel_fov_list: path to specific field of view configurations for individual pixels or macro-pixels.
         vignette: vignetting effect applied to the sensor's optical system.
         n_pulses: number of laser pulses integrated per measurement/histogram.
         dead_time: recovery time required by the SPAD after detecting a photon before it can detect another. Given in nanoseconds.
-        free_running: if true, indicates the SPAD operates in a free-running mode rather than a gated mode.
+        free_running: if true, indicates the SPAD operates in a free-running mode rather than a gated mode. With
+            dead time, a free-running SPAD needs a histogram window of one whole laser period.
         max_detections_per_cycle: gated mode only, the most photons recorded per laser cycle. 1 (the default) keeps
             the first photon of each cycle; a larger value re-arms the SPAD after each detection and its dead time, up
             to that many detections. For no cap, set it to null in the config file.

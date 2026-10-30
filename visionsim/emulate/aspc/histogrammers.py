@@ -11,7 +11,7 @@ from pint import Quantity
 from torch import Tensor
 
 from visionsim.utils.progress import ElapsedProgress
-from visionsim.emulate.aspc.utils import DEPTH_CUTOFF, get_irradiance_with_fov, ureg, validate_units
+from visionsim.emulate.aspc.utils import DEPTH_CUTOFF, MAX_DEPTH_RTOL, get_irradiance_with_fov, ureg, validate_units
 
 # =============================================================================
 # MONTE-CARLO SAMPLING & DEAD-TIME WALK KERNELS
@@ -556,6 +556,29 @@ def calculate_distorted_transient_sync(
 # =============================================================================
 
 
+def _bin_returns(
+    depths: torch.Tensor,
+    n_bins: int,
+    max_depth: float,
+    bin_width: float | None,
+    time_offset: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Histogram bin of each return, and a mask of the returns that land in the histogram's window.
+
+    A return at range r arrives ``r + time_offset`` (one-way distances) after the start of the window, modulo one laser
+    period, ``max_depth``, and lands in bin ``floor(arrival / bin_width)``. Without a bin width the window is the whole
+    period, divided into n_bins bins, so every return lands in it. Bins are computed in the dtype of ``depths``.
+    """
+    if bin_width is None:
+        transient_idx = torch.floor((depths + time_offset) * n_bins / max_depth).to(torch.long)
+        transient_idx = torch.remainder(transient_idx, n_bins)
+        return transient_idx, torch.ones_like(transient_idx, dtype=torch.bool)
+
+    arrival = torch.remainder(depths + time_offset, max_depth)
+    transient_idx = torch.floor(arrival / bin_width).to(torch.long)
+    return transient_idx, transient_idx < n_bins
+
+
 class HistogrammerBase:
     """Base class for SPAD readout and TDC histogramming operations."""
 
@@ -619,19 +642,36 @@ class HistogrammerBase:
         w: int | None = None,
         h: int | None = None,
         omega: float | None = None,
+        bin_width: float | None = None,
+        time_offset: float = 0.0,
     ) -> tuple[torch.Tensor, list]:
         """Bins each zone's per-pixel laser returns by depth into a transient and averages its ambient offset.
 
-        ``depth_frames`` hold each pixel's range, the one-way distance along its ray (not planar depth), so a return
-        at range r lands in bin ``floor(r * gt_ntime_bins / max_depth)``. Depths beyond max_depth wrap around (range
-        aliasing). Depths that are not finite, not positive, or at least DEPTH_CUTOFF (rays that miss every object)
-        add no laser return, but their pixels still count in the zone mean and in the ambient offset.
+        ``depth_frames`` hold each pixel's range, the one-way distance along its ray (not planar depth). ``max_depth``
+        is one laser period as a one-way distance, the unambiguous range ``c / (2 * pulse_repetition)``, and
+        ``bin_width`` and ``time_offset`` are also one-way distances (c * t / 2), all in meters. A return at range r
+        arrives ``r + time_offset`` after the start of the histogram's window, modulo one laser period (range
+        aliasing), and lands in bin ``floor((r + time_offset) / bin_width)`` of that period if it is one of the
+        ``gt_ntime_bins`` bins of the window; returns that arrive after the window are not recorded. Without a
+        ``bin_width``, or with one whose window is the whole period (up to rounding, see MAX_DEPTH_RTOL), the period
+        is divided into exactly ``gt_ntime_bins`` bins, and every return lands in one of them. Depths that are not
+        finite, not positive, or at least DEPTH_CUTOFF (rays that miss every object) add no laser return, but their
+        pixels still count in the zone mean and in the ambient offset.
 
         A zone's transient is the mean of its pixels' irradiance, weighted by its FOV mask. If ``sensor_fov``,
         ``pixel_fov_list``, ``w``, ``h`` and ``omega`` are all given, each zone is also rescaled by
         :func:`~visionsim.emulate.aspc.utils.get_irradiance_with_fov`, which is only meant for irradiance that does
         not already carry each pixel's solid angle.
+
+        The ambient offsets are photons per laser cycle, spread evenly over the period, so each bin gets the fraction
+        ``bin_width / max_depth`` of them.
         """
+        if bin_width is not None and gt_ntime_bins * bin_width >= max_depth * (1 - MAX_DEPTH_RTOL):
+            # The window is the whole period, so it is divided into exactly gt_ntime_bins bins
+            bin_width = None
+        # Bins in one laser period, over which the ambient light of a cycle is spread
+        bins_per_period = gt_ntime_bins if bin_width is None else max_depth / bin_width
+
         if hasattr(irradiance_frames, "magnitude"):
             irradiance_frames = irradiance_frames.magnitude
         if hasattr(depth_frames, "magnitude"):
@@ -695,7 +735,7 @@ class HistogrammerBase:
                         current_depth_vals = current_depth_vals[valid]
                         fov_irradiance_vals = fov_irradiance_vals[valid]
 
-                        ambient_offsets.append(masked_offsets.sum() / (n_fov_pixels * gt_ntime_bins))
+                        ambient_offsets.append(masked_offsets.sum() / (n_fov_pixels * bins_per_period))
 
                         if current_depth_vals.numel() == 0:
                             transient_list.append(
@@ -703,11 +743,14 @@ class HistogrammerBase:
                             )
                             continue
 
-                        transient_idx = torch.floor(current_depth_vals * gt_ntime_bins / max_depth).to(torch.long)
-                        transient_idx = torch.remainder(transient_idx, gt_ntime_bins)
+                        transient_idx, in_window = _bin_returns(
+                            current_depth_vals, gt_ntime_bins, max_depth, bin_width, time_offset
+                        )
 
                         row = torch.zeros(gt_ntime_bins, dtype=fov_irradiance_vals.dtype, device=device)
-                        row = row.scatter_add(0, transient_idx, fov_irradiance_vals / n_fov_pixels)
+                        row = row.scatter_add(
+                            0, transient_idx[in_window], (fov_irradiance_vals / n_fov_pixels)[in_window]
+                        )
                         transient_list.append(row.unsqueeze(0))
                         progress.advance(task)
             return torch.concat(transient_list), ambient_offsets
@@ -753,17 +796,18 @@ class HistogrammerBase:
                     current_depth_vals = current_depth_vals[valid]
                     fov_irradiance_vals = fov_irradiance_vals[valid]
 
-                    ambient_offsets.append(masked_offsets.sum() / (n_fov_pixels * gt_ntime_bins))
+                    ambient_offsets.append(masked_offsets.sum() / (n_fov_pixels * bins_per_period))
 
                     if current_depth_vals.numel() == 0:
                         transient_list.append(torch.zeros((1, gt_ntime_bins), dtype=irradiance_frames.dtype, device=device))
                         continue
 
-                    transient_idx = torch.floor(current_depth_vals * gt_ntime_bins / max_depth).to(torch.long)
-                    transient_idx = torch.remainder(transient_idx, gt_ntime_bins)
+                    transient_idx, in_window = _bin_returns(
+                        current_depth_vals, gt_ntime_bins, max_depth, bin_width, time_offset
+                    )
 
                     row = torch.zeros(gt_ntime_bins, dtype=fov_irradiance_vals.dtype, device=device)
-                    row = row.scatter_add(0, transient_idx, fov_irradiance_vals / n_fov_pixels)
+                    row = row.scatter_add(0, transient_idx[in_window], (fov_irradiance_vals / n_fov_pixels)[in_window])
                     transient_list.append(row.unsqueeze(0))
                     progress.advance(task)
             return torch.concat(transient_list), ambient_offsets
@@ -826,17 +870,37 @@ class HistConfig:
     """Settings of a :class:`Histogrammer` or :class:`HistogrammerEDH`."""
 
     min_depth: Quantity = 0 * ureg.meter
-    max_depth: Quantity = 20 * ureg.meter
+    """Smallest depth expected in the scene. It is only checked (at least 0 and below ``max_depth``) and does not change
+    the histogram"""
+    max_depth: Quantity | None = 20 * ureg.meter
+    """Largest depth expected in the scene, or None. It is checked against the unambiguous range
+    c / (2 * pulse_repetition), and :func:`~visionsim.emulate.aspc.utils.preproc_frames` scales 8-bit depth images to
+    it. It does not set the histogram's range, which is ``n_bins`` bins of ``bin_width`` from the start of the window
+    (see ``time_offset``)"""
     n_bins: int = 1000
-    bin_width: Quantity = 0.03 * ureg.meter
+    """Number of bins of the histogram"""
+    bin_width: Quantity | None = None
+    """Width of a bin, as a one-way distance (c * t / 2). The histogram's window, ``n_bins * bin_width``, must fit in one
+    laser period; returns that arrive after it are not recorded. None divides one laser period into ``n_bins`` bins. The
+    bin width also sets the sampling of the pulse shape and the dead time in bins, while the photons per laser cycle
+    follow from the repetition rate"""
+    time_offset: Quantity = 0 * ureg.second
+    """Time from the start of the histogram's window to the laser pulse. A return at range r arrives
+    ``2 * r / c + time_offset`` after the start of the window, modulo one laser period, and lands in bin
+    ``floor((2 * r / c + time_offset) / bin_duration)``, with ``bin_duration = 2 * bin_width / c``. A positive value
+    opens the window before the pulse, so time zero (range 0) is at bin ``time_offset / bin_duration``; a negative one
+    opens it after the pulse, so returns closer than ``c * |time_offset| / 2`` arrive before the window and, unless the
+    window spans the whole period, are not recorded"""
     n_pulses: int = 100
     """Number of laser cycles integrated into each histogram"""
     dead_time: Quantity = 10e-9 * ureg.second
-    """Time after a detection during which the SPAD cannot detect another photon (non-paralyzable). A synchronous
-    single-hit cycle (``max_detections_per_cycle=1``) does not use it"""
+    """Time after a detection during which the SPAD cannot detect another photon (non-paralyzable), rounded to whole
+    bins. A synchronous single-hit cycle (``max_detections_per_cycle=1``) does not use it"""
     free_running: bool = True
     """If true, the SPAD re-arms after its dead time regardless of the laser cycle (free running). If false, it is also
-    re-armed at the start of every laser cycle (synchronous)"""
+    re-armed at the start of every laser cycle (synchronous), i.e. of every histogram window. With dead time, a
+    free-running SPAD needs a window of a whole laser period, since it also detects photons between the end of a
+    shorter window and the next pulse, which is not simulated"""
     max_detections_per_cycle: int | None = 1
     """Only used when synchronous: the most photons a laser cycle can record. 1 is a single-hit time-to-digital
     converter, which keeps the first photon of each cycle, so ``dead_time`` does not matter. None (no cap) or more than

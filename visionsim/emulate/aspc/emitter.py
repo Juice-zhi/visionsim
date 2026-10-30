@@ -197,10 +197,12 @@ class PulsedLaser(DynamicSource):
 
     @property
     def max_resolvable_depth(self) -> Quantity:
+        """One laser period as a one-way distance, c / (2 * pulse_repetition): the unambiguous range."""
         return tof2depth(1 / self.pulse_repetition)
 
     @property
     def num_photons_per_cycle(self) -> Quantity:
+        """Photons emitted per laser cycle, avg_watts over one period, whatever the histogram's bin width."""
         return watts2photons(self.avg_watts, 1 / self.pulse_repetition, self.wavelength)
 
     def get_scene_radiance(

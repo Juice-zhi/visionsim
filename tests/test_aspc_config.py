@@ -1,5 +1,6 @@
 """Configuration: YAML loading with the ``!Quantity`` / ``!expr`` / ``!file`` tags, the max_depth check, custom pulse
-shapes from a config file or the CLI, and the fast_sim_noise, max_detections_per_cycle and sensor falloff options."""
+shapes from a config file or the CLI, the fast_sim_noise, max_detections_per_cycle and sensor falloff options, and the
+histogram's bin width, window and time offset."""
 
 from pathlib import Path
 
@@ -323,3 +324,110 @@ class TestSensorFalloffConfig:
         config = prepare_config({}, _write(tmp_path, "sensor:\n  falloff: cos2\n"))
         with pytest.raises(ValueError, match="falloff"):
             ASPCEmulator(config)
+
+
+class TestHistogramWindowConfig:
+    """bin_width, time_offset and max_depth: the CLI defaults follow n_bins and the repetition rate, a window shorter
+    than one laser period is accepted, and one longer than it is not."""
+
+    def test_defaults(self):
+        hist = prepare_config({})["histogrammer"]
+        assert hist["bin_width"] is None
+        assert hist["max_depth"] is None
+        assert hist["time_offset"] == 0 * ureg.nanosecond
+
+    @pytest.mark.parametrize(
+        "user_args",
+        [
+            {"n_bins": 128},
+            {"n_bins": 1024},
+            {"active_pulse_repetition": 12.0},
+            {"active_pulse_repetition": 14.9},
+            {"active_pulse_repetition": 15.1},
+            {"active_pulse_repetition": 20.0},
+            {"active_pulse_repetition": 100.0, "n_bins": 64},
+        ],
+        ids=lambda args: ",".join(f"{k}={v}" for k, v in args.items()),
+    )
+    def test_changing_only_n_bins_or_the_rate_is_valid(self, user_args):
+        config = prepare_config(user_args)
+        emulator = ASPCEmulator(config)
+        n_bins = config["histogrammer"]["n_bins"]
+        period = c / (2 * config["active_source"]["pulsed_laser"]["pulse_repetition"].to(ureg.hertz).magnitude)
+        bin_width = emulator.detector.get_bin_width(emulator.emitter)
+        assert bin_width.to(ureg.meter).magnitude == pytest.approx(period / n_bins)
+
+    def test_window_shorter_than_the_period_is_kept(self):
+        config = prepare_config({"n_bins": 128, "bin_width": 0.0141, "free_running": False})
+        assert config["histogrammer"]["bin_width"] == 0.0141 * ureg.meter
+        emulator = ASPCEmulator(config)
+        assert emulator.detector.get_bin_width(emulator.emitter) == 0.0141 * ureg.meter
+
+    @pytest.mark.parametrize(
+        "user_args",
+        [
+            {"n_bins": 128, "bin_width": 0.0141, "active_pulse_repetition": 90.0},
+            {"bin_width": 0.0225},
+            {"bin_width": 0.0235},
+            {"n_bins": 1344, "bin_width": c / (2 * 10e6) / 672},
+        ],
+        ids=["short-period", "0.9-percent-over", "5.3-percent-over", "twice-the-bins-of-one-period"],
+    )
+    def test_window_longer_than_the_period_raises(self, user_args):
+        with pytest.raises(ValueError, match="exceeds one laser period"):
+            prepare_config(user_args)
+
+    def test_negative_bin_width_raises(self):
+        with pytest.raises(ValueError, match="positive"):
+            prepare_config({"bin_width": -0.01})
+
+    def test_time_offset_user_argument_is_in_nanoseconds(self):
+        assert prepare_config({"time_offset": 1.316})["histogrammer"]["time_offset"] == 1.316 * ureg.nanosecond
+
+    def test_time_offset_from_a_config_file(self, tmp_path):
+        config = prepare_config({}, _write(tmp_path, "histogrammer:\n  time_offset: !Quantity 2 ns\n"))
+        assert config["histogrammer"]["time_offset"] == 2 * ureg.nanosecond
+
+    def test_time_offset_must_be_a_time(self, tmp_path):
+        with pytest.raises(ValueError, match="time_offset"):
+            prepare_config({}, _write(tmp_path, "histogrammer:\n  time_offset: !Quantity 2 m\n"))
+
+    def test_cli_time_offset(self, monkeypatch):
+        hist = _cli_config(monkeypatch, "--time-offset", "-1.5")["histogrammer"]
+        assert hist["time_offset"] == -1.5 * ureg.nanosecond
+
+    @pytest.mark.parametrize("args", [("--n-bins", "128"), ("--active-pulse-repetition", "20")])
+    def test_cli_accepts_only_n_bins_or_only_the_rate(self, monkeypatch, args):
+        hist = _cli_config(monkeypatch, *args)["histogrammer"]
+        assert hist["bin_width"] is None
+
+    def test_time_offset_reaches_the_histogrammer(self):
+        emulator = ASPCEmulator(
+            prepare_config({"time_offset": 2.0, "n_bins": 128, "bin_width": 0.0141, "free_running": False})
+        )
+        assert emulator.detector.histogrammer.time_offset == 2 * ureg.nanosecond
+        assert emulator.detector._get_time_offset().to(ureg.meter).magnitude == pytest.approx(c * 1e-9)
+
+    def test_free_running_short_window_fails_before_the_output_is_touched(self, tmp_path):
+        from visionsim.cli.emulate import aspc as aspc_cli
+
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+        (output_dir / "previous.txt").write_text("previous run")
+        with pytest.raises(ValueError, match="free-running"):
+            aspc_cli(input_dir=tmp_path / "in", output_dir=output_dir, n_bins=128, bin_width=0.0141, force=True)
+        assert (output_dir / "previous.txt").exists()
+
+    def test_preproc_frames_without_max_depth(self):
+        config = prepare_config({"sensor_size": (2, 2)})
+        depth, _, _ = preproc_frames(np.full((2, 2), 3.0), np.ones((2, 2)), np.ones((2, 2)), config, depth_type="range")
+        assert np.allclose(depth.magnitude.numpy(), 3.0)
+
+    def test_8_bit_depth_needs_max_depth(self):
+        config = prepare_config({"sensor_size": (2, 2)})
+        depth_8bit = np.full((2, 2), 128, dtype=np.uint8)
+        with pytest.raises(ValueError, match="max_depth"):
+            preproc_frames(depth_8bit, np.ones((2, 2)), np.ones((2, 2)), config, depth_type="range")
+        config["histogrammer"]["max_depth"] = 10 * ureg.meter
+        depth, _, _ = preproc_frames(depth_8bit, np.ones((2, 2)), np.ones((2, 2)), config, depth_type="range")
+        assert np.allclose(depth.magnitude.numpy(), 128 / 255 * 10, rtol=1e-6)
