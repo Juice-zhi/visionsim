@@ -277,5 +277,6 @@ class Detector:
             dead_time_bins=dead_time_bins,
             fast_sim=self.histogrammer.fast_sim,
             fast_sim_noise=self.histogrammer.fast_sim_noise,
+            max_detections_per_cycle=self.histogrammer.max_detections_per_cycle,
         )
         return ewh_list

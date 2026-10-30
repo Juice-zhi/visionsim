@@ -255,6 +255,105 @@ class TestSimulateEwhDispatch:
 
 
 # =========================================================================== #
+# 3e-2 — detections per synchronous cycle: one detector for both paths         #
+# =========================================================================== #
+def _first_photon_counts(phi, n_pulses):
+    """Expected histogram of a synchronous cycle that records only its first photon, in float64."""
+    phi = phi.double()
+    return n_pulses * -torch.expm1(-phi) * torch.exp(-(torch.cumsum(phi, dim=-1) - phi))
+
+
+SYNC_CAPS = [
+    pytest.param(3, 1, id="single-hit-dt3"),
+    pytest.param(0, 1, id="single-hit-dt0"),
+    pytest.param(3, None, id="no-cap-dt3"),
+    pytest.param(1, None, id="no-cap-dt1"),
+    pytest.param(MC_B - 1, None, id="no-cap-dt-just-under-a-period"),
+    pytest.param(0, None, id="no-cap-dt0"),
+    pytest.param(3, 2, id="cap-2-dt3"),
+    pytest.param(0, 2, id="cap-2-dt0"),
+]
+
+
+class TestDetectionsPerCycle:
+    """``max_detections_per_cycle``: the Monte Carlo and the fast path simulate the same synchronous detector."""
+
+    def test_default_is_single_hit(self):
+        assert HistConfig().max_detections_per_cycle == 1
+        assert Histogrammer(HistConfig()).max_detections_per_cycle == 1
+
+    @pytest.mark.parametrize("dt", [0, 3, MC_B - 1])
+    def test_monte_carlo_default_records_the_first_photon(self, dt):
+        """With the default settings a synchronous cycle records at most one photon, whatever the dead time."""
+        h = Histogrammer(HistConfig())
+        phi = _phi((MC_B,), seed=3)
+        torch.manual_seed(0)
+        mc = h.simulate_ewh(phi[None], MC_PULSES, MC_B, free_running=False, dead_time_bins=dt, fast_sim=False)[0]
+        expected = _first_photon_counts(phi, MC_PULSES)
+        assert float(mc.sum()) <= MC_PULSES
+        assert torch.all((mc.double() - expected).abs() <= 6 * torch.sqrt(expected) + 1)
+
+    @pytest.mark.parametrize("dt,cap", SYNC_CAPS)
+    def test_fast_path_matches_monte_carlo(self, dt, cap):
+        h = Histogrammer(HistConfig())
+        rates = torch.stack([_phi((MC_B,), seed=3), _phi((MC_B,), seed=4) * 0.05])
+        kwargs = dict(free_running=False, dead_time_bins=dt, max_detections_per_cycle=cap)
+        fast = h.simulate_ewh(rates, MC_PULSES, MC_B, fast_sim=True, **kwargs)
+        torch.manual_seed(0)
+        mc = h.simulate_ewh(rates, MC_PULSES, MC_B, fast_sim=False, **kwargs)
+        for f, m in zip(fast, mc):
+            f, m = f.double(), m.double()
+            assert float(m.sum()) == pytest.approx(float(f.sum()), abs=5 * float(f.sum()) ** 0.5)
+            assert torch.all((m - f).abs() <= 6 * torch.sqrt(f) + 1)
+
+    def test_multi_hit_records_more_than_one_photon_per_cycle(self):
+        h = Histogrammer(HistConfig())
+        rates = _phi((1, MC_B), seed=3)
+        kwargs = dict(free_running=False, dead_time_bins=3, fast_sim=False)
+        totals = []
+        for cap in (1, 2, None):
+            torch.manual_seed(0)
+            totals.append(float(h.simulate_ewh(rates, MC_PULSES, MC_B, max_detections_per_cycle=cap, **kwargs)[0].sum()))
+        assert totals[0] <= MC_PULSES < totals[1] < totals[2]
+
+    @pytest.mark.parametrize("fast_sim", [True, False])
+    def test_free_running_does_not_use_the_cap(self, fast_sim):
+        h = Histogrammer(HistConfig())
+        rates = _phi((2, MC_B), seed=3)
+        hists = []
+        for cap in (1, 2, None):
+            torch.manual_seed(0)
+            hists.append(
+                h.simulate_ewh(
+                    rates,
+                    2000,
+                    MC_B,
+                    free_running=True,
+                    dead_time_bins=3,
+                    fast_sim=fast_sim,
+                    max_detections_per_cycle=cap,
+                )
+            )
+        for other in hists[1:]:
+            assert all(torch.equal(a, b) for a, b in zip(hists[0], other))
+
+    @pytest.mark.parametrize("fast_sim", [True, False])
+    @pytest.mark.parametrize("cap", [0, -1, 1.5])
+    def test_invalid_cap_raises(self, fast_sim, cap):
+        h = Histogrammer(HistConfig())
+        with pytest.raises(ValueError, match="max_detections_per_cycle"):
+            h.simulate_ewh(
+                _phi((1, MC_B)),
+                100,
+                MC_B,
+                free_running=False,
+                dead_time_bins=3,
+                fast_sim=fast_sim,
+                max_detections_per_cycle=cap,
+            )
+
+
+# =========================================================================== #
 # 3f — EDH is a reduction of the EWH                                           #
 # =========================================================================== #
 EDH_PULSES = 4000
@@ -296,6 +395,25 @@ class TestEdhFromEwh:
             generator=torch.Generator().manual_seed(9),
         )
         assert torch.equal(hist_edh, hist_ewh)
+
+    @pytest.mark.parametrize("cap", [1, None])
+    def test_synchronous_photon_hist_uses_the_cap(self, cap):
+        phi = _phi((B,), seed=2)
+        hist_edh, _ = HistogrammerEDH(HistConfig()).simulate_pixel_edh(
+            phi, EDH_PULSES, 4, False, 3, generator=torch.Generator().manual_seed(9), max_detections_per_cycle=cap
+        )
+        hist_ewh = Histogrammer(HistConfig()).simulate_pixel_ewh(
+            phi, EDH_PULSES, B, False, 3, generator=torch.Generator().manual_seed(9), max_detections_per_cycle=cap
+        )
+        assert torch.equal(hist_edh, hist_ewh)
+        assert (float(hist_edh.sum()) <= EDH_PULSES) == (cap == 1)
+
+    def test_synchronous_default_is_single_hit(self):
+        phi = _phi((B,), seed=2)
+        hists, _ = HistogrammerEDH(HistConfig()).simulate_edh(
+            phi[None], EDH_PULSES, 4, free_running=False, dead_time_bins=3
+        )
+        assert float(hists[0].sum()) <= EDH_PULSES
 
     def test_photon_hist_is_at_full_tdc_resolution(self):
         hist, edh = _edh(n_edh_bins=4)

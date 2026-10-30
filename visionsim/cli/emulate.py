@@ -433,6 +433,7 @@ def aspc(
     n_pulses: int | None = None,
     dead_time: float | None = None,
     free_running: bool | None = None,
+    max_detections_per_cycle: int | None = None,
     fast_sim: bool | None = None,
     fast_sim_noise: bool | None = None,
     active_enabled: bool | None = None,
@@ -488,6 +489,9 @@ def aspc(
         n_pulses: number of laser pulses integrated per measurement/histogram.
         dead_time: recovery time required by the SPAD after detecting a photon before it can detect another. Given in nanoseconds.
         free_running: if true, indicates the SPAD operates in a free-running mode rather than a gated mode.
+        max_detections_per_cycle: gated mode only, the most photons recorded per laser cycle. 1 (the default) keeps
+            the first photon of each cycle; a larger value re-arms the SPAD after each detection and its dead time, up
+            to that many detections. For no cap, set it to null in the config file.
         fast_sim: if true, computes the histograms from closed-form pile-up models instead of simulating every photon.
             This is much faster, and gives the expected (noise-free) counts per bin unless fast_sim_noise is set.
         fast_sim_noise: if true, draws photon noise around the closed-form histograms of fast_sim instead of saving their

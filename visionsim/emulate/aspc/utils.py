@@ -386,6 +386,7 @@ def _build_config(
         "n_pulses": ("histogrammer", "n_pulses"),
         "dead_time": ("histogrammer", "dead_time"),
         "free_running": ("histogrammer", "free_running"),
+        "max_detections_per_cycle": ("histogrammer", "max_detections_per_cycle"),
         "fast_sim": ("histogrammer", "fast_sim"),
         "fast_sim_noise": ("histogrammer", "fast_sim_noise"),
         "active_enabled": ("active_source", "pulsed_laser", "enabled"),
@@ -424,6 +425,9 @@ def _build_config(
         "sensor_fov": "degree",
     }
 
+    # In a config file, null is a value for these keys (no cap), not a missing entry
+    nullable_params = {"max_detections_per_cycle"}
+
     config: dict = {}
 
     for param_name, key_path in cli_mapping.items():
@@ -431,7 +435,7 @@ def _build_config(
 
         if val is None:
             found, yml_val = _get_nested_val(yml_config, key_path)
-            if found and yml_val is not None:
+            if found and (yml_val is not None or param_name in nullable_params):
                 val = yml_val
             else:
                 _, val = _get_nested_val(DEFAULT_CONFIG, key_path)
@@ -469,6 +473,7 @@ def prepare_config(user_args: dict, config_file: Path | str | None = None) -> di
             "n_pulses": 10000,
             "dead_time": 10 * ureg.nanoseconds,
             "free_running": True,
+            "max_detections_per_cycle": 1,
             "fast_sim": False,
             "fast_sim_noise": False,
         },

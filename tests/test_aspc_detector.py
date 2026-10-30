@@ -426,6 +426,12 @@ class TestApiContract:
         with pytest.raises(ValueError, match="inherently multi-hit"):
             simulate_photon_timestamps(phi, 10, free_running=True, max_detections_per_cycle=1)
 
+    @pytest.mark.parametrize("cap", [0, -2, 1.5])
+    def test_rejects_an_invalid_per_cycle_cap(self, cap):
+        phi = torch.full((4,), 0.1)
+        with pytest.raises(ValueError, match="positive integer"):
+            simulate_photon_timestamps(phi, 10, free_running=False, max_detections_per_cycle=cap)
+
     def test_rejects_fractional_dead_time(self):
         phi = torch.full((4,), 0.1)
         with pytest.raises(ValueError, match="non-negative integer"):

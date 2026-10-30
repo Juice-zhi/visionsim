@@ -1,5 +1,5 @@
 """Configuration: YAML loading with the ``!Quantity`` / ``!expr`` / ``!file`` tags, the max_depth check, custom pulse
-shapes from a config file or the CLI, and the fast_sim_noise option."""
+shapes from a config file or the CLI, and the fast_sim_noise and max_detections_per_cycle options."""
 
 from pathlib import Path
 
@@ -243,3 +243,47 @@ class TestFastSimNoiseConfig:
         emulator = ASPCEmulator(prepare_config({"fast_sim": True, "fast_sim_noise": True}))
         assert emulator.detector.histogrammer.fast_sim is True
         assert emulator.detector.histogrammer.fast_sim_noise is True
+
+
+class TestMaxDetectionsPerCycleConfig:
+    """``max_detections_per_cycle`` from the user arguments, a config file or the CLI, on to the histogrammer."""
+
+    def test_default_is_single_hit(self):
+        assert prepare_config({})["histogrammer"]["max_detections_per_cycle"] == 1
+
+    def test_user_argument(self):
+        assert prepare_config({"max_detections_per_cycle": 4})["histogrammer"]["max_detections_per_cycle"] == 4
+
+    def test_config_file(self, tmp_path):
+        config = prepare_config({}, _write(tmp_path, "histogrammer:\n  max_detections_per_cycle: 3\n"))
+        assert config["histogrammer"]["max_detections_per_cycle"] == 3
+
+    @pytest.mark.parametrize("text", ["null", "~", ""])
+    def test_null_in_a_config_file_means_no_cap(self, tmp_path, text):
+        config = prepare_config({}, _write(tmp_path, f"histogrammer:\n  max_detections_per_cycle: {text}\n"))
+        assert config["histogrammer"]["max_detections_per_cycle"] is None
+
+    def test_user_argument_overrides_the_config_file(self, tmp_path):
+        config = prepare_config(
+            {"max_detections_per_cycle": 2}, _write(tmp_path, "histogrammer:\n  max_detections_per_cycle: null\n")
+        )
+        assert config["histogrammer"]["max_detections_per_cycle"] == 2
+
+    def test_other_null_keys_still_take_the_default(self, tmp_path):
+        config = prepare_config({}, _write(tmp_path, "histogrammer:\n  n_pulses: null\n  fast_sim: null\n"))
+        assert config["histogrammer"]["n_pulses"] == 10000
+        assert config["histogrammer"]["fast_sim"] is False
+
+    def test_cli(self, monkeypatch):
+        histogrammer = _cli_config(monkeypatch, "--free-running", "False", "--max-detections-per-cycle", "3")[
+            "histogrammer"
+        ]
+        assert histogrammer["free_running"] is False
+        assert histogrammer["max_detections_per_cycle"] == 3
+
+    @pytest.mark.parametrize("value", [1, 3, None])
+    def test_reaches_the_histogrammer(self, value):
+        config = prepare_config({"free_running": False}, {"histogrammer": {"max_detections_per_cycle": value}})
+        emulator = ASPCEmulator(config)
+        assert emulator.detector.histogrammer.free_running is False
+        assert emulator.detector.histogrammer.max_detections_per_cycle == value
