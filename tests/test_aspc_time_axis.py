@@ -156,6 +156,31 @@ class TestCalculateTransients:
         t, _ = _calculate(0.2, bin_width=BW, time_offset=-0.3)
         assert t.sum() == 0.0
 
+    @pytest.mark.parametrize("depth,expected", [(0.55, 75), (1.95, 89)])
+    def test_return_before_a_late_window_is_recorded_if_it_wraps_into_the_window(self, depth, expected):
+        # A 9 m window opened 3 m after the pulse: 0.55 m arrives 2.45 m before it opens, i.e. 7.55 m into the window
+        # of the previous period, as an aliased return would
+        depths = torch.full((H, W), depth, dtype=torch.float64)
+        t, _ = Histogrammer(HistConfig()).calculate_transients(
+            torch.ones(H, W), depths, torch.zeros(H, W), torch.ones(1, H, W), 90, PERIOD, bin_width=BW, time_offset=-3.0
+        )
+        assert np.flatnonzero(t[0].numpy()).tolist() == [expected]
+        assert expected == int(np.floor(np.remainder(depth - 3.0, PERIOD) / BW))
+
+    @pytest.mark.parametrize("n_bins,bin_m", [(B, PERIOD / B * 1.0001), (B, 0.6), (1000, 0.03)])
+    def test_window_longer_than_the_period_raises(self, n_bins, bin_m):
+        """It would also record the returns of the next pulse; binning it at PERIOD / n_bins instead would move them."""
+        depth = torch.full((H, W), 1.0, dtype=torch.float64)
+        with pytest.raises(ValueError, match="exceeds one laser period"):
+            Histogrammer(HistConfig()).calculate_transients(
+                torch.ones(H, W), depth, torch.zeros(H, W), torch.ones(1, H, W), n_bins, PERIOD, bin_width=bin_m
+            )
+
+    @pytest.mark.parametrize("bin_m", [0.0, -0.1])
+    def test_bin_width_must_be_positive(self, bin_m):
+        with pytest.raises(ValueError, match="positive"):
+            _calculate(0.55, bin_width=bin_m)
+
     @pytest.mark.parametrize("depth,expected", [(0.2, 19), (0.55, 0), (9.9, 19)])
     def test_without_bin_width_the_window_is_the_period(self, depth, expected):
         # B bins of PERIOD / B = 0.5 m, so every return lands in the window
@@ -315,10 +340,29 @@ class TestBinWidthInTheEmulator:
         with pytest.raises(ValueError, match="free-running"):
             ASPCEmulator(_config(10e6, free_running=True, dead_time=10e-9))
 
+    @pytest.mark.parametrize("short_bins", [0.4, 0.001])
+    def test_free_running_with_dead_time_rejects_a_window_short_by_part_of_a_bin(self, short_bins):
+        """The same rule as calculate_transients, which bins a window that is short by any of this at the bin width."""
+        f_rep = C_LIGHT / (2 * (N_BINS + short_bins) * BIN_M)
+        with pytest.raises(ValueError, match="free-running"):
+            ASPCEmulator(_config(f_rep, free_running=True, dead_time=10e-9))
+
     @pytest.mark.parametrize(
         "f_rep,bin_width,dead_time",
-        [(10e6, BIN_M, 0.0), (10e6, BIN_M, 0.4 * BIN_S), (F_WINDOW, BIN_M, 10e-9), (10e6, None, 10e-9)],
-        ids=["no-dead-time", "dead-time-under-half-a-bin", "window-of-one-period", "unset-bin-width"],
+        [
+            (10e6, BIN_M, 0.0),
+            (10e6, BIN_M, 0.4 * BIN_S),
+            (F_WINDOW, BIN_M, 10e-9),
+            (F_WINDOW / (1 + 1e-7), BIN_M, 10e-9),
+            (10e6, None, 10e-9),
+        ],
+        ids=[
+            "no-dead-time",
+            "dead-time-under-half-a-bin",
+            "window-of-one-period",
+            "window-of-one-period-up-to-rounding",
+            "unset-bin-width",
+        ],
     )
     def test_free_running_is_accepted(self, f_rep, bin_width, dead_time):
         emulator = ASPCEmulator(_config(f_rep, bin_width=bin_width, free_running=True, dead_time=dead_time))

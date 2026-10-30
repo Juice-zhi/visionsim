@@ -13,7 +13,14 @@ from pint import Quantity
 from torch import Tensor
 
 from visionsim.utils.progress import ElapsedProgress
-from visionsim.emulate.aspc.utils import DEPTH_CUTOFF, MAX_DEPTH_RTOL, get_irradiance_with_fov, ureg, validate_units
+from visionsim.emulate.aspc.utils import (
+    DEPTH_CUTOFF,
+    MAX_DEPTH_RTOL,
+    get_irradiance_with_fov,
+    is_whole_period,
+    ureg,
+    validate_units,
+)
 
 # =============================================================================
 # MONTE-CARLO SAMPLING & DEAD-TIME WALK KERNELS
@@ -746,10 +753,12 @@ class HistogrammerBase:
         arrives ``r + time_offset`` after the start of the histogram's window, modulo one laser period (range
         aliasing), and lands in bin ``floor((r + time_offset) / bin_width)`` of that period if it is one of the
         ``gt_ntime_bins`` bins of the window; returns that arrive after the window are not recorded. Without a
-        ``bin_width``, or with one whose window is the whole period (up to rounding, see MAX_DEPTH_RTOL), the period
-        is divided into exactly ``gt_ntime_bins`` bins, and every return lands in one of them. Depths that are not
-        finite, not positive, or at least DEPTH_CUTOFF (rays that miss every object) add no laser return, but their
-        pixels still count in the zone mean and in the ambient offset.
+        ``bin_width``, or with one whose window is the whole period (up to rounding, see
+        :func:`~visionsim.emulate.aspc.utils.is_whole_period`), the period is divided into exactly ``gt_ntime_bins``
+        bins, and every return lands in one of them. The window may not be longer than the period, since it would then
+        also record the returns of the next pulse. Depths that are not finite, not positive, or at least DEPTH_CUTOFF
+        (rays that miss every object) add no laser return, but their pixels still count in the zone mean and in the
+        ambient offset.
 
         With a ``pulse_cdf``, the pulse's cumulative distribution over time in bins as
         :meth:`~visionsim.emulate.aspc.emitter.DynamicSource.get_pulse_cdf` returns it, each return in the window is
@@ -765,10 +774,23 @@ class HistogrammerBase:
 
         The ambient offsets are photons per laser cycle, spread evenly over the period, so each bin gets the fraction
         ``bin_width / max_depth`` of them.
+
+        Raises:
+            ValueError: if ``bin_width`` is not positive, or if the window, ``gt_ntime_bins * bin_width``, exceeds one
+                laser period.
         """
-        if bin_width is not None and gt_ntime_bins * bin_width >= max_depth * (1 - MAX_DEPTH_RTOL):
-            # The window is the whole period, so it is divided into exactly gt_ntime_bins bins
-            bin_width = None
+        if bin_width is not None:
+            if not bin_width > 0:
+                raise ValueError(f"bin_width must be positive, got {bin_width}.")
+            window = gt_ntime_bins * bin_width
+            if window > max_depth * (1 + MAX_DEPTH_RTOL):
+                raise ValueError(
+                    f"The histogram window, gt_ntime_bins x bin_width = {gt_ntime_bins} x {bin_width:.6g} m = "
+                    f"{window:.6g} m, exceeds one laser period, max_depth = {max_depth:.6g} m."
+                )
+            if is_whole_period(window, max_depth):
+                # The window is the whole period, so it is divided into exactly gt_ntime_bins bins
+                bin_width = None
         # Bins in one laser period, over which the ambient light of a cycle is spread
         bins_per_period = gt_ntime_bins if bin_width is None else max_depth / bin_width
 
@@ -1000,13 +1022,15 @@ class HistConfig:
     """Settings of a :class:`Histogrammer` or :class:`HistogrammerEDH`."""
 
     min_depth: Quantity = 0 * ureg.meter
-    """Smallest depth expected in the scene. It is only checked (at least 0 and below ``max_depth``) and does not change
-    the histogram"""
+    """Smallest depth expected in the scene. Neither this field nor the config key ``histogrammer.min_depth`` changes
+    the histogram; the config key is only checked (at least 0 and below ``max_depth``) by
+    :func:`~visionsim.emulate.aspc.utils.prepare_config`"""
     max_depth: Quantity | None = 20 * ureg.meter
-    """Largest depth expected in the scene, or None. It is checked against the unambiguous range
-    c / (2 * pulse_repetition), and :func:`~visionsim.emulate.aspc.utils.preproc_frames` scales 8-bit depth images to
-    it. It does not set the histogram's range, which is ``n_bins`` bins of ``bin_width`` from the start of the window
-    (see ``time_offset``)"""
+    """Largest depth expected in the scene, or None. The histogrammer does not read this field, and it does not set the
+    histogram's range, which is ``n_bins`` bins of ``bin_width`` from the start of the window (see ``time_offset``).
+    The config key ``histogrammer.max_depth`` is checked against the unambiguous range c / (2 * pulse_repetition) by
+    :func:`~visionsim.emulate.aspc.utils.prepare_config` and by :func:`~visionsim.emulate.aspc.utils.preproc_frames`,
+    which also scales 8-bit depth images to it"""
     n_bins: int = 1000
     """Number of bins of the histogram"""
     bin_width: Quantity | None = None
@@ -1019,8 +1043,9 @@ class HistConfig:
     ``2 * r / c + time_offset`` after the start of the window, modulo one laser period, and lands in bin
     ``floor((2 * r / c + time_offset) / bin_duration)``, with ``bin_duration = 2 * bin_width / c``. A positive value
     opens the window before the pulse, so time zero (range 0) is at bin ``time_offset / bin_duration``; a negative one
-    opens it after the pulse, so returns closer than ``c * |time_offset| / 2`` arrive before the window and, unless the
-    window spans the whole period, are not recorded"""
+    opens it after the pulse, so returns closer than ``c * |time_offset| / 2`` arrive before the window opens. Like
+    every return, they are taken modulo the period: they arrive at the end of the previous cycle, and are recorded
+    only if that is still inside the window (always, if the window spans the whole period)"""
     n_pulses: int = 100
     """Number of laser cycles integrated into each histogram"""
     dead_time: Quantity = 10e-9 * ureg.second
@@ -1029,8 +1054,9 @@ class HistConfig:
     free_running: bool = True
     """If true, the SPAD re-arms after its dead time regardless of the laser cycle (free running). If false, it is also
     re-armed at the start of every laser cycle (synchronous), i.e. of every histogram window. With dead time, a
-    free-running SPAD needs a window of a whole laser period, since it also detects photons between the end of a
-    shorter window and the next pulse, which is not simulated"""
+    free-running SPAD needs a window of a whole laser period (``bin_width`` unset, or ``n_bins * bin_width`` equal to
+    the period up to rounding), since it also detects photons between the end of a shorter window and the next pulse,
+    which is not simulated"""
     max_detections_per_cycle: int | None = 1
     """Only used when synchronous: the most photons a laser cycle can record. 1 is a single-hit time-to-digital
     converter, which keeps the first photon of each cycle, so ``dead_time`` does not matter. None (no cap) or more than

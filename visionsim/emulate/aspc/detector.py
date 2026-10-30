@@ -16,6 +16,7 @@ from visionsim.emulate.aspc.sensors import SPADSensor
 from visionsim.emulate.aspc.utils import (
     histogram_bin_width,
     incidence_cosine,
+    is_whole_period,
     irradiance_photons,
     tof2depth,
     ureg,
@@ -176,8 +177,10 @@ class Detector:
 
         Raises:
             ValueError: if the histogram's window, ``n_bins * bin_width``, exceeds one laser period, or if a
-                free-running SPAD with dead time has a window shorter than the period. Such a SPAD also detects
-                photons between the end of the window and the next pulse, which is not simulated.
+                free-running SPAD with dead time has a window shorter than the period, by more than rounding (see
+                :func:`~visionsim.emulate.aspc.utils.is_whole_period`). Such a SPAD also detects photons between the
+                end of the window and the next pulse, which is not simulated: its pile-up model wraps after ``n_bins``
+                bins.
         """
         bin_width = histogram_bin_width(
             self.histogrammer.n_bins, emitter.pulse_repetition, getattr(self.histogrammer, "bin_width", None)
@@ -185,13 +188,14 @@ class Detector:
 
         if getattr(self.histogrammer, "free_running", False) and self._get_dead_time_bins(bin_width) > 0:
             period = emitter.max_resolvable_depth.to(ureg.meter)
-            # Like the dead time, the period is simulated in whole bins
-            if round((period / bin_width).to(ureg.dimensionless).magnitude) > self.histogrammer.n_bins:
+            # The pile-up model wraps after n_bins bins, while calculate_transients bins any other window, however
+            # little shorter, at bin_width and drops the returns after it
+            if not is_whole_period(self.histogrammer.n_bins * bin_width, period):
                 raise ValueError(
                     f"A free-running SPAD with dead time needs a histogram window of one laser period, got "
-                    f"n_bins x bin_width = {self.histogrammer.n_bins * bin_width:.6g~P} for a period of "
-                    f"{period:.6g~P}. Set free_running to False (a SPAD re-armed at every laser cycle), or leave "
-                    "bin_width unset."
+                    f"n_bins x bin_width = {self.histogrammer.n_bins * bin_width:.9g~P} for a period of "
+                    f"{period:.9g~P}. Set free_running to False (a SPAD re-armed at every laser cycle), or leave "
+                    "bin_width unset (the period divided into n_bins bins)."
                 )
         return bin_width
 

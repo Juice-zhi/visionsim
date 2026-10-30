@@ -126,6 +126,15 @@ def histogram_bin_width(n_bins: int, pulse_repetition: Quantity, bin_width: Quan
     return bin_width_m
 
 
+def is_whole_period(window: float | Quantity, period: float | Quantity) -> bool:
+    """Whether a histogram window is one whole laser period, up to floating-point rounding (see MAX_DEPTH_RTOL).
+
+    ``window`` and ``period`` are both floats in the same units, or both quantities. A window that is shorter by more
+    than the rounding is not the whole period, however little it is short by: the returns after it are not recorded.
+    """
+    return bool(abs(window - period) <= MAX_DEPTH_RTOL * period)
+
+
 @ureg.wraps(ureg.radian, (ureg.meter, ureg.meter))
 def fov_from_focal_length(fl, d):
     return 2 * np.arctan2(d, 2 * fl)

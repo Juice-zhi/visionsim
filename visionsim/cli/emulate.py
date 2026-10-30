@@ -502,7 +502,8 @@ def aspc(
         n_pulses: number of laser pulses integrated per measurement/histogram.
         dead_time: recovery time required by the SPAD after detecting a photon before it can detect another. Given in nanoseconds.
         free_running: if true, indicates the SPAD operates in a free-running mode rather than a gated mode. With
-            dead time, a free-running SPAD needs a histogram window of one whole laser period.
+            dead time, a free-running SPAD needs a histogram window of one whole laser period (bin_width unset, or
+            n_bins * bin_width equal to the period).
         max_detections_per_cycle: gated mode only, the most photons recorded per laser cycle. 1 (the default) keeps
             the first photon of each cycle; a larger value re-arms the SPAD after each detection and its dead time, up
             to that many detections. For no cap, set it to null in the config file.
