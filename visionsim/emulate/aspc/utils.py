@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 
 import numpy as np
+import numpy.typing as npt
 import pint
 import torch
 from pint import Quantity, UnitRegistry, set_application_registry
@@ -35,6 +36,10 @@ DEPTH_CUTOFF = 1e9
 # Relative tolerance when checking max_depth against the unambiguous range c / (2 * pulse_repetition), so that a
 # max_depth equal to that range is not rejected because of floating-point rounding.
 MAX_DEPTH_RTOL = 1e-6
+
+# Accepted values of preproc_frames' depth_type. "planar_z" is the distance along the optical axis, which is what
+# Blender's Z pass (a rendered depths/ directory) holds, and "range" is the distance along each pixel's ray.
+DEPTH_TYPES = ("planar_z", "range")
 
 
 def validate_units(enum_aware=True, ignore_kwargs=None):
@@ -113,6 +118,73 @@ def get_irradiance_with_fov(irradiance, sensor_fov, pixel_fov, omega, w, h):
     return irradiance * scale
 
 
+def planar_depth_to_range(
+    depth: npt.ArrayLike | torch.Tensor | Quantity, fl_x: float, fl_y: float, cx: float, cy: float
+) -> np.ndarray | torch.Tensor | Quantity:
+    """Converts planar depth, the distance along the optical axis, to range, the distance along each pixel's ray.
+
+    The time of flight and the falloff of a laser return depend on the range, while a rendered ``depths/`` directory
+    holds Blender's Z pass, i.e. planar depth. Each pixel is scaled by the length of its ray
+    ``K^-1 [u + 0.5, v + 0.5, 1]`` through the pixel center, so ``range = Z / cos(theta)`` with ``theta`` the pixel's
+    angle to the optical axis. The intrinsics are in pixels, with the origin at the corner of the image as in a
+    dataset's transforms.
+
+    Args:
+        depth: planar depths of shape ``(..., H, W)``, as an array, a tensor (gradients are kept) or a Pint quantity.
+        fl_x: focal length along the image width, in pixels.
+        fl_y: focal length along the image height, in pixels.
+        cx: principal point along the image width, in pixels.
+        cy: principal point along the image height, in pixels.
+
+    Returns:
+        The ranges, as the same type (and units) with the same shape. Values that mean no return (not finite, not
+        positive, or at least DEPTH_CUTOFF) still do.
+    """
+    if isinstance(depth, Quantity):
+        return ureg.Quantity(planar_depth_to_range(depth.magnitude, fl_x, fl_y, cx, cy), depth.units)
+
+    if not isinstance(depth, torch.Tensor):
+        depth = np.asarray(depth)
+
+    h, w = depth.shape[-2:]
+    x = (np.arange(w) + 0.5 - cx) / fl_x
+    y = (np.arange(h) + 0.5 - cy) / fl_y
+    ray_lengths = np.sqrt(1.0 + x[np.newaxis, :] ** 2 + y[:, np.newaxis] ** 2)
+
+    if isinstance(depth, torch.Tensor):
+        dtype = depth.dtype if depth.is_floating_point() else torch.float64
+        return depth * torch.as_tensor(ray_lengths, dtype=dtype, device=depth.device)
+    return depth * ray_lengths
+
+
+def _frame_intrinsics(transform: Any, shape: tuple[int, ...], sensor_config: dict) -> tuple[float, float, float, float]:
+    """Returns the pinhole intrinsics ``(fl_x, fl_y, cx, cy)``, in pixels, of a frame of shape ``(H, W)``.
+
+    They are taken from the frame's transform when it has them (a dataset item), and otherwise from the emulated
+    sensor, whose field of view the frame is resized to.
+    """
+    if isinstance(transform, dict) and all(transform.get(k) is not None for k in ("fl_x", "fl_y", "cx", "cy")):
+        if transform.get("h") is not None and transform.get("w") is not None:
+            if (int(transform["h"]), int(transform["w"])) != tuple(shape):
+                raise ValueError(
+                    f"Depth frame of shape {tuple(shape)} does not match the size (h={transform['h']}, "
+                    f"w={transform['w']}) of its transform, so the transform's intrinsics do not apply to it."
+                )
+        return float(transform["fl_x"]), float(transform["fl_y"]), float(transform["cx"]), float(transform["cy"])
+
+    # Imported here since the sensors module imports this one
+    from visionsim.emulate.aspc.sensors import SPADSensor
+
+    sensor = SPADSensor(**sensor_config)
+    h, w = shape
+    return (
+        sensor.f_x_px * w / sensor.w,
+        sensor.f_y_px * h / sensor.h,
+        sensor.c_x * w / sensor.w,
+        sensor.c_y * h / sensor.h,
+    )
+
+
 def preproc_frames(
     depth_frame: np.ndarray | torch.Tensor,
     albedo_frame: np.ndarray | torch.Tensor,
@@ -120,12 +192,27 @@ def preproc_frames(
     config: dict,
     device: str | torch.device = "cpu",
     requires_grad: bool = False,
+    depth_type: str = "planar_z",
 ) -> tuple[Quantity, Quantity, Quantity]:
     """Preprocesses a single frame triplet (depth, albedo, ambient) into PyTorch Tensors
 
-    wrapped in Pint quantities. Depths that are not finite, not positive, or at least DEPTH_CUTOFF (rays that miss
-    every object) are set to 0, which the histogrammer treats as no laser return.
+    wrapped in Pint quantities. Each frame is an array or tensor, or a ``(data, transform)`` item of a ``Dataset``.
+
+    The emulator bins and attenuates each pixel's laser return by its range, so the depth frame is returned as range.
+    ``depth_type`` says what the depth frame holds:
+
+    - ``"planar_z"`` (default): planar depth, the distance along the optical axis, which is what a rendered
+      ``depths/`` directory holds. It is converted to range with :func:`planar_depth_to_range`, using the intrinsics
+      ``fl_x, fl_y, cx, cy`` of the item's transform, or, for a frame without them, those of the sensor in
+      ``config``, scaled to the frame's resolution (the frame then spans the sensor's field of view).
+    - ``"range"``: range, used as is.
+
+    Depths that are not finite, not positive, or at least DEPTH_CUTOFF (rays that miss every object) are set to 0,
+    which the histogrammer treats as no laser return.
     """
+    if depth_type not in DEPTH_TYPES:
+        raise ValueError(f"Unknown depth_type {depth_type!r}, expected one of {DEPTH_TYPES}.")
+
     Nr, Nc = config["sensor"]["size"]
 
     # 1. Validate max depth against laser pulse repetition rate
@@ -170,6 +257,11 @@ def preproc_frames(
 
     # Missed rays and invalid depths become 0 (no return), see DEPTH_CUTOFF
     depth_img = np.where(np.isfinite(depth_img) & (depth_img > 0) & (depth_img < DEPTH_CUTOFF), depth_img, 0.0)
+
+    # Planar depth to range, with the intrinsics of the frame at its own resolution (before resizing)
+    if depth_type == "planar_z":
+        transform = depth_frame[1] if isinstance(depth_frame, (tuple, list)) and len(depth_frame) == 2 else None
+        depth_img = planar_depth_to_range(depth_img, *_frame_intrinsics(transform, depth_img.shape, config["sensor"]))
 
     # 3. Process Albedo Frame (Diffuse Color Pass)
     raw_albedo = _to_numpy(albedo_frame)

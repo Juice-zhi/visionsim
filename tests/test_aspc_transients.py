@@ -226,13 +226,13 @@ class TestPreprocDepth:
     def test_missed_and_invalid_depths_become_zero(self):
         depth = np.array([[1e10, np.inf, np.nan], [-1.0, DEPTH_CUTOFF, 2.0]], dtype=np.float32)
         ones = np.ones_like(depth)
-        depth_qty, _, _ = preproc_frames(depth, ones, ones, self.CONFIG)
+        depth_qty, _, _ = preproc_frames(depth, ones, ones, self.CONFIG, depth_type="range")
         assert depth_qty.magnitude.tolist() == [[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]]
 
     def test_valid_depths_are_kept(self):
         depth = np.array([[0.5, 7.25, 14.0], [100.0, 3.0, 2.0]], dtype=np.float32)
         ones = np.ones_like(depth)
-        depth_qty, _, _ = preproc_frames(depth, ones, ones, self.CONFIG)
+        depth_qty, _, _ = preproc_frames(depth, ones, ones, self.CONFIG, depth_type="range")
         assert depth_qty.magnitude.tolist() == depth.tolist()
 
 

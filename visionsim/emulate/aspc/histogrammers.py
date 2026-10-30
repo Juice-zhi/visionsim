@@ -622,9 +622,10 @@ class HistogrammerBase:
     ) -> tuple[torch.Tensor, list]:
         """Bins each zone's per-pixel laser returns by depth into a transient and averages its ambient offset.
 
-        Depths beyond max_depth wrap around (range aliasing). Depths that are not finite, not positive, or at least
-        DEPTH_CUTOFF (rays that miss every object) add no laser return, but their pixels still count in the zone
-        mean and in the ambient offset.
+        ``depth_frames`` hold each pixel's range, the one-way distance along its ray (not planar depth), so a return
+        at range r lands in bin ``floor(r * gt_ntime_bins / max_depth)``. Depths beyond max_depth wrap around (range
+        aliasing). Depths that are not finite, not positive, or at least DEPTH_CUTOFF (rays that miss every object)
+        add no laser return, but their pixels still count in the zone mean and in the ambient offset.
         """
         if hasattr(irradiance_frames, "magnitude"):
             irradiance_frames = irradiance_frames.magnitude

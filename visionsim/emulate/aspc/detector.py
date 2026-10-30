@@ -196,7 +196,11 @@ class Detector:
         scene: Sun | None = None,
         ambient_frame: torch.Tensor | Quantity | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Calculates spatial-temporal transients over laser ToF bins."""
+        """Calculates spatial-temporal transients over laser ToF bins.
+
+        ``depth_frame`` is each pixel's range (the distance along its ray, not planar depth), which sets both its bin
+        and its 1 / range^2 falloff. See :func:`~visionsim.emulate.aspc.utils.planar_depth_to_range`.
+        """
         irradiance = self._get_signal(depth_frame, albedo_frame, emitter)
         offsets = self._get_ambient_offset(
             albedo_frame=albedo_frame,

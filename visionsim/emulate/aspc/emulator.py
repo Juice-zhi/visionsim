@@ -81,7 +81,13 @@ class ASPCEmulator:
         albedo_frame: Quantity | torch.Tensor,
         ambient_frame: Quantity | torch.Tensor | None = None,
     ) -> np.ndarray:
-        """Executes complete forward simulation for input depth, albedo, and optional ambient frame."""
+        """Executes complete forward simulation for input depth, albedo, and optional ambient frame.
+
+        ``depth_frame`` holds each pixel's range in meters, the distance along its ray, which sets both the time of
+        flight and the falloff of the laser return. A planar depth (Blender's Z pass) must be converted first, e.g.
+        by :func:`~visionsim.emulate.aspc.utils.preproc_frames` or
+        :func:`~visionsim.emulate.aspc.utils.planar_depth_to_range`.
+        """
         if self.emitter is None:
             raise RuntimeError("ASPCEmulator requires an active emitter (PulsedLaser) to process frames.")
 

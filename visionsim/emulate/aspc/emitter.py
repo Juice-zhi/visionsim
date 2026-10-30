@@ -210,6 +210,11 @@ class PulsedLaser(DynamicSource):
         num_pixels: int,
         omega: Quantity,
     ) -> Quantity:
+        """Radiance of each pixel's laser return, in photons.
+
+        ``depth`` is the range along the pixel's ray in meters (not planar depth), and the radiance falls off with its
+        square.
+        """
         n_photons = self.num_photons_per_cycle.magnitude
         depth_m = depth.magnitude if hasattr(depth, "magnitude") else depth
         albedo_val = albedo.magnitude if hasattr(albedo, "magnitude") else albedo
