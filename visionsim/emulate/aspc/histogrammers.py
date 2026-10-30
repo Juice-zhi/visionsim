@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
+import numpy.typing as npt
 import torch
 import torch.nn.functional as F
 from pint import Quantity
@@ -562,21 +564,111 @@ def _bin_returns(
     max_depth: float,
     bin_width: float | None,
     time_offset: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Histogram bin of each return, and a mask of the returns that land in the histogram's window.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Histogram bin of each return, how far into that bin it arrives, and a mask of the returns in the window.
 
     A return at range r arrives ``r + time_offset`` (one-way distances) after the start of the window, modulo one laser
     period, ``max_depth``, and lands in bin ``floor(arrival / bin_width)``. Without a bin width the window is the whole
-    period, divided into n_bins bins, so every return lands in it. Bins are computed in the dtype of ``depths``.
+    period, divided into n_bins bins, so every return lands in it. Bins are computed in the dtype of ``depths``, and the
+    phase, in [0, 1) bins, is the remainder of the same value, so that bin + phase is the arrival in bins.
     """
     if bin_width is None:
-        transient_idx = torch.floor((depths + time_offset) * n_bins / max_depth).to(torch.long)
-        transient_idx = torch.remainder(transient_idx, n_bins)
-        return transient_idx, torch.ones_like(transient_idx, dtype=torch.bool)
+        position = (depths + time_offset) * n_bins / max_depth
+        start = torch.floor(position)
+        transient_idx = torch.remainder(start.to(torch.long), n_bins)
+        return transient_idx, position - start, torch.ones_like(transient_idx, dtype=torch.bool)
 
-    arrival = torch.remainder(depths + time_offset, max_depth)
-    transient_idx = torch.floor(arrival / bin_width).to(torch.long)
-    return transient_idx, transient_idx < n_bins
+    position = torch.remainder(depths + time_offset, max_depth) / bin_width
+    start = torch.floor(position)
+    transient_idx = start.to(torch.long)
+    return transient_idx, position - start, transient_idx < n_bins
+
+
+class _PulseSpread:
+    """Spreads returns over the histogram bins by a pulse, from each return's exact arrival time.
+
+    The pulse is given as in :meth:`~visionsim.emulate.aspc.emitter.DynamicSource.get_pulse_cdf`: the fraction of its
+    photons that arrive before each offset ``x`` from the return, in bins, linear in between. A return that arrives
+    ``phase`` bins into bin k (0 <= phase < 1) puts ``cdf(m + 1 - phase) - cdf(m - phase)`` of its photons in bin k + m.
+    A pulse of zero width puts them all in bin k.
+    """
+
+    def __init__(self, pulse_cdf: tuple[npt.ArrayLike, npt.ArrayLike], device: torch.device):
+        x = np.asarray(pulse_cdf[0], dtype=np.float64)
+        cdf = np.asarray(pulse_cdf[1], dtype=np.float64)
+        if x.ndim != 1 or x.shape != cdf.shape or x.size < 2 or np.any(np.diff(x) < 0) or np.any(np.diff(cdf) < 0):
+            raise ValueError("pulse_cdf must be two 1-D arrays (x, cdf) of the same length, both non-decreasing.")
+        if cdf[0] != 0 or cdf[-1] != 1:
+            raise ValueError(f"pulse_cdf must rise from 0 to 1, got {cdf[0]:g} to {cdf[-1]:g}.")
+
+        self.zero_width = bool(x[-1] <= x[0])
+        self.x = torch.as_tensor(x, device=device)
+        self.cdf = torch.as_tensor(cdf, device=device)
+        # Bins k + m that a return in bin k can reach
+        self.first = math.floor(x[0])
+        self.offsets = torch.arange(self.first, math.ceil(x[-1]) + 1, device=device)
+
+        # As the phase grows, the share of bin k + m only changes slope where m - phase or m + 1 - phase meets an x, so
+        # it is linear in the phase between these nodes (rounded, so that nearly equal phases count once)
+        nodes = np.round(np.remainder(-x, 1.0), 12)
+        nodes = np.unique(np.concatenate(([0.0, 1.0], nodes[(nodes > 0) & (nodes < 1)])))
+        self.nodes = torch.as_tensor(nodes, device=device)
+        self.node_shares = self.bin_shares(self.nodes)
+
+    def cdf_at(self, t: torch.Tensor) -> torch.Tensor:
+        """Fraction of the pulse's photons that arrive less than ``t`` bins after the return."""
+        n = self.x.numel()
+        idx = torch.searchsorted(self.x, t.contiguous())
+        upper = idx.clamp(1, n - 1)
+        x0, x1 = self.x[upper - 1], self.x[upper]
+        frac = ((t - x0) / torch.where(x1 > x0, x1 - x0, 1.0)).clamp(0.0, 1.0)
+        inside = self.cdf[upper - 1] + frac * (self.cdf[upper] - self.cdf[upper - 1])
+        return torch.where(idx == 0, 0.0, torch.where(idx == n, 1.0, inside))
+
+    def bin_shares(self, phase: torch.Tensor) -> torch.Tensor:
+        """Shares of a return's photons in bins ``k + offsets``, shape ``(len(phase), len(offsets))``."""
+        edges = torch.arange(self.first, self.first + self.offsets.numel() + 1, device=phase.device, dtype=phase.dtype)
+        cdf = self.cdf_at(edges - phase[:, None])
+        return cdf[:, 1:] - cdf[:, :-1]
+
+    def spread(
+        self, transient_idx: torch.Tensor, phase: torch.Tensor, weights: torch.Tensor, n_bins: int
+    ) -> torch.Tensor:
+        """Expected photons in each of n_bins bins from returns in bins ``transient_idx`` (all in the window).
+
+        Shares that fall outside the window are dropped.
+        """
+        dtype = weights.dtype
+        row = torch.zeros(n_bins, dtype=torch.float64, device=weights.device)
+        if self.zero_width:
+            return row.scatter_add(0, transient_idx, weights.double()).to(dtype)
+
+        phase, weights = phase.double(), weights.double()
+        n_shares = self.offsets.numel()
+        if phase.numel() < self.nodes.numel() * n_bins:
+            # Few returns: integrate the pulse over the bins of each one, in chunks of about 4M shares
+            chunk = max(1, 2**22 // n_shares)
+            for start in range(0, phase.numel(), chunk):
+                shares = self.bin_shares(phase[start : start + chunk])
+                bins = transient_idx[start : start + chunk, None] + self.offsets
+                keep = (bins >= 0) & (bins < n_bins)
+                row = row.scatter_add(0, bins[keep], (weights[start : start + chunk, None] * shares)[keep])
+            return row.to(dtype)
+
+        # Many returns: split each between the two nodes around its phase, then apply the shares of each node to all
+        # the returns at it with one convolution. This gives the same result, since the shares are linear in between
+        n_nodes = self.nodes.numel()
+        lower = (torch.searchsorted(self.nodes, phase, right=True) - 1).clamp(0, n_nodes - 2)
+        frac = (phase - self.nodes[lower]) / (self.nodes[lower + 1] - self.nodes[lower])
+        at_nodes = torch.zeros(n_nodes * n_bins, dtype=torch.float64, device=weights.device)
+        at_nodes = at_nodes.scatter_add(0, lower * n_bins + transient_idx, weights * (1 - frac))
+        at_nodes = at_nodes.scatter_add(0, (lower + 1) * n_bins + transient_idx, weights * frac)
+
+        # Bin j gets the share of bin offset m from the returns in bin j - m
+        last = self.first + n_shares - 1
+        padded = F.pad(at_nodes.view(1, n_nodes, n_bins), (last, -self.first))
+        row = F.conv1d(padded, self.node_shares.flip(-1).unsqueeze(0)).view(n_bins)
+        return row.to(dtype)
 
 
 class HistogrammerBase:
@@ -644,6 +736,7 @@ class HistogrammerBase:
         omega: float | None = None,
         bin_width: float | None = None,
         time_offset: float = 0.0,
+        pulse_cdf: tuple[npt.ArrayLike, npt.ArrayLike] | None = None,
     ) -> tuple[torch.Tensor, list]:
         """Bins each zone's per-pixel laser returns by depth into a transient and averages its ambient offset.
 
@@ -657,6 +750,13 @@ class HistogrammerBase:
         is divided into exactly ``gt_ntime_bins`` bins, and every return lands in one of them. Depths that are not
         finite, not positive, or at least DEPTH_CUTOFF (rays that miss every object) add no laser return, but their
         pixels still count in the zone mean and in the ambient offset.
+
+        With a ``pulse_cdf``, the pulse's cumulative distribution over time in bins as
+        :meth:`~visionsim.emulate.aspc.emitter.DynamicSource.get_pulse_cdf` returns it, each return in the window is
+        spread over the bins by the pulse instead: bin j gets the fraction of the pulse, shifted to the return's exact
+        arrival time, that arrives during bin j, so the transient keeps where in its bin each return arrived. The
+        pulse is cut at both ends of the window. Without a pulse, or with one of zero width, a return lands in its bin
+        as an ideal time-to-digital converter records it.
 
         A zone's transient is the mean of its pixels' irradiance, weighted by its FOV mask. If ``sensor_fov``,
         ``pixel_fov_list``, ``w``, ``h`` and ``omega`` are all given, each zone is also rescaled by
@@ -686,6 +786,7 @@ class HistogrammerBase:
             depth_frames = depth_frames.to(device)
         if offsets.device != device:
             offsets = offsets.to(device)
+        pulse = None if pulse_cdf is None else _PulseSpread(pulse_cdf, device)
 
         transient_list = []
         ambient_offsets = []
@@ -743,14 +844,22 @@ class HistogrammerBase:
                             )
                             continue
 
-                        transient_idx, in_window = _bin_returns(
+                        transient_idx, phase, in_window = _bin_returns(
                             current_depth_vals, gt_ntime_bins, max_depth, bin_width, time_offset
                         )
 
-                        row = torch.zeros(gt_ntime_bins, dtype=fov_irradiance_vals.dtype, device=device)
-                        row = row.scatter_add(
-                            0, transient_idx[in_window], (fov_irradiance_vals / n_fov_pixels)[in_window]
-                        )
+                        if pulse is None:
+                            row = torch.zeros(gt_ntime_bins, dtype=fov_irradiance_vals.dtype, device=device)
+                            row = row.scatter_add(
+                                0, transient_idx[in_window], (fov_irradiance_vals / n_fov_pixels)[in_window]
+                            )
+                        else:
+                            row = pulse.spread(
+                                transient_idx[in_window],
+                                phase[in_window],
+                                (fov_irradiance_vals / n_fov_pixels)[in_window],
+                                gt_ntime_bins,
+                            )
                         transient_list.append(row.unsqueeze(0))
                         progress.advance(task)
             return torch.concat(transient_list), ambient_offsets
@@ -802,24 +911,45 @@ class HistogrammerBase:
                         transient_list.append(torch.zeros((1, gt_ntime_bins), dtype=irradiance_frames.dtype, device=device))
                         continue
 
-                    transient_idx, in_window = _bin_returns(
+                    transient_idx, phase, in_window = _bin_returns(
                         current_depth_vals, gt_ntime_bins, max_depth, bin_width, time_offset
                     )
 
-                    row = torch.zeros(gt_ntime_bins, dtype=fov_irradiance_vals.dtype, device=device)
-                    row = row.scatter_add(0, transient_idx[in_window], (fov_irradiance_vals / n_fov_pixels)[in_window])
+                    if pulse is None:
+                        row = torch.zeros(gt_ntime_bins, dtype=fov_irradiance_vals.dtype, device=device)
+                        row = row.scatter_add(
+                            0, transient_idx[in_window], (fov_irradiance_vals / n_fov_pixels)[in_window]
+                        )
+                    else:
+                        row = pulse.spread(
+                            transient_idx[in_window],
+                            phase[in_window],
+                            (fov_irradiance_vals / n_fov_pixels)[in_window],
+                            gt_ntime_bins,
+                        )
                     transient_list.append(row.unsqueeze(0))
                     progress.advance(task)
             return torch.concat(transient_list), ambient_offsets
 
     def calculate_arrival_rates(
-        self, irf: torch.Tensor, transients: torch.Tensor, offset, gt_ntime_bins: int
+        self, irf: torch.Tensor | None, transients: torch.Tensor, offset, gt_ntime_bins: int
     ) -> torch.Tensor:
+        """Convolves each zone's transient with the pulse ``irf`` and adds the zone's ambient offset.
+
+        ``irf`` is the pulse sampled at whole bins, as
+        :meth:`~visionsim.emulate.aspc.emitter.DynamicSource.get_kernel` returns it. A binned transient no longer
+        holds where in its bin each return arrived, so this puts every return's pulse at its bin. With ``irf`` None,
+        the transients already hold the pulse, as :meth:`calculate_transients` returns them with a ``pulse_cdf``,
+        which keeps that position; then only the ambient offsets are added.
+        """
         arrival_rates = torch.zeros_like(transients, dtype=torch.float32, device=transients.device)
         for i in range(transients.shape[0]):
-            convolved_signal = F.conv1d(transients[i].view(1, 1, -1), irf.flip(-1).view(1, 1, -1), padding="same").view(
-                -1
-            )
+            if irf is None:
+                convolved_signal = transients[i]
+            else:
+                convolved_signal = F.conv1d(
+                    transients[i].view(1, 1, -1), irf.flip(-1).view(1, 1, -1), padding="same"
+                ).view(-1)
 
             if isinstance(offset, (list, tuple)):
                 background = offset[i] if i < len(offset) else (offset[0] if len(offset) > 0 else 0.0)
@@ -882,8 +1012,8 @@ class HistConfig:
     bin_width: Quantity | None = None
     """Width of a bin, as a one-way distance (c * t / 2). The histogram's window, ``n_bins * bin_width``, must fit in one
     laser period; returns that arrive after it are not recorded. None divides one laser period into ``n_bins`` bins. The
-    bin width also sets the sampling of the pulse shape and the dead time in bins, while the photons per laser cycle
-    follow from the repetition rate"""
+    bin width also sets the bins the pulse is integrated over and the dead time in bins, while the photons per laser
+    cycle follow from the repetition rate"""
     time_offset: Quantity = 0 * ureg.second
     """Time from the start of the histogram's window to the laser pulse. A return at range r arrives
     ``2 * r / c + time_offset`` after the start of the window, modulo one laser period, and lands in bin

@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import torch
 from scipy.constants import c as C_LIGHT
+from scipy.special import ndtr
 
 from visionsim.emulate.aspc.detector import Detector
 from visionsim.emulate.aspc.emitter import PulsedLaser
@@ -339,17 +340,20 @@ class TestBinWidthInTheEmulator:
         assert seen["dead_time_bins"] == expected == round(dead_time / bin_s)
 
     @pytest.mark.parametrize("bin_width", [BIN_M, BIN_M / 2, None])
-    def test_pulse_is_sampled_at_the_bin_width(self, bin_width):
+    def test_pulse_is_integrated_over_bins_of_the_bin_width(self, bin_width):
         emulator = ASPCEmulator(_config(10e6, bin_width=bin_width, pulse_width_ps=300.0))
         transient = _transient(emulator, 0.5)
         rates = emulator.detector.get_arrival_rates(emulator.emitter)[0].double().numpy()
-        bw = emulator.detector.get_bin_width(emulator.emitter)
-        _, kernel = emulator.emitter.get_kernel(bw, normalize="sum")
-        assert np.allclose(rates, np.convolve(transient, kernel, mode="same"), rtol=1e-5, atol=1e-12)
+        bw = emulator.detector.get_bin_width(emulator.emitter).to(ureg.meter).magnitude
+        # The Gaussian, centered on the return at 0.5 m, integrated over each bin of bw
+        sigma = 300e-12 * C_LIGHT / 2 / 2.35482 / bw
+        edges = np.arange(N_BINS + 1) - 0.5 / bw
+        expected = transient.sum() * np.diff(ndtr(edges / sigma))
+        np.testing.assert_allclose(rates, expected, rtol=0, atol=1e-4 * transient.sum())
         # A 300 ps pulse is 3.2 bins of 94 ps, or 6.4 bins of 47 ps (FWHM)
         peak = int(np.argmax(rates))
         above_half = np.flatnonzero(rates >= rates[peak] / 2)
-        fwhm_bins = 300e-12 * C_LIGHT / 2 / bw.to(ureg.meter).magnitude
+        fwhm_bins = 300e-12 * C_LIGHT / 2 / bw
         assert above_half.size == pytest.approx(fwhm_bins, abs=1.01)
 
     def test_photons_per_cycle_follow_the_repetition_rate(self):

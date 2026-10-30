@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Callable
 
@@ -7,6 +8,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 from pint import Quantity
+from scipy.special import ndtr
 
 from visionsim.emulate.aspc.utils import (
     radiance_photons,
@@ -18,6 +20,19 @@ from visionsim.emulate.aspc.utils import (
 
 # Accepted values of pulse_shape. A "custom" pulse takes its shape from pulse_shape_custom.
 PULSE_SHAPES = ("gaussian", "square", "custom")
+
+# Resolution of DynamicSource.get_pulse_cdf: steps per sigma of a Gaussian pulse, steps per bin (or per pulse_width, if
+# shorter) of a custom callable, and the most steps per bin of either
+CDF_STEPS_PER_SIGMA = 32
+CDF_STEPS_PER_WIDTH = 16
+CDF_MAX_STEPS_PER_BIN = 1024
+
+
+def _one_way_meters(value: Quantity) -> float:
+    """A distance, or a time of flight as the one-way distance c * t / 2, in meters."""
+    if value.check(ureg.meter.dimensionality):
+        return value.to(ureg.meter).magnitude
+    return tof2depth(value).to(ureg.meter).magnitude
 
 
 def load_pulse_taps(taps: npt.ArrayLike | str | Path | None) -> np.ndarray:
@@ -73,17 +88,19 @@ class DynamicSource:
     ``pulse_shape_custom`` as one of:
 
     - a callable ``f(u)`` of the offset from the return in units of ``pulse_width``, sampled as described in
-      ``get_kernel``;
+      ``get_kernel`` and ``get_pulse_cdf``;
     - a 1-D sequence or array of taps sampled at the histogram bin width;
     - the path (``str`` or ``Path``) to a ``.npy`` file or to a whitespace-separated text file of such taps.
 
-    Taps are relative weights of consecutive bins. Tap ``len(taps) // 2`` is time zero and lands on the bin of the
-    return, and tap ``i`` is delayed by ``i - len(taps) // 2`` bins (negative means earlier). To put time zero
-    elsewhere, e.g. on the peak of an asymmetric IRF, pad the taps with zeros. Taps must be finite, non-negative and
-    not all zero. They are used at whatever bin width the histogram has, so an IRF measured at another bin width
+    Taps are relative weights of consecutive bins, as recorded for a return at the center of a bin. Tap
+    ``len(taps) // 2`` is time zero and lands on the bin of the return, and tap ``i`` is delayed by
+    ``i - len(taps) // 2`` bins (negative means earlier). A return elsewhere in its bin shifts the taps by its offset
+    from the bin's center, with the pulse taken as uniform within each tap's bin (see ``get_pulse_cdf``). To put time
+    zero elsewhere, e.g. on the peak of an asymmetric IRF, pad the taps with zeros. Taps must be finite, non-negative
+    and not all zero. They are used at whatever bin width the histogram has, so an IRF measured at another bin width
     must be resampled first (or given as a callable, e.g. one that wraps ``np.interp``), and ``pulse_width`` does
-    not change them. Like the other shapes, the taps are normalized by ``get_kernel``, to a unit sum by default, so
-    that a return keeps its photon count.
+    not change them. Like the other shapes, the taps are normalized by ``get_kernel`` and ``get_pulse_cdf``, so that
+    a return keeps its photon count.
     """
 
     @validate_units()
@@ -115,6 +132,9 @@ class DynamicSource:
         ``u``. Custom taps are used as given, with a zero appended to an even number of taps so that the kernel has
         a center tap (still tap ``len(taps) // 2``).
 
+        Convolving a binned transient with this kernel puts each return's pulse at its bin, wherever in the bin the
+        return arrived. ``get_pulse_cdf`` describes the pulse within a bin instead, which keeps that position.
+
         Args:
             bin_width: histogram bin width, as a one-way distance (c * t / 2) or as a time.
             normalize: "sum" scales the kernel to a unit sum, "max" to a unit peak, anything else leaves it as is.
@@ -123,15 +143,8 @@ class DynamicSource:
             The offsets ``x`` of the taps from the return as one-way distances in meters (0 at the center tap,
             positive for later bins), and the kernel.
         """
-        if self.pulse_width.check(ureg.meter.dimensionality):
-            pw_m = self.pulse_width.to(ureg.meter).magnitude
-        else:
-            pw_m = tof2depth(self.pulse_width).to(ureg.meter).magnitude
-
-        if bin_width.check(ureg.meter.dimensionality):
-            bw_m = bin_width.to(ureg.meter).magnitude
-        else:
-            bw_m = tof2depth(bin_width).to(ureg.meter).magnitude
+        pw_m = _one_way_meters(self.pulse_width)
+        bw_m = _one_way_meters(bin_width)
 
         num_bins = max(1, round(pw_m / bw_m))
         if self.pulse_shape == "gaussian":
@@ -146,12 +159,7 @@ class DynamicSource:
         elif self.pulse_shape == "custom" and callable(self.pulse_shape_custom):
             half_num = max(3 * num_bins, 5)
             x = np.arange(-half_num, half_num + 1) * bw_m
-            kernel = np.asarray(self.pulse_shape_custom(x / pw_m), dtype=np.float64)
-            if kernel.shape != x.shape:
-                raise ValueError(
-                    f"Custom pulse callable must return one value per offset, shape {x.shape}, got {kernel.shape}."
-                )
-            _check_custom_kernel(kernel)
+            kernel = self._sample_custom_callable(x / pw_m)
         elif self.pulse_shape == "custom" and not callable(self.pulse_shape_custom):
             kernel = load_pulse_taps(self.pulse_shape_custom)
             if kernel.size % 2 == 0:
@@ -171,6 +179,79 @@ class DynamicSource:
                 kernel = kernel / m
 
         return x, kernel
+
+    def get_pulse_cdf(self, bin_width: Quantity) -> tuple[np.ndarray, np.ndarray]:
+        """Cumulative distribution of the pulse's photons over time, in units of histogram bins.
+
+        Unlike ``get_kernel``, which samples the pulse at whole bins, this describes the pulse within a bin, so that
+        each return can be spread over the bins from its exact arrival time (see
+        :meth:`~visionsim.emulate.aspc.histogrammers.HistogrammerBase.calculate_transients`). The pulse is taken to
+        be uniform between consecutive offsets ``x``, so its cumulative distribution is the linear interpolation of
+        ``(x, cdf)``, 0 before ``x[0]`` and 1 after ``x[-1]``:
+
+        - ``"gaussian"``: the exact cumulative distribution at steps of sigma / 32 or less, out to 8 sigma on each
+          side, with sigma = ``pulse_width`` / 2.35482 (``pulse_width`` is the full width at half maximum). Taking
+          the pulse as uniform within each step changes a bin's share of a return by less than 1e-4;
+        - ``"square"``: exact, uniform over ``pulse_width`` centered on the return;
+        - custom taps: tap ``i`` is uniform over the bin-wide interval centered ``i - len(taps) // 2`` bins after the
+          return, so a return at the center of a bin gives the taps, and one elsewhere in its bin shifts them by
+          linear interpolation between neighboring taps;
+        - a custom callable: sampled every 1/16 of a bin, or of ``pulse_width`` if that is shorter, over the span of
+          ``get_kernel``, each sample standing for the photons of the step centered on it.
+
+        Steps are never finer than 1/1024 of a bin, which limits the resolution of a Gaussian with sigma under 1/32 of
+        a bin. A ``pulse_width`` of 0 (``"gaussian"`` or ``"square"``) gives ``x = [0, 0]``: every photon arrives with
+        the return.
+
+        Args:
+            bin_width: histogram bin width, as a one-way distance (c * t / 2) or as a time.
+
+        Returns:
+            The offsets ``x`` from the return in bins (non-decreasing, positive for later), and the fraction ``cdf`` of
+            the pulse's photons that arrive before each, rising from 0 to 1.
+        """
+        width = _one_way_meters(self.pulse_width) / _one_way_meters(bin_width)
+
+        if self.pulse_shape in ("gaussian", "square") and width == 0:
+            return np.zeros(2), np.array([0.0, 1.0])
+
+        if self.pulse_shape == "gaussian":
+            sigma = width / 2.35482
+            steps = min(math.ceil(CDF_STEPS_PER_SIGMA / sigma), CDF_MAX_STEPS_PER_BIN)
+            half_num = math.ceil(8 * sigma * steps)
+            x = np.arange(-half_num, half_num + 1) / steps
+            cdf = ndtr(x / sigma)
+        elif self.pulse_shape == "square":
+            x = np.array([-width / 2, width / 2])
+            cdf = np.array([0.0, 1.0])
+        elif self.pulse_shape == "custom" and callable(self.pulse_shape_custom):
+            steps = min(math.ceil(CDF_STEPS_PER_WIDTH / min(width, 1.0)), CDF_MAX_STEPS_PER_BIN)
+            half_num = max(3 * max(1, round(width)), 5) * steps
+            centers = np.arange(-half_num, half_num + 1) / steps
+            density = self._sample_custom_callable(centers / width)
+            x = np.append(centers - 0.5 / steps, centers[-1] + 0.5 / steps)
+            cdf = np.concatenate(([0.0], np.cumsum(density)))
+        elif self.pulse_shape == "custom" and not callable(self.pulse_shape_custom):
+            taps = load_pulse_taps(self.pulse_shape_custom)
+            x = np.arange(taps.size + 1) - taps.size // 2 - 0.5
+            cdf = np.concatenate(([0.0], np.cumsum(taps)))
+        else:
+            raise ValueError(f"Unknown pulse_shape {self.pulse_shape!r}, expected one of {PULSE_SHAPES}.")
+
+        # The Gaussian is cut at 8 sigma; every shape keeps its photon count
+        cdf = (cdf - cdf[0]) / (cdf[-1] - cdf[0])
+        return x, cdf
+
+    def _sample_custom_callable(self, u: np.ndarray) -> np.ndarray:
+        """Evaluates a custom callable pulse shape at offsets ``u`` from the return, in units of ``pulse_width``."""
+        assert callable(self.pulse_shape_custom)
+        kernel = np.asarray(self.pulse_shape_custom(u), dtype=np.float64)
+        if kernel.shape != u.shape:
+            raise ValueError(
+                f"Custom pulse callable must return one value per offset, shape {u.shape}, got {kernel.shape}."
+            )
+        _check_custom_kernel(kernel)
+        return kernel
 
 
 class PulsedLaser(DynamicSource):

@@ -518,7 +518,8 @@ def aspc(
         active_pulse_shape: the temporal profile of the laser pulse: "gaussian", "square", "custom" (shape taken from
             ``pulse_shape_custom`` in the config file), or the path to a .npy or whitespace-separated text file of
             custom pulse taps. Taps are sampled at the histogram bin width, tap ``len(taps) // 2`` falls on the bin
-            of the return, and they are normalized to a unit sum.
+            of a return at the center of that bin (a return elsewhere in its bin shifts the taps by linear
+            interpolation), and they are normalized to a unit sum.
         ambient_enabled: if true, toggles the ambient light source (e.g., the sun) on.
         ambient_temperature: blackbody color temperature of the ambient light source. Given in kelvin.
         ambient_light_conditions: descriptor for the environment's lighting (e.g., "BRIGHT_SUNLIGHT", "OVERCAST").

@@ -80,6 +80,8 @@ class Detector:
         self.transients: torch.Tensor | None = None
         self.arrival_rates: torch.Tensor | None = None
         self.ambient_offsets: list[torch.Tensor] | torch.Tensor | None = None
+        # Arguments of the last calculate_transients call but the FOV masks, to spread the same returns by the pulse
+        self._transient_args: dict[str, Any] | None = None
 
     def build_pixel_fov_list(
         self,
@@ -169,8 +171,8 @@ class Detector:
         """Returns the histogram's bin width as a one-way distance (c * t / 2), in meters.
 
         It is the histogrammer's ``bin_width`` if set, and otherwise one laser period divided into ``n_bins`` bins, see
-        :func:`~visionsim.emulate.aspc.utils.histogram_bin_width`. It sets the bins of the returns, the sampling of the
-        pulse shape and the dead time in bins; the photons per laser cycle follow from the repetition rate.
+        :func:`~visionsim.emulate.aspc.utils.histogram_bin_width`. It sets the bins of the returns, the bins the pulse
+        is integrated over and the dead time in bins; the photons per laser cycle follow from the repetition rate.
 
         Raises:
             ValueError: if the histogram's window, ``n_bins * bin_width``, exceeds one laser period, or if a
@@ -297,7 +299,9 @@ class Detector:
         and its 1 / range^2 falloff. See :func:`~visionsim.emulate.aspc.utils.planar_depth_to_range`. A return at
         range r arrives ``2 * r / c + time_offset`` after the start of the histogram's window, modulo one laser period,
         and lands in one of its ``n_bins`` bins of :meth:`get_bin_width`, or, if it arrives after the window, is not
-        recorded (see :meth:`~visionsim.emulate.aspc.histogrammers.HistogrammerBase.calculate_transients`).
+        recorded (see :meth:`~visionsim.emulate.aspc.histogrammers.HistogrammerBase.calculate_transients`). The
+        transients hold no pulse, as an ideal time-to-digital converter records the returns; :meth:`get_arrival_rates`
+        adds the pulse.
 
         ``normal_frame`` holds each pixel's surface normal in the camera frame (+X right, +Y up, looking along -Z),
         with shape ``(..., H, W, 3)``, as :func:`~visionsim.emulate.aspc.utils.preproc_normals` returns it. The laser
@@ -321,20 +325,12 @@ class Detector:
             ambient_frame=ambient_frame,
         )
 
-        empty_ref = depth_frame.magnitude if hasattr(depth_frame, "magnitude") else depth_frame
-        if empty_ref.dim() == 3:
-            empty_ref = empty_ref[0]
-
-        vignette_flag = getattr(self.histogrammer, "vignette", True)
-        fov_masks = self.get_perpixel_fov_masks(empty_ref, vignette=vignette_flag)
-
         # Without a falloff every pixel has the same weight, and each zone is rescaled by a solid angle of its size
         rescale_zones = self.sensor.falloff == "none"
-        transients, ambient_offsets = self.histogrammer.calculate_transients(
+        transient_args = dict(
             irradiance_frames=irradiance,
             depth_frames=depth_frame,
             offsets=offsets,
-            fov_masks=fov_masks,
             gt_ntime_bins=self.histogrammer.n_bins,
             max_depth=emitter.max_resolvable_depth.to(ureg.meter).magnitude,
             sensor_fov=self.sensor.fov if rescale_zones else None,
@@ -345,25 +341,44 @@ class Detector:
             bin_width=bin_width.magnitude,
             time_offset=self._get_time_offset().magnitude,
         )
+        transients, ambient_offsets = self.histogrammer.calculate_transients(
+            fov_masks=self._get_fov_masks(depth_frame), **transient_args
+        )
 
         self.transients = transients
         self.ambient_offsets = ambient_offsets
+        self._transient_args = transient_args
         return transients, ambient_offsets
 
-    def get_arrival_rates(self, emitter: PulsedLaser) -> torch.Tensor:
-        """Convolves transients with IRF pulse kernel and adds background offset noise.
+    def _get_fov_masks(self, depth_frame: torch.Tensor | Quantity) -> torch.Tensor:
+        """The zones' FOV masks for frames of the shape of ``depth_frame``, ``(H, W)`` or ``(N, H, W)``."""
+        empty_ref = depth_frame.magnitude if hasattr(depth_frame, "magnitude") else depth_frame
+        if empty_ref.dim() == 3:
+            empty_ref = empty_ref[0]
 
-        The pulse shape is sampled at the histogram's bin width, :meth:`get_bin_width`. Since the transients only hold
-        the returns that arrive in the histogram's window, the pulse of a return just outside it does not reach it.
+        vignette_flag = getattr(self.histogrammer, "vignette", True)
+        return self.get_perpixel_fov_masks(empty_ref, vignette=vignette_flag)
+
+    def get_arrival_rates(self, emitter: PulsedLaser) -> torch.Tensor:
+        """Spreads the returns of the last :meth:`get_transients` over the bins by the pulse, and adds the ambient.
+
+        Each return is spread from its exact arrival time, not from the start of its bin: bin j gets the fraction of
+        the pulse that arrives during bin j (see :meth:`~visionsim.emulate.aspc.emitter.DynamicSource.get_pulse_cdf`
+        and :meth:`~visionsim.emulate.aspc.histogrammers.HistogrammerBase.calculate_transients`), so the arrival rates
+        keep where in its bin each return arrived, which the binned transients do not. With a pulse of zero width the
+        arrival rates are the transients plus the ambient offsets. Only the returns that arrive in the histogram's
+        window are spread, and their pulse is cut at both ends of the window.
         """
-        if self.transients is None:
+        if self.transients is None or self._transient_args is None:
             raise RuntimeError("Transients not computed. Call get_transients() first.")
 
-        _, irf = emitter.get_kernel(self.get_bin_width(emitter), normalize="sum")
-        irf_tensor = torch.tensor(irf, dtype=torch.float32, device=self.device)
-
+        pulse_transients, _ = self.histogrammer.calculate_transients(
+            fov_masks=self._get_fov_masks(self._transient_args["depth_frames"]),
+            pulse_cdf=emitter.get_pulse_cdf(self.get_bin_width(emitter)),
+            **self._transient_args,
+        )
         arrival_rates = self.histogrammer.calculate_arrival_rates(
-            irf_tensor, self.transients, self.ambient_offsets, self.histogrammer.n_bins
+            None, pulse_transients, self.ambient_offsets, self.histogrammer.n_bins
         )
 
         self.arrival_rates = arrival_rates
