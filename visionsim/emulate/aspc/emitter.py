@@ -209,11 +209,15 @@ class PulsedLaser(DynamicSource):
         depth: torch.Tensor | Quantity | float,
         num_pixels: int,
         omega: Quantity,
+        cos_incidence: torch.Tensor | float = 1.0,
     ) -> Quantity:
         """Radiance of each pixel's laser return, in photons.
 
-        ``depth`` is the range along the pixel's ray in meters (not planar depth), and the radiance falls off with its
-        square.
+        The laser spreads its photons evenly over the sensor's field of view, of solid angle ``num_pixels * omega``,
+        and lights a Lambertian surface, whose radiance is ``albedo * cos_incidence / (pi * depth^2)`` times the
+        photons per steradian. ``depth`` is the range along the pixel's ray in meters (not planar depth), and
+        ``cos_incidence`` the cosine of the angle between the surface normal and the ray (1 for a surface facing the
+        sensor), see :func:`~visionsim.emulate.aspc.utils.incidence_cosine`.
         """
         n_photons = self.num_photons_per_cycle.magnitude
         depth_m = depth.magnitude if hasattr(depth, "magnitude") else depth
@@ -224,5 +228,5 @@ class PulsedLaser(DynamicSource):
         total_omega = omega_val * num_pixels
 
         # Radiance is total photons divided by total illuminated solid angle and area
-        rad_val = (n_photons * albedo_val) / (np.pi * (depth_m**2) * total_omega)
+        rad_val = (n_photons * albedo_val * cos_incidence) / (np.pi * (depth_m**2) * total_omega)
         return rad_val * radiance_photons

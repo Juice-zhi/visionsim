@@ -626,6 +626,11 @@ class HistogrammerBase:
         at range r lands in bin ``floor(r * gt_ntime_bins / max_depth)``. Depths beyond max_depth wrap around (range
         aliasing). Depths that are not finite, not positive, or at least DEPTH_CUTOFF (rays that miss every object)
         add no laser return, but their pixels still count in the zone mean and in the ambient offset.
+
+        A zone's transient is the mean of its pixels' irradiance, weighted by its FOV mask. If ``sensor_fov``,
+        ``pixel_fov_list``, ``w``, ``h`` and ``omega`` are all given, each zone is also rescaled by
+        :func:`~visionsim.emulate.aspc.utils.get_irradiance_with_fov`, which is only meant for irradiance that does
+        not already carry each pixel's solid angle.
         """
         if hasattr(irradiance_frames, "magnitude"):
             irradiance_frames = irradiance_frames.magnitude

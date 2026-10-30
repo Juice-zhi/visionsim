@@ -470,14 +470,18 @@ def aspc(
     sensor_pixel_pitch: float | None = None,
     sensor_f_number: float | None = None,
     sensor_fov: tuple | None = None,
+    sensor_falloff: Literal["cos4", "cos3", "none"] | None = None,
     force: bool | None = None,
     pattern: str | None = None,
     device: str = "cpu",
 ) -> None:
     """Simulate Single-Photon (SP) LiDAR data from rendered frames and depth maps.
 
+    If ``input_dir`` also has a ``normals/`` directory, as rendered by VisionSim, the laser return of each surface
+    scales with the cosine of its angle of incidence. Without it every surface is taken to face the sensor.
+
     Args:
-        input_dir: directory containing the input rendered frames and depth maps.
+        input_dir: directory containing the input rendered frames and depth maps, and optionally normal maps.
         output_dir: directory in which to save the simulated SP LiDAR data.
         config_file: path to an optional YAML configuration file for the simulation parameters.
         min_depth: minimum resolvable depth for the histogram. Given in meters.
@@ -515,6 +519,10 @@ def aspc(
         sensor_pixel_pitch: physical distance between the centers of adjacent pixels. Given in micrometer.
         sensor_f_number: the F-number (focal ratio) determining the optical aperture of the sensor.
         sensor_fov: the angular field of view of the camera sensor. Given in degree.
+        sensor_falloff: how much less light a pixel at an angle theta to the optical axis collects than one on the
+            axis: "cos4" (the default, the camera equation of a sensor behind a lens: the pixel's solid angle,
+            cos^3(theta), times the foreshortened aperture, cos(theta)), "cos3" (the pixel's solid angle only) or
+            "none" (every pixel collects as much as the one on the axis).
         force: if true, overwrite output file(s) or directory if present.
         pattern: glob pattern to filter which files to process in the input directory.
         device: cpu or cuda for processing
@@ -523,7 +531,7 @@ def aspc(
 
     from visionsim.dataset import Dataset
     from visionsim.emulate.aspc import ASPCEmulator
-    from visionsim.emulate.aspc.utils import prepare_config, preproc_frames, ureg
+    from visionsim.emulate.aspc.utils import prepare_config, preproc_frames, preproc_normals, ureg
 
     prepared_config = prepare_config(user_args, config_file)
 
@@ -542,6 +550,7 @@ def aspc(
     (output_dir / "frames").mkdir(parents=True, exist_ok=True)
 
     # 5. Load Dataset
+    normals = None
     if pattern:
         frames = Dataset.from_pattern(root=input_dir / "frames", pattern="*.png")
         depths = Dataset.from_pattern(root=input_dir / "depths", pattern="*.exr")
@@ -550,7 +559,14 @@ def aspc(
         ambient = Dataset.from_path(input_dir / "frames")
         albedo = Dataset.from_path(input_dir / "diffuse" / "color")
 
+        # Normal maps are optional; they give each surface its incidence cosine
+        if (input_dir / "normals").exists():
+            normals = Dataset.from_path(input_dir / "normals")
+            if len(normals) != len(depths):
+                raise ValueError(f"Found {len(normals)} normal maps for {len(depths)} depth maps.")
+
     total_frames = len(depths)
+    normal_frames = normals if normals is not None else [None] * total_frames
 
     # 7. Frame processing loop
     import torch
@@ -579,7 +595,9 @@ def aspc(
     with ElapsedProgress() as progress:
         task = progress.add_task("[cyan]Generating ASPC histograms...", total=total_frames)
 
-        for frame_idx, (depth_frame, albedo_frame, ambient_frame) in enumerate(zip(depths, albedo, ambient)):
+        for frame_idx, (depth_frame, albedo_frame, ambient_frame, normal_frame) in enumerate(
+            zip(depths, albedo, ambient, normal_frames)
+        ):
             depth_qty, albedo_qty, ambient_qty = preproc_frames(
                 depth_frame=depth_frame,
                 albedo_frame=albedo_frame,
@@ -587,9 +605,12 @@ def aspc(
                 config=prepared_config,
                 device=device,
             )
+            normal_qty = None
+            if normal_frame is not None:
+                normal_qty = preproc_normals(normal_frame=normal_frame, config=prepared_config, device=device)
 
-            # Pass depth, albedo, and ambient quantities to the emulator
-            histogram_data = emulator.process_frame(depth_qty, albedo_qty, ambient_qty)
+            # Pass depth, albedo, ambient and normal quantities to the emulator
+            histogram_data = emulator.process_frame(depth_qty, albedo_qty, ambient_qty, normal_qty)
 
             output_file = output_dir / "frames" / f"histogram_{frame_idx:04d}.npy"
             np.save(output_file, histogram_data)

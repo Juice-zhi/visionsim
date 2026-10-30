@@ -5,11 +5,16 @@ import numpy as np
 from pint import Quantity
 
 from visionsim.emulate.aspc.utils import (
+    camera_ray_directions,
     irradiance_photons,
     pyramid_solid_angle,
     radiance_photons,
     ureg,
 )
+
+# Accepted values of a sensor's falloff, the power of cos(theta) by which a pixel at an angle theta to the optical
+# axis collects less light than a pixel on the axis from the same radiance. See SensorBase.
+FALLOFF_TYPES = ("cos4", "cos3", "none")
 
 
 def _ensure_quantity(val, default_unit):
@@ -20,7 +25,21 @@ def _ensure_quantity(val, default_unit):
 
 
 class SensorBase:
-    """Base class for camera sensors with unit-aware perspective projections."""
+    """Base class for camera sensors with unit-aware perspective projections.
+
+    By the camera equation, a pixel on the optical axis collects ``L * pi / (4 * f_number^2) * pixel_pitch^2`` photons
+    from a radiance ``L``. A pixel whose center is at an angle ``theta`` to the axis collects ``cos^k(theta)`` times as
+    many, with ``k`` set by ``falloff``:
+
+    - ``"cos4"`` (default): a sensor behind a lens. The pixel subtends a solid angle ``cos^3(theta)`` times that of the
+      pixel on the axis, and sees the aperture foreshortened by ``cos(theta)`` (natural vignetting).
+    - ``"cos3"``: the pixel's solid angle only, for a sensor modelled as integrating radiance over the cone it sees,
+      without a foreshortened aperture. Over the whole sensor, the pixels' solid angles add up to its field of view.
+    - ``"none"``: every pixel collects as much as the one on the axis.
+
+    Unlike a histogrammer's ``vignette``, which weights the pixels of a zone by their distance to the zone's center,
+    the falloff is measured from the optical axis.
+    """
 
     def __init__(
         self,
@@ -29,7 +48,11 @@ class SensorBase:
         pixel_pitch=10 * ureg.micrometer,
         fov=(90.5 * ureg.degree, 90.5 * ureg.degree),
         f_number=1.4,
+        falloff: str = "cos4",
     ):
+        if falloff not in FALLOFF_TYPES:
+            raise ValueError(f"Unknown falloff {falloff!r}, expected one of {FALLOFF_TYPES}.")
+        self.falloff = falloff
         self.h, self.w = size
         self.num_pixels = self.h * self.w
         self.pixel_pitch = _ensure_quantity(pixel_pitch, ureg.micrometer)
@@ -121,6 +144,7 @@ class SensorBase:
             "omega",
             "f_number",
             "aperture",
+            "falloff",
         ]
 
     @property
@@ -169,6 +193,30 @@ class SensorBase:
             )
         image_points = np.einsum("j..., ij->i...", camera_points, self.intrinsics)
         return image_points[:-1, ...] / image_points[-1, ...]
+
+    def frame_intrinsics(self, shape: tuple[int, int] | None = None) -> tuple[float, float, float, float]:
+        """Pinhole intrinsics ``(fl_x, fl_y, cx, cy)``, in pixels, of a frame that spans the sensor's field of view.
+
+        These are the sensor's intrinsics scaled to the frame's shape ``(H, W)``, which defaults to the sensor's size.
+        """
+        h, w = (self.h, self.w) if shape is None else shape
+        return (
+            self.f_x_px * w / self.w,
+            self.f_y_px * h / self.h,
+            self.c_x * w / self.w,
+            self.c_y * h / self.h,
+        )
+
+    def pixel_falloff(self, shape: tuple[int, int] | None = None) -> np.ndarray:
+        """Fraction of light each pixel collects relative to a pixel on the optical axis, see ``falloff``.
+
+        Returns ``cos^k(theta)`` at each pixel center of a frame of shape ``(H, W)`` that spans the sensor's field of
+        view (defaults to the sensor's size), with ``theta`` its angle to the axis and ``k`` 4, 3 or 0.
+        """
+        h, w = (self.h, self.w) if shape is None else shape
+        cos_theta = -camera_ray_directions(h, w, *self.frame_intrinsics((h, w)))[..., 2]
+        power = {"cos4": 4, "cos3": 3, "none": 0}[self.falloff]
+        return cos_theta**power
 
     @ureg.wraps(irradiance_photons, (None, radiance_photons))
     def get_irradiance(self, surface_radiance):

@@ -1,5 +1,5 @@
 """Configuration: YAML loading with the ``!Quantity`` / ``!expr`` / ``!file`` tags, the max_depth check, custom pulse
-shapes from a config file or the CLI, and the fast_sim_noise and max_detections_per_cycle options."""
+shapes from a config file or the CLI, and the fast_sim_noise, max_detections_per_cycle and sensor falloff options."""
 
 from pathlib import Path
 
@@ -287,3 +287,39 @@ class TestMaxDetectionsPerCycleConfig:
         emulator = ASPCEmulator(config)
         assert emulator.detector.histogrammer.free_running is False
         assert emulator.detector.histogrammer.max_detections_per_cycle == value
+
+
+class TestSensorFalloffConfig:
+    """The sensor's ``falloff`` from the user arguments, a config file or the CLI, on to the sensor."""
+
+    def test_default_is_the_camera_equation(self):
+        assert prepare_config({})["sensor"]["falloff"] == "cos4"
+
+    def test_user_argument(self):
+        assert prepare_config({"sensor_falloff": "cos3"})["sensor"]["falloff"] == "cos3"
+
+    def test_config_file(self, tmp_path):
+        config = prepare_config({}, _write(tmp_path, "sensor:\n  falloff: none\n"))
+        assert config["sensor"]["falloff"] == "none"
+
+    def test_user_argument_overrides_the_config_file(self, tmp_path):
+        config = prepare_config({"sensor_falloff": "cos4"}, _write(tmp_path, "sensor:\n  falloff: cos3\n"))
+        assert config["sensor"]["falloff"] == "cos4"
+
+    @pytest.mark.parametrize("falloff", ["cos4", "cos3", "none"])
+    def test_cli(self, monkeypatch, falloff):
+        assert _cli_config(monkeypatch, "--sensor-falloff", falloff)["sensor"]["falloff"] == falloff
+
+    def test_cli_rejects_an_unknown_falloff(self, monkeypatch):
+        with pytest.raises(SystemExit):
+            _cli_config(monkeypatch, "--sensor-falloff", "cos2")
+
+    @pytest.mark.parametrize("falloff", ["cos4", "cos3", "none"])
+    def test_reaches_the_sensor(self, falloff):
+        emulator = ASPCEmulator(prepare_config({"sensor_falloff": falloff}))
+        assert emulator.detector.sensor.falloff == falloff
+
+    def test_unknown_falloff_in_a_config_file_raises(self, tmp_path):
+        config = prepare_config({}, _write(tmp_path, "sensor:\n  falloff: cos2\n"))
+        with pytest.raises(ValueError, match="falloff"):
+            ASPCEmulator(config)

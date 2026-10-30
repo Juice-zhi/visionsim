@@ -41,6 +41,10 @@ MAX_DEPTH_RTOL = 1e-6
 # Blender's Z pass (a rendered depths/ directory) holds, and "range" is the distance along each pixel's ray.
 DEPTH_TYPES = ("planar_z", "range")
 
+# Accepted values of preproc_normals' normal_type, the frame a normal map is expressed in. "rendered" is what VisionSim's
+# normal pass (a rendered normals/ directory) holds, "camera" is the camera frame and "world" the world frame.
+NORMAL_TYPES = ("rendered", "camera", "world")
+
 
 def validate_units(enum_aware=True, ignore_kwargs=None):
     ignore_kwargs = ignore_kwargs or []
@@ -109,6 +113,13 @@ def pyramid_solid_angle(a, b):
 
 
 def get_irradiance_with_fov(irradiance, sensor_fov, pixel_fov, omega, w, h):
+    """Rescales the irradiance of a zone's pixels by the mean solid angle of a pixel in a zone of the same angular
+    size centered on the optical axis, relative to omega, the sensor's mean pixel solid angle.
+
+    The factor depends on the zone's size but not on its position. It stands in for the solid angles of the pixels
+    when the sensor has no ``falloff`` (``"none"``); with a falloff, each pixel's irradiance already carries its own
+    solid angle and the detector does not rescale zones.
+    """
     fov_x, fov_y = sensor_fov[0], sensor_fov[1]
     w_ratio, h_ratio = pixel_fov[3] - pixel_fov[2], pixel_fov[1] - pixel_fov[0]
     w_new, h_new = w * w_ratio, h * h_ratio
@@ -157,6 +168,76 @@ def planar_depth_to_range(
     return depth * ray_lengths
 
 
+def camera_ray_directions(h: int, w: int, fl_x: float, fl_y: float, cx: float, cy: float) -> np.ndarray:
+    """Unit directions of the rays through the pixel centers of an ``(h, w)`` image, as an array of shape ``(h, w, 3)``.
+
+    They are in the camera frame of VisionSim's camera poses (``transform_matrix``) and normal maps: +X points right,
+    +Y up, and the camera looks along -Z (OpenGL / Blender convention). The intrinsics are in pixels, with the origin at
+    the corner of the image as in a dataset's transforms, so ``cos(theta) = -z`` with ``theta`` the angle of a ray to
+    the optical axis.
+    """
+    x = (np.arange(w) + 0.5 - cx) / fl_x
+    y = (np.arange(h) + 0.5 - cy) / fl_y
+    rays = np.stack(np.broadcast_arrays(x[np.newaxis, :], -y[:, np.newaxis], -1.0), axis=-1)
+    return rays / np.linalg.norm(rays, axis=-1, keepdims=True)
+
+
+def incidence_cosine(
+    normals: npt.ArrayLike | torch.Tensor | Quantity, fl_x: float, fl_y: float, cx: float, cy: float
+) -> np.ndarray | torch.Tensor:
+    """Returns ``|cos|`` of the angle between each pixel's surface normal and its ray, which scales the light a
+    Lambertian surface receives from a source next to the camera, such as an active sensor's laser.
+
+    Args:
+        normals: surface normals of shape ``(..., H, W, 3)`` in the camera frame of :func:`camera_ray_directions`, as
+            an array, a tensor (gradients are kept) or a dimensionless Pint quantity. They need not have unit length,
+            and either side of the surface may face the camera.
+        fl_x: focal length along the image width, in pixels.
+        fl_y: focal length along the image height, in pixels.
+        cx: principal point along the image width, in pixels.
+        cy: principal point along the image height, in pixels.
+
+    Returns:
+        The cosines, of shape ``(..., H, W)``, as a float64 array or a floating-point tensor. A pixel whose normal is
+        zero or not finite, as where a ray misses every object, gets 0.
+    """
+    if isinstance(normals, Quantity):
+        normals = normals.to(ureg.dimensionless).magnitude
+
+    is_tensor = isinstance(normals, torch.Tensor)
+    values = normals if isinstance(normals, torch.Tensor) else torch.tensor(np.asarray(normals, dtype=np.float64))
+    dtype = values.dtype if values.is_floating_point() else torch.float64
+    h, w = values.shape[-3:-1]
+    rays = torch.as_tensor(camera_ray_directions(h, w, fl_x, fl_y, cx, cy), dtype=dtype, device=values.device)
+
+    # Masked before the division, so that pixels without a normal do not produce NaN gradients
+    values = torch.where(torch.isfinite(values).all(dim=-1, keepdim=True), values.to(dtype), 0.0)
+    length_sq = (values * values).sum(dim=-1)
+    valid = length_sq > 0
+    cosine = (values * rays).sum(dim=-1).abs() / torch.sqrt(torch.where(valid, length_sq, 1.0))
+    cosine = torch.where(valid, cosine, 0.0).clamp(max=1.0)
+    return cosine if is_tensor else cosine.numpy()
+
+
+def _normals_to_camera_frame(normals: np.ndarray, transform: Any, normal_type: str) -> np.ndarray:
+    """Expresses normals of shape ``(..., 3)`` in the camera frame, see :func:`preproc_normals`."""
+    if normal_type == "camera":
+        return normals
+
+    pose = transform.get("transform_matrix") if isinstance(transform, dict) else None
+    if pose is None:
+        raise ValueError(
+            f"normal_type {normal_type!r} needs the camera pose (transform_matrix) of the normal frame, which only a "
+            "dataset item has. Pass normals that are in the camera frame with normal_type='camera'."
+        )
+    rotation = np.asarray(pose, dtype=np.float64)[:3, :3]
+
+    # Row vectors: n @ R is R^T n, the world-to-camera rotation of a world-frame normal
+    if normal_type == "world":
+        return normals @ rotation
+    return normals @ rotation @ rotation
+
+
 def _frame_intrinsics(transform: Any, shape: tuple[int, ...], sensor_config: dict) -> tuple[float, float, float, float]:
     """Returns the pinhole intrinsics ``(fl_x, fl_y, cx, cy)``, in pixels, of a frame of shape ``(H, W)``.
 
@@ -175,14 +256,8 @@ def _frame_intrinsics(transform: Any, shape: tuple[int, ...], sensor_config: dic
     # Imported here since the sensors module imports this one
     from visionsim.emulate.aspc.sensors import SPADSensor
 
-    sensor = SPADSensor(**sensor_config)
     h, w = shape
-    return (
-        sensor.f_x_px * w / sensor.w,
-        sensor.f_y_px * h / sensor.h,
-        sensor.c_x * w / sensor.w,
-        sensor.c_y * h / sensor.h,
-    )
+    return SPADSensor(**sensor_config).frame_intrinsics((h, w))
 
 
 def preproc_frames(
@@ -299,6 +374,65 @@ def preproc_frames(
     ambient_qty = ureg.Quantity(ambient_tensor, "dimensionless")
 
     return depth_qty, albedo_qty, ambient_qty
+
+
+def preproc_normals(
+    normal_frame: np.ndarray | torch.Tensor,
+    config: dict,
+    device: str | torch.device = "cpu",
+    requires_grad: bool = False,
+    normal_type: str = "rendered",
+) -> Quantity:
+    """Preprocesses a normal frame into unit normals in the camera frame, resized to the sensor like the depth frame
+    of :func:`preproc_frames`, for ``ASPCEmulator.process_frame``.
+
+    The frame is an ``(H, W, 3)`` array or tensor, or a ``(data, transform)`` item of a ``Dataset``. The camera frame
+    is that of VisionSim's camera poses: +X points right, +Y up, and the camera looks along -Z. With ``R`` the
+    camera-to-world rotation of the item's ``transform_matrix``, ``normal_type`` says what the frame holds:
+
+    - ``"rendered"`` (default): a normal map from VisionSim's Blender normal pass (``include_normals``, a rendered
+      ``normals/`` directory). Its compositor drivers index ``camera.matrix_world`` column-major, so the pass holds
+      ``R @ n_world`` instead of the camera-frame normal ``R.T @ n_world`` that the documentation describes. It is
+      converted with ``R.T @ R.T``.
+    - ``"camera"``: normals in the camera frame, used as is.
+    - ``"world"``: normals in the world frame, converted with ``R.T``.
+
+    Normals are scaled to unit length, and normals that are zero or not finite (rays that miss every object) are set
+    to 0, for which the emulator gives no laser return.
+
+    Returns:
+        A dimensionless quantity holding a float64 tensor of shape ``(H, W, 3)`` at the sensor's size.
+    """
+    if normal_type not in NORMAL_TYPES:
+        raise ValueError(f"Unknown normal_type {normal_type!r}, expected one of {NORMAL_TYPES}.")
+
+    Nr, Nc = config["sensor"]["size"]
+
+    transform = None
+    if isinstance(normal_frame, (tuple, list)) and len(normal_frame) == 2:
+        normal_frame, transform = normal_frame
+    if hasattr(normal_frame, "detach"):
+        normal_frame = normal_frame.detach().cpu().numpy()
+
+    raw_normals = np.asarray(normal_frame, dtype=np.float64)
+    if raw_normals.ndim == 3 and raw_normals.shape[-1] == 1:
+        # Dataset.load_data collapses an EXR whose channels are all equal (e.g. a frame without any hit) to one channel
+        raw_normals = np.repeat(raw_normals, 3, axis=-1)
+    if raw_normals.ndim != 3 or raw_normals.shape[-1] < 3:
+        raise ValueError(f"Expected a normal frame of shape (H, W, 3), got shape {raw_normals.shape}.")
+
+    normals = _normals_to_camera_frame(raw_normals[..., :3], transform, normal_type)
+
+    normals = np.where(np.isfinite(normals).all(axis=-1, keepdims=True), normals, 0.0)
+    length = np.linalg.norm(normals, axis=-1, keepdims=True)
+    normals = np.where(length > 0, normals / np.where(length > 0, length, 1.0), 0.0)
+
+    # Resized 'nearest', like the depth frame, so that each pixel keeps the normal of the surface its depth comes from
+    normal_tensor = torch.tensor(normals, device=device, dtype=torch.float64).permute(2, 0, 1).unsqueeze(0)
+    normal_tensor = F.interpolate(normal_tensor, size=(Nr, Nc), mode="nearest").squeeze(0).permute(1, 2, 0)
+    normal_tensor = normal_tensor.contiguous().requires_grad_(requires_grad)
+
+    return ureg.Quantity(normal_tensor, "dimensionless")
 
 
 def _validate_config(config: dict) -> None:
@@ -498,6 +632,7 @@ def _build_config(
         "sensor_pixel_pitch": ("sensor", "pixel_pitch"),
         "sensor_f_number": ("sensor", "f_number"),
         "sensor_fov": ("sensor", "fov"),
+        "sensor_falloff": ("sensor", "falloff"),
     }
 
     cli_param_units = {
@@ -595,6 +730,7 @@ def prepare_config(user_args: dict, config_file: Path | str | None = None) -> di
             "pixel_pitch": 10 * ureg.micrometer,
             "f_number": 1.4 * ureg.dimensionless,
             "fov": [90.5 * ureg.degree, 59.14 * ureg.degree],
+            "falloff": "cos4",
         },
     }
     config = _build_config(DEFAULT_CONFIG, user_args, config_file=config_file)

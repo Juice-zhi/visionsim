@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -12,16 +14,31 @@ from visionsim.emulate.aspc.emitter import PulsedLaser
 from visionsim.emulate.aspc.histogrammers import HistogrammerBase
 from visionsim.emulate.aspc.sensors import SPADSensor
 from visionsim.emulate.aspc.utils import (
+    incidence_cosine,
     irradiance_photons,
     ureg,
     radiance_photons,
 )
+
+logger = logging.getLogger(__name__)
+
+
+@functools.cache
+def _log_without_normals() -> None:
+    """Logs, once per process, that frames without a normal frame have no incidence cosine."""
+    logger.warning(
+        "No normal frame given: the laser return has no incidence cosine, as if every surface faced the sensor."
+    )
 
 
 class Detector:
     """
     Unified Detector module combining physical camera optics (SPADSensor),
     spatial pixel FOV masking, and readout processing (Histogrammer).
+
+    Frames passed to the detector span the sensor's field of view, and each pixel is weighted by the sensor's
+    ``falloff`` (see :class:`~visionsim.emulate.aspc.sensors.SensorBase`). A zone's transient is the mean of its
+    pixels', i.e. photons per pixel of the zone.
     """
 
     def __init__(
@@ -143,15 +160,45 @@ class Detector:
 
         return torch.concat(mask_list)
 
-    def _get_signal(self, depth_frame: torch.Tensor, albedo_frame: torch.Tensor, emitter: PulsedLaser) -> torch.Tensor:
-        """Converts active laser radiance to focal plane irradiance (#photons)."""
+    def _get_falloff(self, shape: tuple[int, ...]) -> torch.Tensor:
+        """The sensor's off-axis falloff for frames of shape ``(..., H, W)``."""
+        h, w = shape[-2:]
+        return torch.as_tensor(self.sensor.pixel_falloff((h, w)), dtype=torch.float32, device=self.device)
+
+    def _get_incidence_cosine(self, normal_frame: torch.Tensor | Quantity, shape: tuple[int, ...]) -> torch.Tensor:
+        """|cos| of the angle between each pixel's camera-frame normal and its ray, for frames of shape (..., H, W)."""
+        normals = normal_frame.magnitude if hasattr(normal_frame, "magnitude") else normal_frame
+        normals = torch.as_tensor(normals)
+        h, w = shape[-2:]
+        if normals.ndim < 3 or normals.shape[-1] != 3 or tuple(normals.shape[-3:-1]) != (h, w):
+            raise ValueError(f"Expected a normal frame of shape (..., {h}, {w}, 3), got shape {tuple(normals.shape)}.")
+        return torch.as_tensor(incidence_cosine(normals, *self.sensor.frame_intrinsics((h, w))))
+
+    def _get_signal(
+        self,
+        depth_frame: torch.Tensor,
+        albedo_frame: torch.Tensor,
+        emitter: PulsedLaser,
+        normal_frame: torch.Tensor | Quantity | None = None,
+    ) -> torch.Tensor:
+        """Converts active laser radiance to focal plane irradiance (#photons).
+
+        With a ``normal_frame``, the radiance of each surface scales with its incidence cosine; without one, every
+        surface is taken to face the sensor. The camera equation then applies the sensor's off-axis falloff.
+        """
+        depth_ref = depth_frame.magnitude if hasattr(depth_frame, "magnitude") else depth_frame
+        cos_incidence: torch.Tensor | float = 1.0
+        if normal_frame is not None:
+            cos_incidence = self._get_incidence_cosine(normal_frame, depth_ref.shape)
+
         num_pixels = self.sensor.w * self.sensor.h
-        radiance = emitter.get_scene_radiance(albedo_frame, depth_frame, num_pixels, self.sensor.omega)
+        radiance = emitter.get_scene_radiance(albedo_frame, depth_frame, num_pixels, self.sensor.omega, cos_incidence)
         irradiance = (radiance * torch.pi / 4 * (1 / self.sensor.f_number) ** 2).to(irradiance_photons) * (
             self.sensor.pixel_pitch.to(ureg.meter)
         ) ** 2
 
-        return torch.as_tensor(irradiance.magnitude, dtype=torch.float32, device=self.device)
+        irradiance = torch.as_tensor(irradiance.magnitude, dtype=torch.float32, device=self.device)
+        return irradiance * self._get_falloff(irradiance.shape)
 
     def _get_ambient_offset(
             self,
@@ -160,7 +207,10 @@ class Detector:
             scene: Sun | None = None,
             ambient_frame: torch.Tensor | Quantity | None = None,
         ) -> torch.Tensor:
-            """Converts ambient background radiance to focal plane offset irradiance (#photons)."""
+            """Converts ambient background radiance to focal plane offset irradiance (#photons).
+
+            Like the laser return, it is weighted by the sensor's off-axis falloff.
+            """
             # 1. Primary path: Use rendered ambient spatial frame scaled by physical radiance
             if ambient_frame is not None:
                 if scene is not None:
@@ -173,7 +223,8 @@ class Detector:
                     spatial_radiance * torch.pi / 4 * (1 / self.sensor.f_number) ** 2
                 ).to(irradiance_photons) * (self.sensor.pixel_pitch.to(ureg.meter)) ** 2
 
-                return torch.as_tensor(ambient_irradiance.magnitude, dtype=torch.float32, device=self.device)
+                offsets = torch.as_tensor(ambient_irradiance.magnitude, dtype=torch.float32, device=self.device)
+                return offsets * self._get_falloff(offsets.shape)
 
             # 2. Secondary path: Fall back to analytical Sun model
             elif scene is not None:
@@ -182,7 +233,8 @@ class Detector:
                     irradiance_photons
                 ) * (self.sensor.pixel_pitch.to(ureg.meter)) ** 2
 
-                return torch.as_tensor(ambient_irradiance.magnitude, dtype=torch.float32, device=self.device)
+                offsets = torch.as_tensor(ambient_irradiance.magnitude, dtype=torch.float32, device=self.device)
+                return offsets * self._get_falloff(offsets.shape)
 
             # 3. Default path: No ambient source
             else:
@@ -195,13 +247,27 @@ class Detector:
         emitter: PulsedLaser,
         scene: Sun | None = None,
         ambient_frame: torch.Tensor | Quantity | None = None,
+        normal_frame: torch.Tensor | Quantity | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Calculates spatial-temporal transients over laser ToF bins.
 
         ``depth_frame`` is each pixel's range (the distance along its ray, not planar depth), which sets both its bin
         and its 1 / range^2 falloff. See :func:`~visionsim.emulate.aspc.utils.planar_depth_to_range`.
+
+        ``normal_frame`` holds each pixel's surface normal in the camera frame (+X right, +Y up, looking along -Z),
+        with shape ``(..., H, W, 3)``, as :func:`~visionsim.emulate.aspc.utils.preproc_normals` returns it. The laser
+        return then scales with ``|cos|`` of the angle between the normal and the pixel's ray. Without a normal
+        frame there is no incidence cosine, i.e. every surface is taken to face the sensor, which overestimates
+        oblique surfaces; this is logged once.
+
+        Every pixel is weighted by the sensor's off-axis falloff. With a falloff, the zones are not rescaled, since
+        each pixel already carries its own solid angle; with ``falloff="none"`` each zone is rescaled by
+        :func:`~visionsim.emulate.aspc.utils.get_irradiance_with_fov`, as before.
         """
-        irradiance = self._get_signal(depth_frame, albedo_frame, emitter)
+        if normal_frame is None:
+            _log_without_normals()
+
+        irradiance = self._get_signal(depth_frame, albedo_frame, emitter, normal_frame)
         offsets = self._get_ambient_offset(
             albedo_frame=albedo_frame,
             emitter=emitter,
@@ -216,6 +282,8 @@ class Detector:
         vignette_flag = getattr(self.histogrammer, "vignette", True)
         fov_masks = self.get_perpixel_fov_masks(empty_ref, vignette=vignette_flag)
 
+        # Without a falloff every pixel has the same weight, and each zone is rescaled by a solid angle of its size
+        rescale_zones = self.sensor.falloff == "none"
         transients, ambient_offsets = self.histogrammer.calculate_transients(
             irradiance_frames=irradiance,
             depth_frames=depth_frame,
@@ -223,11 +291,11 @@ class Detector:
             fov_masks=fov_masks,
             gt_ntime_bins=self.histogrammer.n_bins,
             max_depth=emitter.max_resolvable_depth.magnitude,
-            sensor_fov=self.sensor.fov,
+            sensor_fov=self.sensor.fov if rescale_zones else None,
             pixel_fov_list=self.pixel_fov_list,
             w=self.sensor.w,
             h=self.sensor.h,
-            omega=self.sensor.omega,
+            omega=self.sensor.omega if rescale_zones else None,
         )
 
         self.transients = transients
