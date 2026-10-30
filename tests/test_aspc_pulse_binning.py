@@ -190,6 +190,13 @@ class TestGetPulseCdf:
         with pytest.raises(ValueError):
             _source("custom", 2.0, pulse_shape_custom=bad).get_pulse_cdf(BW_M * ureg.meter)
 
+    @pytest.mark.parametrize("method", ["get_pulse_cdf", "get_kernel"])
+    def test_callable_needs_a_positive_pulse_width(self, method):
+        """Its offsets are in units of pulse_width; a width of 0 raised a ZeroDivisionError or a non-finite pulse."""
+        source = _source("custom", 0.0, pulse_shape_custom=lambda u: np.exp(-(u**2)))
+        with pytest.raises(ValueError, match="pulse_width"):
+            getattr(source, method)(BW_M * ureg.meter)
+
     @pytest.mark.parametrize("shape", ["gaussian", "square"])
     def test_bin_width_as_time_or_distance(self, shape):
         source = _source(shape, 2.5)
@@ -561,6 +568,17 @@ class TestArrivalRates:
         emulator = ASPCEmulator(_config())
         with pytest.raises(RuntimeError, match="get_transients"):
             emulator.detector.get_arrival_rates(emulator.emitter)
+
+    def test_replaced_transients_raise(self):
+        """The arrival rates come from the returns of get_transients, so replaced transients would be ignored."""
+        emulator = ASPCEmulator(_config())
+        _emulate(emulator, 40.3 * BIN_M)
+        emulator.detector.transients = torch.zeros_like(emulator.detector.transients)
+        with pytest.raises(RuntimeError, match="replaced"):
+            emulator.detector.get_arrival_rates(emulator.emitter)
+        # The next frame's transients are used again
+        _, rates = _emulate(emulator, 70.7 * BIN_M)
+        assert _centroid(rates) == pytest.approx(70.2, abs=1e-4)
 
     def test_photon_counts_follow_the_arrival_rates(self):
         """The photon histogram has the centroid of the arrival rates, not of the bin's start."""

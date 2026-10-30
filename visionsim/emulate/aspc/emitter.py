@@ -101,6 +101,11 @@ class DynamicSource:
     must be resampled first (or given as a callable, e.g. one that wraps ``np.interp``), and ``pulse_width`` does
     not change them. Like the other shapes, the taps are normalized by ``get_kernel`` and ``get_pulse_cdf``, so that
     a return keeps its photon count.
+
+    Shifting the taps keeps the centroid of a return exact, but a return ``d`` bins from the center of its bin also
+    widens them by a variance of ``|d| * (1 - |d|)`` bin^2 (at most 1/4, 1/6 on average). A time-to-digital converter
+    records a pulse much wider than a bin with nearly the same width wherever the return arrives, so this blurs the
+    histogram slightly more than the measured taps; a callable, sampled within each bin, does not.
     """
 
     @validate_units()
@@ -157,6 +162,7 @@ class DynamicSource:
             x = np.arange(-half_num, half_num + 1) * bw_m
             kernel = np.where(np.abs(x) <= pw_m / 2, 1.0, 0.0)
         elif self.pulse_shape == "custom" and callable(self.pulse_shape_custom):
+            self._check_custom_callable_width()
             half_num = max(3 * num_bins, 5)
             x = np.arange(-half_num, half_num + 1) * bw_m
             kernel = self._sample_custom_callable(x / pw_m)
@@ -201,7 +207,7 @@ class DynamicSource:
 
         Steps are never finer than 1/1024 of a bin, which limits the resolution of a Gaussian with sigma under 1/32 of
         a bin. A ``pulse_width`` of 0 (``"gaussian"`` or ``"square"``) gives ``x = [0, 0]``: every photon arrives with
-        the return.
+        the return. A custom callable needs a positive ``pulse_width``, the unit of its offsets.
 
         Args:
             bin_width: histogram bin width, as a one-way distance (c * t / 2) or as a time.
@@ -225,6 +231,7 @@ class DynamicSource:
             x = np.array([-width / 2, width / 2])
             cdf = np.array([0.0, 1.0])
         elif self.pulse_shape == "custom" and callable(self.pulse_shape_custom):
+            self._check_custom_callable_width()
             steps = min(math.ceil(CDF_STEPS_PER_WIDTH / min(width, 1.0)), CDF_MAX_STEPS_PER_BIN)
             half_num = max(3 * max(1, round(width)), 5) * steps
             centers = np.arange(-half_num, half_num + 1) / steps
@@ -241,6 +248,14 @@ class DynamicSource:
         # The Gaussian is cut at 8 sigma; every shape keeps its photon count
         cdf = (cdf - cdf[0]) / (cdf[-1] - cdf[0])
         return x, cdf
+
+    def _check_custom_callable_width(self) -> None:
+        """Raises if a custom callable pulse shape cannot be sampled, as its offsets are in units of ``pulse_width``."""
+        if not _one_way_meters(self.pulse_width) > 0:
+            raise ValueError(
+                "A custom pulse shape callable takes offsets in units of pulse_width, which must then be positive, got "
+                f"pulse_width = {self.pulse_width}."
+            )
 
     def _sample_custom_callable(self, u: np.ndarray) -> np.ndarray:
         """Evaluates a custom callable pulse shape at offsets ``u`` from the return, in units of ``pulse_width``."""

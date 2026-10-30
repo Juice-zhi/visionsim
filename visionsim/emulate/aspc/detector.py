@@ -81,8 +81,9 @@ class Detector:
         self.transients: torch.Tensor | None = None
         self.arrival_rates: torch.Tensor | None = None
         self.ambient_offsets: list[torch.Tensor] | torch.Tensor | None = None
-        # Arguments of the last calculate_transients call but the FOV masks, to spread the same returns by the pulse
-        self._transient_args: dict[str, Any] | None = None
+        # The transients of the last get_transients, and the arguments of its calculate_transients call but the FOV
+        # masks, from which get_arrival_rates spreads the same returns by the pulse
+        self._last_transients: tuple[torch.Tensor, dict[str, Any]] | None = None
 
     def build_pixel_fov_list(
         self,
@@ -351,7 +352,7 @@ class Detector:
 
         self.transients = transients
         self.ambient_offsets = ambient_offsets
-        self._transient_args = transient_args
+        self._last_transients = (transients, transient_args)
         return transients, ambient_offsets
 
     def _get_fov_masks(self, depth_frame: torch.Tensor | Quantity) -> torch.Tensor:
@@ -372,14 +373,29 @@ class Detector:
         keep where in its bin each return arrived, which the binned transients do not. With a pulse of zero width the
         arrival rates are the transients plus the ambient offsets. Only the returns that arrive in the histogram's
         window are spread, and their pulse is cut at both ends of the window.
+
+        ``transients`` is therefore an output of :meth:`get_transients`, not an input of this method: changing it in
+        place does not change the arrival rates, and replacing it raises. To give transients of your own a pulse, use
+        :meth:`~visionsim.emulate.aspc.histogrammers.HistogrammerBase.calculate_arrival_rates` with the kernel of
+        :meth:`~visionsim.emulate.aspc.emitter.DynamicSource.get_kernel`, which puts every return's pulse at its bin.
+
+        Raises:
+            RuntimeError: if :meth:`get_transients` has not run, or if ``transients`` was replaced since.
         """
-        if self.transients is None or self._transient_args is None:
+        if self._last_transients is None:
             raise RuntimeError("Transients not computed. Call get_transients() first.")
+        transients, transient_args = self._last_transients
+        if self.transients is not transients:
+            raise RuntimeError(
+                "Detector.transients was replaced after get_transients(), but the arrival rates are spread from the "
+                "returns of the last get_transients(), not from the transients. To give transients of your own a "
+                "pulse, use histogrammer.calculate_arrival_rates() with the kernel of emitter.get_kernel()."
+            )
 
         pulse_transients, _ = self.histogrammer.calculate_transients(
-            fov_masks=self._get_fov_masks(self._transient_args["depth_frames"]),
+            fov_masks=self._get_fov_masks(transient_args["depth_frames"]),
             pulse_cdf=emitter.get_pulse_cdf(self.get_bin_width(emitter)),
-            **self._transient_args,
+            **transient_args,
         )
         arrival_rates = self.histogrammer.calculate_arrival_rates(
             None, pulse_transients, self.ambient_offsets, self.histogrammer.n_bins
