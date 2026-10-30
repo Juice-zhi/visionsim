@@ -11,7 +11,7 @@ from pint import Quantity
 from torch import Tensor
 
 from visionsim.utils.progress import ElapsedProgress
-from visionsim.emulate.aspc.utils import get_irradiance_with_fov, ureg, validate_units
+from visionsim.emulate.aspc.utils import DEPTH_CUTOFF, get_irradiance_with_fov, ureg, validate_units
 
 # =============================================================================
 # MONTE-CARLO SAMPLING & DEAD-TIME WALK KERNELS
@@ -385,6 +385,12 @@ class HistogrammerBase:
         h: int | None = None,
         omega: float | None = None,
     ) -> tuple[torch.Tensor, list]:
+        """Bins each zone's per-pixel laser returns by depth into a transient and averages its ambient offset.
+
+        Depths beyond max_depth wrap around (range aliasing). Depths that are not finite, not positive, or at least
+        DEPTH_CUTOFF (rays that miss every object) add no laser return, but their pixels still count in the zone
+        mean and in the ambient offset.
+        """
         if hasattr(irradiance_frames, "magnitude"):
             irradiance_frames = irradiance_frames.magnitude
         if hasattr(depth_frames, "magnitude"):
@@ -440,7 +446,11 @@ class HistogrammerBase:
 
                         fov_irradiance_vals = fov_irradiance_vals * fov_mask[index_mask]
 
-                        valid = torch.isfinite(current_depth_vals) & (current_depth_vals > 0)
+                        valid = (
+                            torch.isfinite(current_depth_vals)
+                            & (current_depth_vals > 0)
+                            & (current_depth_vals < DEPTH_CUTOFF)
+                        )
                         current_depth_vals = current_depth_vals[valid]
                         fov_irradiance_vals = fov_irradiance_vals[valid]
 
@@ -494,7 +504,11 @@ class HistogrammerBase:
 
                     fov_irradiance_vals = fov_irradiance_vals * fov_mask[index_mask]
 
-                    valid = torch.isfinite(current_depth_vals) & (current_depth_vals > 0)
+                    valid = (
+                        torch.isfinite(current_depth_vals)
+                        & (current_depth_vals > 0)
+                        & (current_depth_vals < DEPTH_CUTOFF)
+                    )
                     current_depth_vals = current_depth_vals[valid]
                     fov_irradiance_vals = fov_irradiance_vals[valid]
 

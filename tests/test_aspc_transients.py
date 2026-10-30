@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from visionsim.emulate.aspc.histogrammers import HistConfig, Histogrammer
-from visionsim.emulate.aspc.utils import tof2depth, ureg
+from visionsim.emulate.aspc.utils import DEPTH_CUTOFF, preproc_frames, tof2depth, ureg
 
 B = 20
 MAX_DEPTH = 10.0
@@ -169,12 +169,17 @@ class TestOutOfRangeAliasing:
         t, _ = hist.calculate_transients(irr, dep, off, torch.ones(1, 2, 2), B, MAX_DEPTH)
         assert float(t[0, _expected_bin(5.0)]) == pytest.approx(0.25)
 
+    def test_far_surface_below_miss_cutoff_still_aliases(self, hist):
+        irr, dep, off = _scene(0.5 * DEPTH_CUTOFF, h=1, w=1)
+        t, _ = hist.calculate_transients(irr, dep.double(), off, _full_mask(1, 1), B, MAX_DEPTH)
+        assert float(t.sum()) == pytest.approx(1.0)
+
 
 # =========================================================================== #
-# 4e — invalid depths are rejected                                            #
+# 4e — invalid depths and missed rays are rejected                            #
 # =========================================================================== #
 class TestInvalidDepths:
-    @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+    @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf"), 1e10, DEPTH_CUTOFF])
     def test_invalid_depth_contributes_nothing(self, hist, bad):
         irr, dep, off = _scene(1.0, h=2, w=2)
         dep[0] = torch.tensor([[3.0, bad], [bad, bad]])
@@ -188,6 +193,47 @@ class TestInvalidDepths:
         t, _ = hist.calculate_transients(irr, dep, off, _full_mask(), B, MAX_DEPTH)
         assert torch.isfinite(t).all()
         assert float(t.sum()) == pytest.approx(0.0)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    @pytest.mark.parametrize("n_frames", [1, 2])
+    def test_missed_rays_are_not_binned(self, hist, dtype, n_frames):
+        irr, dep, off = _scene(3.0, n_frames=n_frames)
+        dep[:, :, W // 2 :] = 1e10
+        dep = dep.to(dtype)
+        if n_frames == 1:
+            irr, dep, off = irr[0], dep[0], off[0]
+        t, _ = hist.calculate_transients(irr, dep, off, _full_mask(), B, MAX_DEPTH)
+        assert t.shape == (n_frames, B)
+        for row in t:
+            assert torch.nonzero(row).flatten().tolist() == [_expected_bin(3.0)]
+            assert float(row.sum()) == pytest.approx(0.5)
+
+    def test_missed_rays_count_in_ambient_offset(self, hist):
+        irr, dep, _ = _scene(3.0)
+        dep[0, :, W // 2 :] = 1e10
+        off = torch.full((1, H, W), 2.0)
+        _, amb = hist.calculate_transients(irr, dep, off, _full_mask(), B, MAX_DEPTH)
+        assert float(amb[0]) == pytest.approx(2.0 / B)
+
+
+class TestPreprocDepth:
+    CONFIG = {
+        "sensor": {"size": (2, 3)},
+        "active_source": {"pulsed_laser": {"pulse_repetition": 10e6}},
+        "histogrammer": {"max_depth": 10.0},
+    }
+
+    def test_missed_and_invalid_depths_become_zero(self):
+        depth = np.array([[1e10, np.inf, np.nan], [-1.0, DEPTH_CUTOFF, 2.0]], dtype=np.float32)
+        ones = np.ones_like(depth)
+        depth_qty, _, _ = preproc_frames(depth, ones, ones, self.CONFIG)
+        assert depth_qty.magnitude.tolist() == [[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]]
+
+    def test_valid_depths_are_kept(self):
+        depth = np.array([[0.5, 7.25, 14.0], [100.0, 3.0, 2.0]], dtype=np.float32)
+        ones = np.ones_like(depth)
+        depth_qty, _, _ = preproc_frames(depth, ones, ones, self.CONFIG)
+        assert depth_qty.magnitude.tolist() == depth.tolist()
 
 
 # =========================================================================== #

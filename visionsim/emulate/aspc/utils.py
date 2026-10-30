@@ -28,6 +28,10 @@ irradiance = ureg.watts / ureg.meter**2
 radiance_photons = ureg.count / ureg.steradian / ureg.meter**2
 irradiance_photons = ureg.count / ureg.meter**2
 
+# Blender writes a depth of 1e10 m for rays that miss every object. Depths (in meters) at or beyond this cutoff,
+# like non-finite and non-positive depths, are treated as no laser return instead of a surface to bin.
+DEPTH_CUTOFF = 1e9
+
 
 def validate_units(enum_aware=True, ignore_kwargs=None):
     ignore_kwargs = ignore_kwargs or []
@@ -115,7 +119,8 @@ def preproc_frames(
 ) -> tuple[Quantity, Quantity, Quantity]:
     """Preprocesses a single frame triplet (depth, albedo, ambient) into PyTorch Tensors
 
-    wrapped in Pint quantities.
+    wrapped in Pint quantities. Depths that are not finite, not positive, or at least DEPTH_CUTOFF (rays that miss
+    every object) are set to 0, which the histogrammer treats as no laser return.
     """
     Nr, Nc = config["sensor"]["size"]
 
@@ -159,7 +164,8 @@ def preproc_frames(
     else:
         depth_img = raw_depth.astype(np.float32)
 
-    depth_img = np.where(np.isfinite(depth_img) & (depth_img > 0), depth_img, 0.0)
+    # Missed rays and invalid depths become 0 (no return), see DEPTH_CUTOFF
+    depth_img = np.where(np.isfinite(depth_img) & (depth_img > 0) & (depth_img < DEPTH_CUTOFF), depth_img, 0.0)
 
     # 3. Process Albedo Frame (Diffuse Color Pass)
     raw_albedo = _to_numpy(albedo_frame)
