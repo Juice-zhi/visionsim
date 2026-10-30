@@ -87,6 +87,35 @@ class TestZeroFlux:
 
 
 # =========================================================================== #
+# 3a-3 — low-flux precision of the synchronous model                           #
+# =========================================================================== #
+def _coates_reference(phi):
+    """Single-hit synchronous detection distribution in float64, normalised to sum to one."""
+    phi = phi.double()
+    p = -torch.expm1(-phi) * torch.exp(-(torch.cumsum(phi, dim=-1) - phi))
+    return p / p.sum(dim=-1, keepdim=True)
+
+
+class TestSyncLowFlux:
+    @pytest.mark.parametrize("scale", [1e-3, 1e-4, 1e-6])
+    def test_matches_float64_reference(self, scale):
+        phi = _phi((2, B)) * scale
+        out = batch_distorted_transient_sync(phi, 0, B)
+        assert torch.allclose(out.double(), _coates_reference(phi), rtol=1e-5, atol=0)
+
+    def test_weak_ambient_is_not_lost_under_a_return(self):
+        phi = torch.full((1, B), 1e-8)
+        phi[0, 4] = 0.1
+        out = batch_distorted_transient_sync(phi, 0, B)
+        assert torch.all(out > 0)
+        assert torch.allclose(out.double(), _coates_reference(phi), rtol=1e-5, atol=0)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_keeps_input_dtype(self, dtype):
+        assert batch_distorted_transient_sync(_phi((2, B)).to(dtype), 0, B).dtype == dtype
+
+
+# =========================================================================== #
 # 3b — pile-up physics                                                         #
 # =========================================================================== #
 class TestPileUpPhysics:

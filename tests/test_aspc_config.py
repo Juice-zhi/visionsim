@@ -1,12 +1,13 @@
-"""YAML configuration loading: ``_load_config`` and the ``!Quantity`` / ``!expr`` / ``!file`` tags."""
+"""Configuration: YAML loading with the ``!Quantity`` / ``!expr`` / ``!file`` tags, and the max_depth check."""
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 from pint import Quantity
 
 import visionsim.emulate.aspc as aspc
-from visionsim.emulate.aspc.utils import _load_config, ureg
+from visionsim.emulate.aspc.utils import _load_config, c, prepare_config, preproc_frames, ureg
 
 ASPC_DIR = Path(aspc.__file__).parent
 SHIPPED_CONFIGS = [ASPC_DIR / "config.yaml", *sorted((ASPC_DIR / "examples").glob("*.yaml"))]
@@ -66,3 +67,43 @@ class TestTags:
     def test_file_is_relative_to_config(self, tmp_path):
         config = _load_config(_write(tmp_path, "pixel_fov_list: !file zones.txt\n"))
         assert Path(config["pixel_fov_list"]) == tmp_path / "zones.txt"
+
+
+class TestMaxDepthCheck:
+    """max_depth may equal the unambiguous range c / (2 * pulse_repetition) up to rounding, but not exceed it."""
+
+    @staticmethod
+    def _preproc(max_depth, pulse_rep_hz):
+        config = {
+            "sensor": {"size": (2, 2)},
+            "active_source": {"pulsed_laser": {"pulse_repetition": pulse_rep_hz * ureg.hertz}},
+            "histogrammer": {"max_depth": max_depth * ureg.meter},
+        }
+        frame = np.ones((2, 2), dtype=np.float32)
+        return preproc_frames(frame, frame, frame, config)
+
+    @staticmethod
+    def _prepare(max_depth, pulse_rep_hz):
+        user_args = {
+            "max_depth": max_depth,
+            "active_pulse_repetition": pulse_rep_hz / 1e6,
+            "n_bins": 64,
+            "bin_width": max_depth / 64,
+        }
+        return prepare_config(user_args)
+
+    @pytest.mark.parametrize("max_depth", [1.28, 7.5, 3.0, 0.6])
+    def test_unambiguous_range_is_accepted(self, max_depth):
+        pulse_rep_hz = c / (2 * max_depth)
+        self._preproc(max_depth, pulse_rep_hz)
+        config = self._prepare(max_depth, pulse_rep_hz)
+        assert config["histogrammer"]["max_depth"] == max_depth * ureg.meter
+
+    @pytest.mark.parametrize("excess", [1.0001, 1.01])
+    def test_beyond_unambiguous_range_is_rejected(self, excess):
+        max_depth = 1.28
+        pulse_rep_hz = c / (2 * max_depth)
+        with pytest.raises(ValueError, match="exceeds max resolvable depth"):
+            self._preproc(max_depth * excess, pulse_rep_hz)
+        with pytest.raises(ValueError, match="exceeds max resolvable depth"):
+            self._prepare(max_depth * excess, pulse_rep_hz)

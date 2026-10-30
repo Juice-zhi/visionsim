@@ -223,13 +223,18 @@ def batch_distorted_transient_sync(
     dead_time_bins: int,
     n_bins: int,
 ) -> torch.Tensor:
-    """Batched single-hit synchronous forward model (Coates)."""
-    p_detect = 1.0 - torch.exp(-torch.clamp(phi_bar[:, :n_bins], min=0.0))
+    """Batched single-hit synchronous forward model (Coates).
+
+    The detection probabilities 1 - exp(-phi) are computed with expm1 in float64: in float32 they lose most of their
+    digits at low per-bin rates (and become 0 below about 3e-8). The result has the dtype of phi_bar.
+    """
+    phi = torch.clamp(phi_bar[:, :n_bins].to(torch.float64), min=0.0)
+    p_detect = -torch.expm1(-phi)
     survival = torch.ones_like(p_detect)
     survival[:, 1:] = torch.cumprod(1.0 - p_detect[:, :-1], dim=-1)
     prob_detect = p_detect * survival
     total = prob_detect.sum(dim=-1, keepdim=True)
-    return prob_detect / (total + 1e-12)
+    return (prob_detect / (total + 1e-12)).to(phi_bar.dtype)
 
 
 def batch_distorted_transient_async(

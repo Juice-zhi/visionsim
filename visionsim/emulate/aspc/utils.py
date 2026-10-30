@@ -32,6 +32,10 @@ irradiance_photons = ureg.count / ureg.meter**2
 # like non-finite and non-positive depths, are treated as no laser return instead of a surface to bin.
 DEPTH_CUTOFF = 1e9
 
+# Relative tolerance when checking max_depth against the unambiguous range c / (2 * pulse_repetition), so that a
+# max_depth equal to that range is not rejected because of floating-point rounding.
+MAX_DEPTH_RTOL = 1e-6
+
 
 def validate_units(enum_aware=True, ignore_kwargs=None):
     ignore_kwargs = ignore_kwargs or []
@@ -138,7 +142,7 @@ def preproc_frames(
     else:
         scale_depth = scale_depth.to(ureg.meter)
 
-    if scale_depth > max_resolvable_depth:
+    if scale_depth > max_resolvable_depth * (1 + MAX_DEPTH_RTOL):
         raise ValueError(
             f"histogrammer.max_depth ({scale_depth}) exceeds max resolvable depth ({max_resolvable_depth})."
         )
@@ -264,7 +268,7 @@ def _validate_config(config: dict) -> None:
 
     if pulse_rep is not None and pulse_rep > 0 * ureg.megahertz:
         max_resolvable_depth = tof2depth(1 / pulse_rep)
-        if max_depth is not None and max_depth > max_resolvable_depth:
+        if max_depth is not None and max_depth > max_resolvable_depth * (1 + MAX_DEPTH_RTOL):
             errors.append(f"Max depth ({max_depth}) exceeds max resolvable depth ({max_resolvable_depth}).")
 
         if n_bins is not None and bin_width is not None:
