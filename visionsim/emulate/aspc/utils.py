@@ -14,6 +14,7 @@ import pint
 import torch
 from pint import Quantity, UnitRegistry, set_application_registry
 from ruamel.yaml import YAML
+from ruamel.yaml.nodes import MappingNode, ScalarNode, SequenceNode
 from scipy.constants import c  # Top-level export for unit tests
 import torch.nn.functional as F
 
@@ -274,18 +275,19 @@ def _validate_config(config: dict) -> None:
 
 
 def yaml_constructor(cls_or_func, *extra_args):
+    """Builds a YAML tag constructor that applies ``cls_or_func`` to the tagged node.
+
+    A scalar is passed as is (``!Quantity 10 ns``), each item of a sequence is converted on its own
+    (``!Quantity [90 degree, 60 degree]`` gives a list of quantities), and a mapping is passed as keyword arguments.
+    """
+
     def constructor(loader, node):
-        if hasattr(loader, "construct_scalar") and isinstance(node, loader.model.ScalarNode):
-            val = loader.construct_scalar(node)
-            return cls_or_func(val, *extra_args)
-        elif hasattr(node, "value") and isinstance(node.value, str):
-            return cls_or_func(node.value, *extra_args)
-        elif isinstance(node.value, list):
-            seq = [loader.construct_object(child) for child in node.value]
-            return cls_or_func(seq, *extra_args)
-        elif isinstance(node.value, dict):
-            mapping = {loader.construct_object(k): loader.construct_object(v) for k, v in node.value.items()}
-            return cls_or_func(*extra_args, **mapping)
+        if isinstance(node, ScalarNode):
+            return cls_or_func(loader.construct_scalar(node), *extra_args)
+        elif isinstance(node, SequenceNode):
+            return [cls_or_func(item, *extra_args) for item in loader.construct_sequence(node, deep=True)]
+        elif isinstance(node, MappingNode):
+            return cls_or_func(*extra_args, **loader.construct_mapping(node, deep=True))
         return cls_or_func(node.value, *extra_args)
 
     return constructor
