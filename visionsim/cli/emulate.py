@@ -439,7 +439,7 @@ def aspc(
     active_pulse_repetition: float | None = None,
     active_pulse_width: float | None = None,
     active_avg_watts: float | None = None,
-    active_pulse_shape: Literal["gaussian", "square"] | Path | None = None,
+    active_pulse_shape: Literal["gaussian", "square", "custom"] | Path | None = None,
     ambient_enabled: bool | None = None,
     ambient_temperature: float | None = None,
     ambient_light_conditions: (
@@ -493,7 +493,10 @@ def aspc(
         active_pulse_repetition: repetition rate of the laser pulses. Given in megahertz.
         active_pulse_width: temporal duration (often FWHM) of a single laser pulse. Given in nanoseconds.
         active_avg_watts: average power output of the pulsed laser. Given in watts.
-        active_pulse_shape: the temporal profile of the laser pulse (e.g., "gaussian", "square") or path to a custom shape.
+        active_pulse_shape: the temporal profile of the laser pulse: "gaussian", "square", "custom" (shape taken from
+            ``pulse_shape_custom`` in the config file), or the path to a .npy or whitespace-separated text file of
+            custom pulse taps. Taps are sampled at the histogram bin width, tap ``len(taps) // 2`` falls on the bin
+            of the return, and they are normalized to a unit sum.
         ambient_enabled: if true, toggles the ambient light source (e.g., the sun) on.
         ambient_temperature: blackbody color temperature of the ambient light source. Given in kelvin.
         ambient_light_conditions: descriptor for the environment's lighting (e.g., "BRIGHT_SUNLIGHT", "OVERCAST").
@@ -516,6 +519,9 @@ def aspc(
 
     prepared_config = prepare_config(user_args, config_file)
 
+    # Build the emulator first, so that an invalid pulse shape or zone file fails before the output is touched
+    emulator = ASPCEmulator(config=prepared_config)
+
     # 4. Output directory setup
     if input_dir.resolve() == output_dir.resolve():
         raise RuntimeError("Input and output directory cannot be the same!")
@@ -535,8 +541,6 @@ def aspc(
         depths = Dataset.from_path(input_dir / "depths")
         ambient = Dataset.from_path(input_dir / "frames")
         albedo = Dataset.from_path(input_dir / "diffuse" / "color")
-
-    emulator = ASPCEmulator(config=prepared_config)
 
     total_frames = len(depths)
 

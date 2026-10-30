@@ -393,6 +393,7 @@ def _build_config(
         "active_pulse_width": ("active_source", "pulsed_laser", "pulse_width"),
         "active_avg_watts": ("active_source", "pulsed_laser", "avg_watts"),
         "active_pulse_shape": ("active_source", "pulsed_laser", "pulse_shape"),
+        "active_pulse_shape_custom": ("active_source", "pulsed_laser", "pulse_shape_custom"),
         "ambient_enabled": ("ambient_source", "sun", "enabled"),
         "ambient_temperature": ("ambient_source", "sun", "temperature"),
         "ambient_light_conditions": ("ambient_source", "sun", "light_conditions"),
@@ -442,6 +443,12 @@ def _build_config(
             d = d.setdefault(step, {})
         d[key_path[-1]] = val
 
+    # A path given as the pulse shape (e.g. ``--active-pulse-shape irf.txt``) selects a custom pulse with its taps
+    pulsed_laser = config["active_source"]["pulsed_laser"]
+    if isinstance(pulsed_laser["pulse_shape"], Path):
+        pulsed_laser["pulse_shape_custom"] = pulsed_laser["pulse_shape"]
+        pulsed_laser["pulse_shape"] = "custom"
+
     for key in ("input_dir", "output_dir", "force", "pattern"):
         if key in user_args and user_args[key] is not None:
             config[key] = user_args[key]
@@ -471,6 +478,7 @@ def prepare_config(user_args: dict, config_file: Path | str | None = None) -> di
                 "pulse_width": 6 * ureg.nanoseconds,
                 "avg_watts": 0.000000007 * ureg.watts,
                 "pulse_shape": "gaussian",
+                "pulse_shape_custom": None,
             }
         },
         "ambient_source": {
