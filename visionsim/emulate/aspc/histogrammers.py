@@ -597,8 +597,16 @@ class _PulseSpread:
     The pulse is given as in :meth:`~visionsim.emulate.aspc.emitter.DynamicSource.get_pulse_cdf`: the fraction of its
     photons that arrive before each offset ``x`` from the return, in bins, linear in between. A return that arrives
     ``phase`` bins into bin k (0 <= phase < 1) puts ``cdf(m + 1 - phase) - cdf(m - phase)`` of its photons in bin k + m.
-    A pulse of zero width puts them all in bin k.
+    Where ``x`` repeats, the cumulative distribution jumps: the photons of the jump all arrive that many bins after the
+    return, and land in the bin of their arrival time like any other photon. A pulse of zero width, whose ``x`` are all
+    equal, puts every photon in the bin of ``k + phase + x[0]``, i.e. in bin k for ``x = [0, 0]``.
     """
+
+    # Large zones interpolate each bin's share linearly between phases rounded to NODE_DECIMALS decimals of a bin (see
+    # spread). That needs a cumulative distribution without jumps, and with no step of x narrower than NODE_MIN_STEP
+    # bins, which the rounding would move; the returns of any other pulse are spread one by one
+    NODE_DECIMALS = 12
+    NODE_MIN_STEP = 1e-4
 
     def __init__(self, pulse_cdf: tuple[npt.ArrayLike, npt.ArrayLike], device: torch.device):
         x = np.asarray(pulse_cdf[0], dtype=np.float64)
@@ -616,11 +624,14 @@ class _PulseSpread:
         self.offsets = torch.arange(self.first, math.ceil(x[-1]) + 1, device=device)
 
         # As the phase grows, the share of bin k + m only changes slope where m - phase or m + 1 - phase meets an x, so
-        # it is linear in the phase between these nodes (rounded, so that nearly equal phases count once)
-        nodes = np.round(np.remainder(-x, 1.0), 12)
-        nodes = np.unique(np.concatenate(([0.0, 1.0], nodes[(nodes > 0) & (nodes < 1)])))
-        self.nodes = torch.as_tensor(nodes, device=device)
-        self.node_shares = self.bin_shares(self.nodes)
+        # it is linear in the phase between these nodes (rounded, so that nearly equal phases count once). At a jump
+        # it jumps instead, so such pulses do not use the nodes
+        self.use_nodes = not self.zero_width and bool(np.diff(x).min() >= self.NODE_MIN_STEP)
+        if self.use_nodes:
+            nodes = np.round(np.remainder(-x, 1.0), self.NODE_DECIMALS)
+            nodes = np.unique(np.concatenate(([0.0, 1.0], nodes[(nodes > 0) & (nodes < 1)])))
+            self.nodes = torch.as_tensor(nodes, device=device)
+            self.node_shares = self.bin_shares(self.nodes)
 
     def cdf_at(self, t: torch.Tensor) -> torch.Tensor:
         """Fraction of the pulse's photons that arrive less than ``t`` bins after the return."""
@@ -648,12 +659,16 @@ class _PulseSpread:
         dtype = weights.dtype
         row = torch.zeros(n_bins, dtype=torch.float64, device=weights.device)
         if self.zero_width:
-            return row.scatter_add(0, transient_idx, weights.double()).to(dtype)
+            # Every photon arrives x[0] bins after the return: for x[0] = 0, in the bin of the return
+            bins = transient_idx + torch.floor(phase.double() + self.x[0]).long()
+            keep = (bins >= 0) & (bins < n_bins)
+            return row.scatter_add(0, bins[keep], weights.double()[keep]).to(dtype)
 
         phase, weights = phase.double(), weights.double()
         n_shares = self.offsets.numel()
-        if phase.numel() < self.nodes.numel() * n_bins:
-            # Few returns: integrate the pulse over the bins of each one, in chunks of about 4M shares
+        if not self.use_nodes or phase.numel() < self.nodes.numel() * n_bins:
+            # Few returns, or a pulse the nodes cannot follow: integrate the pulse over the bins of each return, in
+            # chunks of about 4M shares
             chunk = max(1, 2**22 // n_shares)
             for start in range(0, phase.numel(), chunk):
                 shares = self.bin_shares(phase[start : start + chunk])
@@ -763,9 +778,10 @@ class HistogrammerBase:
         With a ``pulse_cdf``, the pulse's cumulative distribution over time in bins as
         :meth:`~visionsim.emulate.aspc.emitter.DynamicSource.get_pulse_cdf` returns it, each return in the window is
         spread over the bins by the pulse instead: bin j gets the fraction of the pulse, shifted to the return's exact
-        arrival time, that arrives during bin j, so the transient keeps where in its bin each return arrived. The
-        pulse is cut at both ends of the window. Without a pulse, or with one of zero width, a return lands in its bin
-        as an ideal time-to-digital converter records it.
+        arrival time, that arrives during bin j, so the transient keeps where in its bin each return arrived. ``x``
+        may repeat where the distribution jumps, i.e. where photons arrive at one exact offset from the return. The
+        pulse is cut at both ends of the window. Without a pulse, or with one of zero width at the return
+        (``x = [0, 0]``), a return lands in its bin as an ideal time-to-digital converter records it.
 
         A zone's transient is the mean of its pixels' irradiance, weighted by its FOV mask. If ``sensor_fov``,
         ``pixel_fov_list``, ``w``, ``h`` and ``omega`` are all given, each zone is also rescaled by

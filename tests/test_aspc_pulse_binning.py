@@ -32,6 +32,17 @@ TAPS = [0.5, 3.0, 1.0, 0.25, 0.0, 0.1]  # asymmetric, even count
 # Copies of 6 returns that make a zone large enough for the faster route of every pulse below (more returns than
 # bins times nodes, about 515 nodes for the narrowest Gaussian)
 MANY = 6000
+# Cumulative distributions with jumps (a repeated x), as their point masses (share, offset) and uniform parts
+# (share, start, end), all in bins
+JUMPS = {
+    "jump-at-the-return": (([0.0, 0.0, 1.0], [0.0, 0.5, 1.0]), [(0.5, 0.0)], [(0.5, 0.0, 1.0)]),
+    "jump-inside": (
+        ([-1.0, 0.7, 0.7, 2.0], [0.0, 0.3, 0.8, 1.0]),
+        [(0.5, 0.7)],
+        [(0.3, -1.0, 0.7), (0.2, 0.7, 2.0)],
+    ),
+    "jump-at-the-end": (([-0.4, 1.3, 1.3], [0.0, 0.25, 1.0]), [(0.75, 1.3)], [(0.25, -0.4, 1.3)]),
+}
 
 
 def _source(shape="gaussian", width_bins=2.0, **kwargs):
@@ -55,6 +66,12 @@ def _uniform_shares(tau, lo, hi, n_bins=N_BINS):
     j = np.arange(n_bins)
     t = np.asarray(tau, dtype=np.float64)[..., None]
     return np.clip(np.minimum(j + 1, t + hi) - np.maximum(j, t + lo), 0, None) / (hi - lo)
+
+
+def _point_shares(tau, offset, n_bins=N_BINS):
+    """Shares of a pulse whose photons all arrive offset bins after tau: all in the bin of tau + offset."""
+    j = np.floor(np.asarray(tau, dtype=np.float64) + offset)
+    return (np.arange(n_bins) == j[..., None]).astype(np.float64)
 
 
 def _taps_shares(tau, taps, n_bins=N_BINS):
@@ -278,6 +295,48 @@ class TestSpreadReturns:
         tau = rng.integers(5, 60, (4, 25)) + rng.uniform(2 / CDF_MAX_STEPS_PER_BIN, 1 - 2 / CDF_MAX_STEPS_PER_BIN)
         spread = _zone(tau, pulse_cdf=_gaussian_cdf(1e-6))
         torch.testing.assert_close(spread, _zone(tau), rtol=1e-12, atol=0)
+
+    @pytest.mark.parametrize("name", list(JUMPS))
+    @pytest.mark.parametrize("copies", [1, MANY], ids=["few-returns", "many-returns"])
+    def test_jump_in_the_cdf_is_a_point_mass(self, name, copies):
+        """The photons of a jump arrive at one offset; large zones interpolated straight across it."""
+        pulse_cdf, points, uniforms = JUMPS[name]
+        tau, weights = _tiled(*_returns(12), copies)  # phases on both sides of every jump
+        spread = _zone(tau, weights, pulse_cdf=pulse_cdf)[0].numpy()
+
+        def shares(t):
+            point = sum(share * _point_shares(t, offset) for share, offset in points)
+            return point + sum(share * _uniform_shares(t, lo, hi) for share, lo, hi in uniforms)
+
+        np.testing.assert_allclose(spread, _expected(tau, weights, shares), rtol=0, atol=1e-12)
+
+    @pytest.mark.parametrize("n_returns", [1, 200])
+    def test_jump_does_not_depend_on_the_size_of_the_zone(self, n_returns):
+        # Half the photons with the return, half over the next bin: 0.5 + 0.5 * 0.05 in bin 30, 0.5 * 0.95 in bin 31
+        row = _zone(np.full((1, n_returns), 30.95), pulse_cdf=([0.0, 0.0, 1.0], [0.0, 0.5, 1.0]))[0].numpy()
+        np.testing.assert_allclose(row[29:33], [0.0, 0.525, 0.475, 0.0], rtol=0, atol=1e-9)
+
+    @pytest.mark.parametrize("copies", [1, MANY], ids=["few-returns", "many-returns"])
+    def test_zero_width_pulse_away_from_the_return_is_delayed(self, copies):
+        """A step at x[0] = 2.5 bins puts every photon 2.5 bins after the return, as a step of 1e-9 bins there does."""
+        step = ([2.5, 2.5], [0.0, 1.0])
+        assert np.flatnonzero(_zone(np.full((1, 1), 30.2), pulse_cdf=step)[0].numpy()).tolist() == [32]
+
+        tau, weights = _tiled(*_returns(6), copies)
+        spread = _zone(tau, weights, pulse_cdf=step)[0].numpy()
+        expected = _expected(tau, weights, lambda t: _point_shares(t, 2.5))
+        np.testing.assert_allclose(spread, expected, rtol=0, atol=1e-12)
+        narrow = _zone(tau, weights, pulse_cdf=([2.5, 2.5 + 1e-9], [0.0, 1.0]))[0].numpy()
+        np.testing.assert_allclose(narrow, expected, rtol=0, atol=1e-6)
+
+    @pytest.mark.parametrize("pulse_width_s", [1e-20, 1e-24])
+    @pytest.mark.parametrize("copies", [1, MANY], ids=["few-returns", "many-returns"])
+    def test_square_much_narrower_than_a_bin_lands_in_the_bin_of_the_return(self, pulse_width_s, copies):
+        """Its edges are closer than the rounding of the large-zone route, which spread it over three bins."""
+        source = DynamicSource(pulse_width=pulse_width_s * ureg.second, pulse_shape="square")
+        cdf = source.get_pulse_cdf(BW_M * ureg.meter)
+        tau, weights = _tiled(*_returns(6), copies)
+        torch.testing.assert_close(_zone(tau, weights, pulse_cdf=cdf), _zone(tau, weights), rtol=1e-12, atol=0)
 
     @pytest.mark.parametrize("sigma", [0.88, 1.04, 2.55])
     def test_centroid_follows_the_return_within_its_bin(self, sigma):
