@@ -18,6 +18,7 @@ from scipy.special import ndtr
 from visionsim.emulate.aspc.emitter import (
     CDF_MAX_STEPS_PER_BIN,
     CDF_STEPS_PER_SIGMA,
+    CDF_STEPS_PER_TAP,
     CDF_STEPS_PER_WIDTH,
     DynamicSource,
 )
@@ -74,11 +75,10 @@ def _point_shares(tau, offset, n_bins=N_BINS):
     return (np.arange(n_bins) == j[..., None]).astype(np.float64)
 
 
-def _taps_shares(tau, taps, n_bins=N_BINS):
-    """Shares of custom taps: tap i uniform over the bin-wide interval centered i - len(taps) // 2 bins after tau."""
-    center = len(taps) // 2
-    shares = sum(w * _uniform_shares(np.asarray(tau) + i - center, -0.5, 0.5, n_bins) for i, w in enumerate(taps))
-    return shares / np.sum(taps)
+def _gaussian_taps(sigma, offset=0.0, half=25):
+    """Taps of a Gaussian of sigma centered offset bins after a return at the center of a bin: its bin integrals."""
+    i = np.arange(-half, half + 1)
+    return ndtr((i + 0.5 - offset) / sigma) - ndtr((i - 0.5 - offset) / sigma)
 
 
 def _zone(tau, weights=None, pulse_cdf=None, n_bins=N_BINS, dtype=torch.float64, **kwargs):
@@ -153,11 +153,39 @@ class TestGetPulseCdf:
         np.testing.assert_array_equal(x, [0.0, 0.0])
         np.testing.assert_array_equal(cdf, [0.0, 1.0])
 
-    @pytest.mark.parametrize("taps", [TAPS, [1.0, 2.0, 1.0], [1.0]], ids=["even", "odd", "one"])
-    def test_taps_are_uniform_over_bins_centered_on_their_offsets(self, taps):
+    @pytest.mark.parametrize(
+        "taps",
+        [TAPS, [1.0, 2.0, 1.0], [1.0], [0.0, 5.0, 0.0, 0.0, 1e-12, 3.0, 3.0, 3.0, 0.0, 1.0]],
+        ids=["even", "odd", "one", "steps"],
+    )
+    def test_taps_fix_the_cdf_at_the_edges_of_their_bins(self, taps):
+        """The edges of the taps' bins are among the steps, with the taps' cumulative sums; the cdf never falls."""
         x, cdf = _source("custom", pulse_shape_custom=taps).get_pulse_cdf(BW_M * ureg.meter)
-        np.testing.assert_allclose(x, np.arange(len(taps) + 1) - len(taps) // 2 - 0.5)
-        np.testing.assert_allclose(cdf, np.concatenate(([0.0], np.cumsum(taps))) / np.sum(taps), rtol=1e-15)
+        edges = np.arange(len(taps) + 1) - len(taps) // 2 - 0.5
+        np.testing.assert_allclose(np.diff(x), 1 / CDF_STEPS_PER_TAP, rtol=1e-9)
+        np.testing.assert_array_equal(x[::CDF_STEPS_PER_TAP], edges)
+        np.testing.assert_allclose(
+            cdf[::CDF_STEPS_PER_TAP], np.concatenate(([0.0], np.cumsum(taps))) / np.sum(taps), rtol=0, atol=1e-15
+        )
+        assert cdf[0] == 0 and cdf[-1] == 1 and np.all(np.diff(cdf) >= 0)
+
+    @pytest.mark.parametrize("taps", [[1.0, 2.0, 1.0], TAPS, list(_gaussian_taps(1.0, 0.3, half=3))])
+    def test_zero_taps_around_the_pulse_do_not_change_it(self, taps):
+        """Guard: as many zeros before the taps as after them (time zero stays) leave the pulse as it is."""
+        padded = [0.0, 0.0, *taps, 0.0, 0.0]
+        t = np.linspace(-8, 8, 3001)
+        cdf = _source("custom", pulse_shape_custom=taps).get_pulse_cdf(BW_M * ureg.meter)
+        padded_cdf = _source("custom", pulse_shape_custom=padded).get_pulse_cdf(BW_M * ureg.meter)
+        np.testing.assert_allclose(np.interp(t, *padded_cdf), np.interp(t, *cdf), rtol=0, atol=1e-15)
+
+    def test_taps_do_not_jump_at_the_edges_of_their_bins(self):
+        """The pulse's density is continuous, and 0 at both ends; with each tap uniform within its bin, it jumped by
+        a quarter of the photons per bin at every edge of [1, 2, 1]."""
+        _, cdf = _source("custom", pulse_shape_custom=[1.0, 2.0, 1.0]).get_pulse_cdf(BW_M * ureg.meter)
+        density = np.diff(cdf) * CDF_STEPS_PER_TAP  # photons per bin, over each step
+        inner = np.arange(1, 3) * CDF_STEPS_PER_TAP  # the steps that start at the inner edges
+        assert np.abs(density[inner] - density[inner - 1]).max() < 0.01
+        assert density[0] < 0.02 and density[-1] < 0.02
 
     def test_taps_do_not_depend_on_pulse_width(self):
         narrow = _source("custom", 0.1, pulse_shape_custom=TAPS).get_pulse_cdf(BW_M * ureg.meter)
@@ -244,13 +272,19 @@ class TestSpreadReturns:
 
     @pytest.mark.parametrize(
         "pulse",
-        [("gaussian", 0.1 * FWHM), ("gaussian", 2.55 * FWHM), ("square", 2.3), ("custom", 1.5)],
-        ids=["narrow-gaussian", "gaussian", "square", "callable"],
+        [
+            ("gaussian", 0.1 * FWHM, None),
+            ("gaussian", 2.55 * FWHM, None),
+            ("square", 2.3, None),
+            ("custom", 1.5, lambda u: np.exp(-(u**2))),
+            ("custom", 2.0, TAPS),
+        ],
+        ids=["narrow-gaussian", "gaussian", "square", "callable", "taps"],
     )
     def test_many_returns_give_the_same_row_as_few(self, pulse):
         """Large zones take a faster route, which must not change the result."""
-        shape, width = pulse
-        kwargs = {"pulse_shape_custom": lambda u: np.exp(-(u**2))} if shape == "custom" else {}
+        shape, width, custom = pulse
+        kwargs = {} if custom is None else {"pulse_shape_custom": custom}
         cdf = _source(shape, width, **kwargs).get_pulse_cdf(BW_M * ureg.meter)
         tau, weights = _returns(6)
         few = _zone(tau, weights, pulse_cdf=cdf)
@@ -265,13 +299,40 @@ class TestSpreadReturns:
         expected = _expected(tau, weights, lambda t: _uniform_shares(t, -width / 2, width / 2))
         np.testing.assert_allclose(spread[0].numpy(), expected, rtol=0, atol=1e-12)
 
+    @pytest.mark.parametrize(
+        "fwhm, offset, peak_error, centroid_error, variance_error",
+        [
+            (2.45, 0.0, 0.010, 2e-5, 3e-4),
+            (2.45, 0.5, 0.014, 2e-5, 3e-4),
+            (4.0, 0.5, 0.0014, 2e-5, 3e-4),
+            (8.0, 0.0, 1e-4, 2e-5, 3e-4),
+            (1.5, 0.0, 0.005, 0.004, 0.008),
+        ],
+    )
+    def test_taps_of_a_gaussian_match_its_bin_integrals(self, fwhm, offset, peak_error, centroid_error, variance_error):
+        """The accuracy that DynamicSource states for taps, for returns all over a bin.
+
+        Each tap was uniform within its bin, which widened a return d bins from the center of its bin by a variance of
+        |d| * (1 - |d|) bin^2: for 2.45 bins, a bin was off by up to 8% of the peak share and the variance by 1/4 bin^2.
+        """
+        sigma = fwhm / FWHM
+        taps = _gaussian_taps(sigma, offset)
+        cdf = _source("custom", pulse_shape_custom=taps).get_pulse_cdf(BW_M * ureg.meter)
+        tau = 30 + (np.arange(400) + 0.5) / 400
+        rows = _zone(tau[:, None, None], pulse_cdf=cdf).numpy()
+        exact = _gaussian_shares(tau + offset, sigma)
+        assert np.abs(rows - exact).max() < peak_error * exact.max()
+        assert np.abs(_centroid(rows) - _centroid(exact)).max() < centroid_error
+        assert np.abs(_variance(rows) - _variance(exact)).max() < variance_error
+
     @pytest.mark.parametrize("copies", [1, MANY], ids=["few-returns", "many-returns"])
-    def test_taps_are_shifted_by_the_offset_from_the_bin_center(self, copies):
+    def test_taps_of_a_gaussian_match_its_bin_integrals_in_large_zones(self, copies):
+        sigma = 2.45 / FWHM
         tau, weights = _tiled(*_returns(6), copies)
-        cdf = _source("custom", pulse_shape_custom=TAPS).get_pulse_cdf(BW_M * ureg.meter)
-        spread = _zone(tau, weights, pulse_cdf=cdf)
-        expected = _expected(tau, weights, lambda t: _taps_shares(t, TAPS))
-        np.testing.assert_allclose(spread[0].numpy(), expected, rtol=0, atol=1e-12)
+        cdf = _source("custom", pulse_shape_custom=_gaussian_taps(sigma)).get_pulse_cdf(BW_M * ureg.meter)
+        spread = _zone(tau, weights, pulse_cdf=cdf)[0].numpy()
+        expected = _expected(tau, weights, lambda t: _gaussian_shares(t, sigma))
+        np.testing.assert_allclose(spread, expected, rtol=0, atol=0.01 * expected.max())
 
     def test_taps_at_the_center_of_a_bin_are_the_taps(self):
         cdf = _source("custom", pulse_shape_custom=TAPS).get_pulse_cdf(BW_M * ureg.meter)
@@ -281,9 +342,11 @@ class TestSpreadReturns:
         np.testing.assert_allclose(spread, expected, atol=1e-15)
 
     def test_taps_at_the_start_of_a_bin_are_split_with_the_bin_before(self):
+        """A single tap is a bump over the bin centered on the return, whose cdf is 3 s^2 - 2 s^3 at s of that bin."""
         cdf = _source("custom", pulse_shape_custom=[1.0]).get_pulse_cdf(BW_M * ureg.meter)
         spread = _zone(np.full((1, 1), 30.25), pulse_cdf=cdf)[0].numpy()
-        assert spread[29] == pytest.approx(0.25) and spread[30] == pytest.approx(0.75)
+        # The bin centered on 30.25 starts at 29.75, so 0.25 of it falls in bin 29
+        assert spread[29] == pytest.approx(3 * 0.25**2 - 2 * 0.25**3) and spread[30] == pytest.approx(0.84375)
         assert spread.sum() == pytest.approx(1.0)
 
     def test_callable_gaussian_matches_the_gaussian(self):
@@ -546,6 +609,15 @@ class TestArrivalRates:
         start = 40 - len(TAPS) // 2
         expected[start : start + len(TAPS)] = transient.sum() * np.array(TAPS) / np.sum(TAPS)
         np.testing.assert_allclose(rates, expected, rtol=1e-5, atol=1e-7 * transient.sum())
+
+    @pytest.mark.parametrize("phase", [0.001, 0.25, 0.75, 0.999])
+    def test_custom_taps_of_a_gaussian_keep_its_peak(self, phase):
+        """Taps that are a Gaussian's bin integrals (2.44 bins wide) lost up to 8% of its peak away from a bin center."""
+        sigma = 230e-12 * C_LIGHT / 2 / FWHM / BIN_M
+        emulator = ASPCEmulator(_config("custom", pulse_shape_custom=_gaussian_taps(sigma)))
+        transient, rates = _emulate(emulator, (40 + phase) * BIN_M)
+        expected = transient.sum() * _gaussian_shares(40 + phase, sigma, N_BINS_EMU)
+        np.testing.assert_allclose(rates, expected, rtol=0, atol=0.01 * expected.max())
 
     def test_ambient_offset_is_added_to_every_bin(self):
         """Guard: the ambient offset is still added on top of the pulse."""
