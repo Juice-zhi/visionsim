@@ -218,48 +218,73 @@ def timestamps_to_histogram(
 # =============================================================================
 
 
-def batch_distorted_transient_sync(
-    phi_bar: torch.Tensor,
-    dead_time_bins: int,
-    n_bins: int,
-) -> torch.Tensor:
-    """Batched single-hit synchronous forward model (Coates).
+def _first_photon_probabilities(phi_bar: torch.Tensor, n_bins: int) -> torch.Tensor:
+    """Probability that a synchronous laser cycle records its first photon in each bin, in float64.
 
-    The detection probabilities 1 - exp(-phi) are computed with expm1 in float64: in float32 they lose most of their
-    digits at low per-bin rates (and become 0 below about 3e-8). The result has the dtype of phi_bar.
+    Bin i records a photon with probability 1 - exp(-phi_i) if no earlier bin of the cycle did. These probabilities are
+    computed with expm1 in float64: in float32 they lose most of their digits at low per-bin rates (and become 0 below
+    about 3e-8).
     """
     phi = torch.clamp(phi_bar[:, :n_bins].to(torch.float64), min=0.0)
     p_detect = -torch.expm1(-phi)
     survival = torch.ones_like(p_detect)
     survival[:, 1:] = torch.cumprod(1.0 - p_detect[:, :-1], dim=-1)
-    prob_detect = p_detect * survival
+    return p_detect * survival
+
+
+def batch_distorted_transient_sync(
+    phi_bar: torch.Tensor,
+    dead_time_bins: int,
+    n_bins: int,
+) -> torch.Tensor:
+    """Batched single-hit synchronous forward model (Coates), normalised to sum to one per row.
+
+    This is the shape of :func:`batch_expected_detections_sync`. It is computed in float64 and has the dtype of phi_bar.
+    """
+    prob_detect = _first_photon_probabilities(phi_bar, n_bins)
     total = prob_detect.sum(dim=-1, keepdim=True)
     return (prob_detect / (total + 1e-12)).to(phi_bar.dtype)
 
 
-def batch_distorted_transient_async(
+def batch_expected_detections_sync(
     phi_bar: torch.Tensor,
     dead_time_bins: int,
     n_bins: int,
-    n_iterations: int = 150,
 ) -> torch.Tensor:
-    """Batched asynchronous (free-running) forward model using power iteration."""
-    if phi_bar.ndim == 1:
-        phi_bar = phi_bar.unsqueeze(0)
+    """Batched expected detections per laser cycle in each bin of a single-hit synchronous SPAD (Coates).
 
-    phi = torch.clamp(phi_bar[:, :n_bins], min=0.0)
+    A cycle records at most its first photon, in bin i with probability (1 - exp(-phi_i)) * exp(-sum_{k<i} phi_k). A row
+    therefore sums to 1 - exp(-sum_i phi_i), the probability that a cycle records a photon at all, and n_pulses times a
+    row is the expected histogram. dead_time_bins is not used. It is computed in float64 and has the dtype of phi_bar.
+    """
+    return _first_photon_probabilities(phi_bar, n_bins).to(phi_bar.dtype)
+
+
+def _free_running_chain(
+    phi: torch.Tensor,
+    dead_time_bins: int,
+    n_iterations: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Detection statistics of a free-running SPAD with a non-paralyzable dead time of at least one bin.
+
+    The bin of each detection is a Markov chain: after a detection in bin j, the SPAD re-arms in bin
+    (j + dead_time_bins) mod B and records the next photon from there on. Power iteration gives the stationary
+    distribution v of that bin. The mean time between detections, T_j, is the dead time plus the mean wait for a photon
+    after re-arming, so a cycle of B bins holds B / sum_j v_j T_j detections on average.
+
+    Args:
+        phi: clamped arrival rates per bin and cycle, shape (N, B).
+        dead_time_bins: dead time in bins, at least 1.
+        n_iterations: number of power iterations.
+
+    Returns:
+        The stationary distribution, shape (N, B), and the mean number of detections per cycle, shape (N, 1). Both are
+        0 for rows without photons.
+    """
+    N, B = phi.shape
+    device = phi.device
+    dtype = phi.dtype
     total = phi.sum(dim=-1, keepdim=True)
-
-    if dead_time_bins == 0:
-        zero_mask = total.squeeze(-1) == 0
-        result = phi / (total + 1e-12)
-        result[zero_mask] = 0.0
-        return result
-
-    N = phi_bar.shape[0]
-    B = n_bins
-    device = phi_bar.device
-    dtype = phi_bar.dtype
 
     dt = int(dead_time_bins) % B
 
@@ -278,9 +303,10 @@ def batch_distorted_transient_async(
     cum_end = cum[:, end_exp]
     cyclic_sum = cum_end - cum_k
 
-    p_i = (1.0 - torch.exp(-phi)).unsqueeze(1)
-    denom = (1.0 - torch.exp(-total.squeeze(-1))).view(N, 1, 1) + 1e-15
-    M = p_i * torch.exp(-cyclic_sum) / denom
+    # M[k, i]: probability that the first photon after re-arming in bin k lands in bin i, whichever cycle that takes
+    p_i = (-torch.expm1(-phi)).unsqueeze(1)
+    p_cycle = -torch.expm1(-total)
+    M = p_i * torch.exp(-cyclic_sum) / (p_cycle.view(N, 1, 1) + 1e-15)
     M = M / (M.sum(dim=-1, keepdim=True) + 1e-15)
 
     j_idx = torch.arange(B, device=device)
@@ -292,11 +318,110 @@ def batch_distorted_transient_async(
         v = torch.bmm(v, T)
         v = v / (v.sum(dim=-1, keepdim=True) + 1e-15)
 
-    distorted = v.squeeze(1)
-    zero_mask = total.squeeze(-1) == 0
-    distorted[zero_mask] = 0.0
+    has_photons = total > 0
+    distorted = torch.where(has_photons, v.squeeze(1), 0.0)
 
+    # Mean wait in bins after re-arming in bin k: the offset of the photon from bin k, plus B bins for each full cycle
+    # without a photon (a cycle is empty with probability exp(-total))
+    wait = (M * s.to(dtype)).sum(dim=-1) + B * torch.exp(-total) / (p_cycle + 1e-15)
+    time_between = (distorted * (int(dead_time_bins) + wait[:, rearm_k])).sum(dim=-1, keepdim=True)
+    detections_per_cycle = torch.where(has_photons, B / torch.where(has_photons, time_between, 1.0), 0.0)
+
+    return distorted, detections_per_cycle
+
+
+def batch_distorted_transient_async(
+    phi_bar: torch.Tensor,
+    dead_time_bins: int,
+    n_bins: int,
+    n_iterations: int = 150,
+) -> torch.Tensor:
+    """Batched asynchronous (free-running) forward model using power iteration, normalised to sum to one per row.
+
+    This is the shape of :func:`batch_expected_detections_async`.
+    """
+    if phi_bar.ndim == 1:
+        phi_bar = phi_bar.unsqueeze(0)
+
+    phi = torch.clamp(phi_bar[:, :n_bins], min=0.0)
+    total = phi.sum(dim=-1, keepdim=True)
+
+    if dead_time_bins == 0:
+        zero_mask = total.squeeze(-1) == 0
+        result = phi / (total + 1e-12)
+        result[zero_mask] = 0.0
+        return result
+
+    distorted, _ = _free_running_chain(phi, dead_time_bins, n_iterations)
     return distorted
+
+
+def batch_expected_detections_async(
+    phi_bar: torch.Tensor,
+    dead_time_bins: int,
+    n_bins: int,
+    n_iterations: int = 150,
+) -> torch.Tensor:
+    """Batched expected detections per laser cycle in each bin of a free-running (asynchronous) SPAD.
+
+    Without dead time every photon is detected, so this is phi itself. With a non-paralyzable dead time it is the shape
+    of :func:`batch_distorted_transient_async` times the mean number of detections per cycle, which follows from the
+    mean time between detections: the dead time plus the mean wait for the next photon after re-arming. n_pulses times
+    a row is the expected histogram. When nearly every bin is bright enough to fire as soon as the SPAD re-arms, the
+    power iteration converges slowly and needs a larger n_iterations.
+    """
+    if phi_bar.ndim == 1:
+        phi_bar = phi_bar.unsqueeze(0)
+
+    phi = torch.clamp(phi_bar[:, :n_bins], min=0.0)
+    if dead_time_bins == 0:
+        return phi
+
+    distorted, detections_per_cycle = _free_running_chain(phi, dead_time_bins, n_iterations)
+    return distorted * detections_per_cycle
+
+
+def batch_sample_detections(
+    phi_bar: torch.Tensor,
+    n_pulses: int,
+    n_bins: int,
+    free_running: bool,
+    dead_time_bins: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Batched noisy histograms over n_pulses laser cycles, drawn around the expected counts of the closed-form models.
+
+    - Synchronous (single-hit): a multinomial over the bins and "no detection", which is exact. It is drawn bin by
+      bin: of the cycles without a detection so far, each records a photon in bin i with probability 1 - exp(-phi_i).
+    - Free running without dead time: every photon is counted, so the bins are independent Poisson counts, which is
+      exact.
+    - Free running with dead time: independent binomial counts per bin around :func:`batch_expected_detections_async`,
+      since a bin records at most one detection per cycle. This is an approximation. Per bin it is close to the Monte
+      Carlo when the dead time is a small fraction of the period, but it ignores the correlations that dead time
+      introduces between bins and cycles, so it overstates the spread of the total count when the dead time is
+      comparable with the period or longer.
+
+    The counts are whole numbers with the dtype of phi_bar.
+    """
+    if phi_bar.ndim == 1:
+        phi_bar = phi_bar.unsqueeze(0)
+
+    if not free_running:
+        p_detect = -torch.expm1(-torch.clamp(phi_bar[:, :n_bins].to(torch.float64), min=0.0))
+        counts = torch.zeros_like(p_detect)
+        remaining = torch.full_like(p_detect[:, 0], float(n_pulses))
+        for i in range(p_detect.shape[-1]):
+            counts[:, i] = torch.binomial(remaining, p_detect[:, i], generator=generator)
+            remaining = remaining - counts[:, i]
+    elif dead_time_bins == 0:
+        expected = torch.clamp(phi_bar[:, :n_bins].to(torch.float64), min=0.0) * n_pulses
+        counts = torch.poisson(expected, generator=generator)
+    else:
+        p_bin = batch_expected_detections_async(phi_bar, dead_time_bins, n_bins).to(torch.float64)
+        counts = torch.binomial(
+            torch.full_like(p_bin, float(n_pulses)), torch.clamp(p_bin, 0.0, 1.0), generator=generator
+        )
+    return counts.to(phi_bar.dtype)
 
 
 def calculate_distorted_transient(
@@ -581,14 +706,30 @@ class HistogrammerBase:
 
 @dataclass
 class HistConfig:
+    """Settings of a :class:`Histogrammer` or :class:`HistogrammerEDH`."""
+
     min_depth: Quantity = 0 * ureg.meter
     max_depth: Quantity = 20 * ureg.meter
     n_bins: int = 1000
     bin_width: Quantity = 0.03 * ureg.meter
     n_pulses: int = 100
+    """Number of laser cycles integrated into each histogram"""
     dead_time: Quantity = 10e-9 * ureg.second
+    """Time after a detection during which the SPAD cannot detect another photon (non-paralyzable)"""
     free_running: bool = True
+    """If true, the SPAD re-arms after its dead time regardless of the laser cycle (free running). If false, it is also
+    re-armed at the start of every laser cycle (synchronous)"""
     fast_sim: bool = True
+    """If true, compute the histograms from closed-form pile-up models instead of simulating every photon (Monte
+    Carlo). They give the expected number of detections in each bin over ``n_pulses`` cycles, so the totals follow the
+    flux: a synchronous cycle records only its first photon (single-hit; ``dead_time`` is not used), a free-running
+    SPAD without dead time records every photon, and one with dead time as many as its dead time allows. By default
+    the result is this noise-free expectation, in floats; see ``fast_sim_noise``."""
+    fast_sim_noise: bool = False
+    """Only used with ``fast_sim``. If false, return the noise-free expected counts. If true, draw whole-number counts
+    around them instead (see :func:`batch_sample_detections`): multinomial when synchronous, Poisson per bin when free
+    running without dead time, and binomial per bin when free running with dead time, which is an approximation that
+    ignores the correlations dead time introduces between bins. The Monte Carlo (``fast_sim=False``) is always noisy."""
     vignette: bool = False
     pixel_fov_list: list = field(default_factory=lambda: [[0, 1.0, 0, 1.0]])
 
@@ -633,20 +774,38 @@ class Histogrammer(HistogrammerBase):
         free_running: bool = True,
         dead_time_bins: int = 0,
         fast_sim: bool = True,
+        fast_sim_noise: bool = False,
+        generator: torch.Generator | None = None,
     ) -> list[torch.Tensor]:
+        """Simulates the histogram of each row of arrival_rates over n_pulses laser cycles.
+
+        With fast_sim, the histograms come from the closed-form pile-up models: n_pulses times the expected detections
+        per cycle (:func:`batch_expected_detections_sync` or :func:`batch_expected_detections_async`), which is noise
+        free, or with fast_sim_noise a noisy draw around it (:func:`batch_sample_detections`). Otherwise every photon
+        is simulated (Monte Carlo). See :class:`HistConfig`.
+        """
         if fast_sim:
-            if free_running:
-                photon_hist_probs = batch_distorted_transient_async(arrival_rates, dead_time_bins, n_bins)
+            if fast_sim_noise:
+                photon_hists = batch_sample_detections(
+                    arrival_rates, n_pulses, n_bins, free_running, dead_time_bins, generator=generator
+                )
+            elif free_running:
+                photon_hists = batch_expected_detections_async(arrival_rates, dead_time_bins, n_bins) * n_pulses
             else:
-                photon_hist_probs = batch_distorted_transient_sync(arrival_rates, dead_time_bins, n_bins)
-            photon_hists = photon_hist_probs * n_pulses
+                photon_hists = batch_expected_detections_sync(arrival_rates, dead_time_bins, n_bins) * n_pulses
             return [photon_hists[i] for i in range(photon_hists.shape[0])]
 
         ewh_pixel_list = []
         for p_idx in range(arrival_rates.shape[0]):
             ewh_pixel_list.append(
                 self.simulate_pixel_ewh(
-                    arrival_rates[p_idx], n_pulses, n_bins, free_running, dead_time_bins, fast_sim=fast_sim
+                    arrival_rates[p_idx],
+                    n_pulses,
+                    n_bins,
+                    free_running,
+                    dead_time_bins,
+                    fast_sim=fast_sim,
+                    generator=generator,
                 )
             )
         return ewh_pixel_list

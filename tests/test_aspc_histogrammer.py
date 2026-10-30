@@ -207,14 +207,39 @@ class TestMonteCarloForwardModel:
 # 3e — simulate_ewh / simulate_ewh_diff dispatcher wiring                      #
 # =========================================================================== #
 class TestSimulateEwhDispatch:
-    def test_fast_path_total_counts_equal_n_pulses(self):
+    def test_fast_path_totals_follow_the_flux(self):
+        """The fast path gives the expected number of detections; it must not rescale every histogram to n_pulses."""
         h = Histogrammer(HistConfig())
-        rates = _phi((3, B), seed=7)
         n_pulses = 500
-        for free_running, dt in [(False, 0), (True, 3)]:
-            hists = h.simulate_ewh(rates, n_pulses, B, free_running=free_running, dead_time_bins=dt, fast_sim=True)
-            for hist in hists:
-                assert float(hist.sum()) == pytest.approx(n_pulses, rel=1e-4)
+        rates = _phi((3, B), seed=7) * torch.tensor([[1.0], [0.01], [0.2]])
+        lam = rates.double().sum(-1)
+        flat = torch.tensor([[0.5], [0.005], [0.05]]).expand(3, B)
+        p = 1.0 - torch.exp(-flat[:, 0].double())
+        cases = [
+            (rates, False, 0, n_pulses * (1.0 - torch.exp(-lam))),  # first photon of each cycle
+            (rates, True, 0, n_pulses * lam),  # every photon
+            (flat, True, 3, n_pulses * B / (3 + (1.0 - p) / p)),  # non-paralyzable dead time of 3 bins
+        ]
+        for phi, free_running, dt, expected in cases:
+            hists = h.simulate_ewh(phi, n_pulses, B, free_running=free_running, dead_time_bins=dt, fast_sim=True)
+            totals = torch.stack([hist.sum() for hist in hists]).double()
+            assert torch.allclose(totals, expected, rtol=1e-5), (free_running, dt, totals, expected)
+
+    @pytest.mark.parametrize(
+        "free_running,dt",
+        [(False, MC_B), (True, 0), (True, 3), (True, MC_B + 4)],
+        ids=["gated-single-hit", "free-running-dt0", "free-running-dt3", "free-running-dt-over-a-period"],
+    )
+    def test_fast_path_matches_monte_carlo(self, free_running, dt):
+        h = Histogrammer(HistConfig())
+        rates = torch.stack([_phi((MC_B,), seed=3), _phi((MC_B,), seed=4) * 0.05])
+        fast = h.simulate_ewh(rates, MC_PULSES, MC_B, free_running=free_running, dead_time_bins=dt, fast_sim=True)
+        torch.manual_seed(0)
+        mc = h.simulate_ewh(rates, MC_PULSES, MC_B, free_running=free_running, dead_time_bins=dt, fast_sim=False)
+        for f, m in zip(fast, mc):
+            f, m = f.double(), m.double()
+            assert float(m.sum()) == pytest.approx(float(f.sum()), abs=5 * float(f.sum()) ** 0.5)
+            assert torch.all((m - f).abs() <= 6 * torch.sqrt(f) + 1)
 
     def test_diff_returns_expected_value(self):
         h = Histogrammer(HistConfig())

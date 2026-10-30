@@ -276,5 +276,6 @@ class Detector:
             free_running=self.histogrammer.free_running,
             dead_time_bins=dead_time_bins,
             fast_sim=self.histogrammer.fast_sim,
+            fast_sim_noise=self.histogrammer.fast_sim_noise,
         )
         return ewh_list

@@ -387,6 +387,7 @@ def _build_config(
         "dead_time": ("histogrammer", "dead_time"),
         "free_running": ("histogrammer", "free_running"),
         "fast_sim": ("histogrammer", "fast_sim"),
+        "fast_sim_noise": ("histogrammer", "fast_sim_noise"),
         "active_enabled": ("active_source", "pulsed_laser", "enabled"),
         "active_wavelength": ("active_source", "pulsed_laser", "wavelength"),
         "active_pulse_repetition": ("active_source", "pulsed_laser", "pulse_repetition"),
@@ -469,6 +470,7 @@ def prepare_config(user_args: dict, config_file: Path | str | None = None) -> di
             "dead_time": 10 * ureg.nanoseconds,
             "free_running": True,
             "fast_sim": False,
+            "fast_sim_noise": False,
         },
         "active_source": {
             "pulsed_laser": {

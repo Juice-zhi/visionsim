@@ -434,6 +434,7 @@ def aspc(
     dead_time: float | None = None,
     free_running: bool | None = None,
     fast_sim: bool | None = None,
+    fast_sim_noise: bool | None = None,
     active_enabled: bool | None = None,
     active_wavelength: float | None = None,
     active_pulse_repetition: float | None = None,
@@ -487,7 +488,10 @@ def aspc(
         n_pulses: number of laser pulses integrated per measurement/histogram.
         dead_time: recovery time required by the SPAD after detecting a photon before it can detect another. Given in nanoseconds.
         free_running: if true, indicates the SPAD operates in a free-running mode rather than a gated mode.
-        fast_sim: if true, enables a computationally faster, approximate simulation mode.
+        fast_sim: if true, computes the histograms from closed-form pile-up models instead of simulating every photon.
+            This is much faster, and gives the expected (noise-free) counts per bin unless fast_sim_noise is set.
+        fast_sim_noise: if true, draws photon noise around the closed-form histograms of fast_sim instead of saving their
+            expected values.
         active_enabled: if true, toggles the active pulsed laser source on.
         active_wavelength: center wavelength of the emitted laser pulse. Given in nanometers.
         active_pulse_repetition: repetition rate of the laser pulses. Given in megahertz.

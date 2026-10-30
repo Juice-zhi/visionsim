@@ -1,5 +1,5 @@
-"""Configuration: YAML loading with the ``!Quantity`` / ``!expr`` / ``!file`` tags, the max_depth check, and custom
-pulse shapes from a config file or the CLI."""
+"""Configuration: YAML loading with the ``!Quantity`` / ``!expr`` / ``!file`` tags, the max_depth check, custom pulse
+shapes from a config file or the CLI, and the fast_sim_noise option."""
 
 from pathlib import Path
 
@@ -9,6 +9,7 @@ from pint import Quantity
 
 import visionsim.emulate.aspc as aspc
 from visionsim.emulate.aspc.emitter import PulsedLaser
+from visionsim.emulate.aspc.emulator import ASPCEmulator
 from visionsim.emulate.aspc.utils import _load_config, c, prepare_config, preproc_frames, ureg
 
 ASPC_DIR = Path(aspc.__file__).parent
@@ -158,30 +159,35 @@ class TestCustomPulseConfig:
         np.testing.assert_array_equal(_kernel(config), CUSTOM_TAPS)
 
 
+def _cli_config(monkeypatch, *args):
+    """Parses the arguments of ``emulate.aspc`` and returns the prepared config, without emulating anything."""
+    import tyro
+
+    import visionsim.emulate.aspc.utils as utils
+    from visionsim.cli.emulate import aspc as aspc_cli
+
+    prepare, prepared = utils.prepare_config, []
+
+    class Prepared(Exception):
+        pass
+
+    def prepare_and_stop(user_args, config_file=None):
+        prepared.append(prepare(user_args, config_file))
+        raise Prepared
+
+    monkeypatch.setattr(utils, "prepare_config", prepare_and_stop)
+    with pytest.raises(Prepared):
+        tyro.cli(aspc_cli, args=["--input-dir", "in", "--output-dir", "out", *args])
+    return prepared[0]
+
+
 class TestCliPulseShape:
     """``--active-pulse-shape``: a name, or the path to a file of custom taps."""
 
     @staticmethod
     def _cli_laser(monkeypatch, *args):
         """Parses the arguments of ``emulate.aspc`` and returns the laser config, without emulating anything."""
-        import tyro
-
-        import visionsim.emulate.aspc.utils as utils
-        from visionsim.cli.emulate import aspc as aspc_cli
-
-        prepare, prepared = utils.prepare_config, []
-
-        class Prepared(Exception):
-            pass
-
-        def prepare_and_stop(user_args, config_file=None):
-            prepared.append(prepare(user_args, config_file))
-            raise Prepared
-
-        monkeypatch.setattr(utils, "prepare_config", prepare_and_stop)
-        with pytest.raises(Prepared):
-            tyro.cli(aspc_cli, args=["--input-dir", "in", "--output-dir", "out", *args])
-        return prepared[0]["active_source"]["pulsed_laser"]
+        return _cli_config(monkeypatch, *args)["active_source"]["pulsed_laser"]
 
     @pytest.mark.parametrize("shape", ["gaussian", "square"])
     def test_named_shape(self, monkeypatch, shape):
@@ -212,3 +218,28 @@ class TestCliPulseShape:
         with pytest.raises(FileNotFoundError if missing_file else ValueError, match="pulse_shape_custom"):
             aspc_cli(input_dir=tmp_path / "in", output_dir=output_dir, active_pulse_shape=shape, force=True)
         assert (output_dir / "previous.txt").exists()
+
+
+class TestFastSimNoiseConfig:
+    """``fast_sim_noise`` from the user arguments, a config file or the CLI, on to the histogrammer."""
+
+    def test_default_is_noise_free(self):
+        assert prepare_config({})["histogrammer"]["fast_sim_noise"] is False
+
+    def test_user_argument(self):
+        assert prepare_config({"fast_sim_noise": True})["histogrammer"]["fast_sim_noise"] is True
+
+    def test_config_file(self, tmp_path):
+        config = prepare_config({}, _write(tmp_path, "histogrammer:\n  fast_sim: true\n  fast_sim_noise: true\n"))
+        assert config["histogrammer"]["fast_sim"] is True
+        assert config["histogrammer"]["fast_sim_noise"] is True
+
+    def test_cli(self, monkeypatch):
+        histogrammer = _cli_config(monkeypatch, "--fast-sim", "True", "--fast-sim-noise", "True")["histogrammer"]
+        assert histogrammer["fast_sim"] is True
+        assert histogrammer["fast_sim_noise"] is True
+
+    def test_reaches_the_histogrammer(self):
+        emulator = ASPCEmulator(prepare_config({"fast_sim": True, "fast_sim_noise": True}))
+        assert emulator.detector.histogrammer.fast_sim is True
+        assert emulator.detector.histogrammer.fast_sim_noise is True
